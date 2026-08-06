@@ -118,7 +118,7 @@ def _suggested_fast_models(installed: set[str] | None = None) -> list[str]:
 
 
 def resolve_model_chain() -> list[str]:
-    """Primary first; optional smaller fallbacks only (never auto-escalate to heavier)."""
+    """Primary first; append smaller installed fallbacks (esp. after heavy primary)."""
     primary = str(
         getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:7b") or "qwen2.5-coder:7b"
     ).strip()
@@ -127,6 +127,12 @@ def resolve_model_chain() -> list[str]:
         for m in str(getattr(config, "OLLAMA_FALLBACK_MODELS", "") or "").split(",")
         if m.strip()
     ]
+    # Always prefer a fast path when the primary is heavy and smaller models exist.
+    if _is_heavy_model(primary) or _model_param_b(primary) >= 14:
+        for pref in _FAST_MODEL_PREFS:
+            if pref not in fallbacks and pref != primary:
+                fallbacks.append(pref)
+
     candidates = [primary]
     for m in fallbacks:
         if m not in candidates:
@@ -153,41 +159,108 @@ def resolve_model_chain() -> list[str]:
             continue
         if _model_param_b(m) < primary_size and not _is_heavy_model(m):
             out.append(m)
+    # If primary missing but a fast model is installed, put fast first.
+    if primary_resolved not in installed:
+        fast = _suggested_fast_models(installed)
+        if fast:
+            return [fast[0]] + [m for m in out if m != fast[0]]
     return out
 
 
+def _analysis_num_predict(model: str, *, json_mode: bool) -> int:
+    """Cap generation length — short JSON reasons do not need 1600 tokens."""
+    configured = max(128, int(getattr(config, "OLLAMA_NUM_PREDICT", 512) or 512))
+    if not json_mode:
+        return configured
+    # Card narrate JSON is tiny; heavy models waste the whole timeout padding tokens.
+    if _is_heavy_model(model) or _model_param_b(model) >= 14:
+        return min(configured, 420)
+    return min(configured, 560)
+
+
+def _attempt_timeout_sec(model: str, full_timeout: int, *, has_fallback: bool) -> int:
+    """Soft-cap heavy first attempts so we fail over (or return HA slip) sooner."""
+    full_timeout = max(30, int(full_timeout))
+    if not has_fallback:
+        return full_timeout
+    if _is_heavy_model(model) or _model_param_b(model) >= 14:
+        # Don't burn the whole budget on a 14b that will never finish on CPU.
+        return min(full_timeout, max(90, int(full_timeout * 0.35)))
+    return full_timeout
+
+
+def _fallback_installed_model(installed: set[str]) -> str:
+    """Pick a usable installed model (prefer larger quality models)."""
+    if not installed:
+        return str(getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:14b") or "qwen2.5-coder:14b")
+    return sorted(installed, key=lambda n: (_model_param_b(n), n), reverse=True)[0]
+
+
 def list_model_choices() -> list[str]:
-    """Models for the dashboard picker: configured primary first, then installed."""
-    installed = sorted(ollama_installed_models())
+    """Models for the dashboard picker: active primary, then installed (no unpulled stubs)."""
+    installed = ollama_installed_models()
     primary = str(getattr(config, "OLLAMA_MODEL", "") or "").strip()
     choices: list[str] = []
-    if primary:
-        choices.append(primary)
-    for name in _suggested_fast_models(set(installed)):
+    # Only keep primary in the list when it is actually installed (or nothing is listed yet).
+    if primary and (not installed or primary in installed or resolve_model(primary, installed)):
+        resolved_primary = resolve_model(primary, installed) if installed else primary
+        if resolved_primary:
+            choices.append(resolved_primary)
+    for name in _suggested_fast_models(set(installed) if installed else None):
+        if name not in choices and (not installed or name in installed):
+            choices.append(name)
+    for name in sorted(installed, key=lambda n: (_model_param_b(n), n)):
         if name not in choices:
             choices.append(name)
-    for name in installed:
-        if name not in choices:
-            choices.append(name)
-    for extra in (
-        "llama3.2:3b",
-        "qwen2.5:7b",
-        "qwen2.5-coder:7b",
-        "qwen2.5-coder:14b",
-        "deepseek-r1:8b",
-    ):
-        if extra not in choices:
-            choices.append(extra)
-    return choices or ["qwen2.5-coder:7b"]
+    if not choices:
+        choices = [primary or "qwen2.5-coder:7b"]
+    return choices
+
+
+def model_speed_hint(model: str) -> str:
+    """Short UI hint for the selected model."""
+    name = str(model or "").strip()
+    if not name:
+        return "pick a model"
+    if _is_heavy_model(name) or _model_param_b(name) >= 14:
+        return "heavier · better narrative, slower"
+    if _model_param_b(name) <= 3:
+        return "fast · lighter narrative"
+    return "balanced speed / quality"
+
+
+_LAST_MODEL_WARN = ""
 
 
 def set_active_model(model: str) -> str:
-    """Update runtime config model (session); returns resolved name."""
+    """Update runtime config model (session); fall back if the tag is not installed."""
+    global _LAST_MODEL_WARN
+    _LAST_MODEL_WARN = ""
     name = str(model or "").strip() or str(
         getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:7b")
     )
-    config.OLLAMA_MODEL = name
-    return name
+    installed = ollama_installed_models()
+    if not installed:
+        config.OLLAMA_MODEL = name
+        return name
+
+    resolved = resolve_model(name, installed)
+    if resolved:
+        config.OLLAMA_MODEL = resolved
+        return resolved
+
+    fallback = _fallback_installed_model(installed)
+    _LAST_MODEL_WARN = (
+        f"{name} is not installed. Using {fallback} instead. "
+        f"To install: ollama pull {name}"
+    )
+    logger.warning("%s", _LAST_MODEL_WARN)
+    config.OLLAMA_MODEL = fallback
+    return fallback
+
+
+def last_model_warn() -> str:
+    return str(_LAST_MODEL_WARN or "")
 
 
 def _is_timeout_error(exc: BaseException) -> bool:
@@ -275,14 +348,25 @@ def ollama_complete(
     Call Ollama chat/generate.
 
     Returns (model_used, text). On timeout, falls back only to smaller/faster models.
+    Heavy models get a soft first-attempt timeout so CPU hosts fail over sooner.
     """
     timeout = int(timeout_sec if timeout_sec is not None else ollama_timeout_sec())
     chain = [model] if model else resolve_model_chain()
     if not chain:
-        chain = [str(getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:14b"))]
+        chain = [str(getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:7b"))]
 
-    num_predict = max(256, int(getattr(config, "OLLAMA_NUM_PREDICT", 1600) or 1600))
-    num_ctx = max(2048, int(getattr(config, "OLLAMA_NUM_CTX", 8192) or 8192))
+    # Prefetch installed fast models into the queue after a heavy primary.
+    installed = ollama_installed_models()
+    if chain and (_is_heavy_model(chain[0]) or _model_param_b(chain[0]) >= 14):
+        for pref in _suggested_fast_models(installed):
+            if pref not in chain:
+                chain.append(pref)
+
+    num_ctx = max(2048, int(getattr(config, "OLLAMA_NUM_CTX", 4096) or 4096))
+    # Smaller context for heavy JSON narrate — less KV cache thrash on CPU.
+    if chain and (_is_heavy_model(chain[0]) or _model_param_b(chain[0]) >= 14):
+        num_ctx = min(num_ctx, 4096)
+
     last_err: Exception | None = None
     tried: list[str] = []
     queue = list(chain)
@@ -292,6 +376,14 @@ def ollama_complete(
         if pick in tried:
             continue
         tried.append(pick)
+        num_predict = _analysis_num_predict(pick, json_mode=json_mode)
+        attempt_timeout = _attempt_timeout_sec(
+            pick, timeout, has_fallback=bool(queue) or bool(_suggested_fast_models(installed))
+        )
+        # If nothing smaller is installed, give the heavy model the full budget.
+        if not any(_model_param_b(m) < _model_param_b(pick) for m in (*queue, *_suggested_fast_models(installed))):
+            attempt_timeout = timeout
+
         options = {
             "temperature": temperature,
             "num_predict": num_predict,
@@ -300,6 +392,13 @@ def ollama_complete(
         use_chat = bool(getattr(config, "OLLAMA_USE_CHAT_API", True))
         body: dict[str, Any] | None = None
         try:
+            logger.info(
+                "Ollama attempt model=%s timeout=%ss num_predict=%s num_ctx=%s",
+                pick,
+                attempt_timeout,
+                num_predict,
+                num_ctx,
+            )
             if use_chat:
                 messages: list[dict[str, str]] = []
                 if system:
@@ -309,13 +408,13 @@ def ollama_complete(
                     "model": pick,
                     "messages": messages,
                     "stream": False,
-                    "keep_alive": "5m",
+                    "keep_alive": "10m",
                     "options": options,
                 }
                 if json_mode and bool(getattr(config, "OLLAMA_JSON_FORMAT", True)):
                     chat_body["format"] = "json"
                 try:
-                    raw = _http_post("/api/chat", chat_body, timeout=timeout)
+                    raw = _http_post("/api/chat", chat_body, timeout=attempt_timeout)
                     body = {
                         "response": (raw.get("message") or {}).get("content", ""),
                         "thinking": raw.get("thinking", ""),
@@ -335,22 +434,21 @@ def ollama_complete(
                     "model": pick,
                     "prompt": prompt,
                     "stream": False,
-                    "keep_alive": "5m",
+                    "keep_alive": "10m",
                     "options": options,
                 }
                 if system:
                     gen_body["system"] = system
                 if json_mode and bool(getattr(config, "OLLAMA_JSON_FORMAT", True)):
                     gen_body["format"] = "json"
-                body = _http_post("/api/generate", gen_body, timeout=timeout)
+                body = _http_post("/api/generate", gen_body, timeout=attempt_timeout)
 
             text = _merge_thinking_response(body)
             return pick, text
         except TimeoutError as exc:
-            last_err = TimeoutError(_timeout_message(pick, timeout, tried=tried))
+            last_err = TimeoutError(_timeout_message(pick, attempt_timeout, tried=tried))
             logger.warning("%s", last_err)
             queue = _reorder_after_timeout(queue, pick)
-            # Keep full timeout on fallbacks — accuracy mode, do not rush weaker models.
             continue
         except Exception as exc:
             last_err = exc
@@ -455,22 +553,27 @@ def check_ollama_health(*, force: bool = False) -> dict[str, Any]:
 
     latency_ms = int((time.perf_counter() - t0) * 1000)
     resolved = resolve_model(primary, installed) if installed else primary
-    model_ok = bool(reachable and (not installed or resolved is not None))
     if reachable and installed and resolved is None:
-        error_class = "model_missing"
-        error = error or f"model missing: {primary}"
-    elif reachable:
+        # Soft-recover: don't hard-fail analysis when another model is available.
+        resolved = _fallback_installed_model(installed)
+        config.OLLAMA_MODEL = resolved
         error_class = "ok"
         error = None
-    elif error_class == "other":
-        error_class = "offline"
-
-    if not reachable:
-        banner = "Ollama offline — showing model tickets only"
-    elif error_class == "model_missing":
-        banner = f"Ollama model missing ({primary}) — showing model tickets only"
+        banner = (
+            f"Ollama ready · {resolved} · {latency_ms}ms "
+            f"(requested {primary} missing — run: ollama pull {primary})"
+        )
+        model_ok = True
     else:
-        banner = f"Ollama ready · {resolved or primary} · {latency_ms}ms"
+        model_ok = bool(reachable and (not installed or resolved is not None))
+        if reachable:
+            error_class = "ok"
+            error = None
+            banner = f"Ollama ready · {resolved or primary} · {latency_ms}ms"
+        else:
+            if error_class == "other":
+                error_class = "offline"
+            banner = "Ollama offline — showing model tickets only"
 
     status: dict[str, Any] = {
         "reachable": reachable,

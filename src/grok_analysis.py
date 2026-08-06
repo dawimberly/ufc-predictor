@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import config
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -421,49 +422,23 @@ def _pick_id(item: dict[str, Any]) -> str:
 
 
 def build_grok_prompt(inputs: dict[str, Any]) -> str:
-    """Prompt for concise Top-5 bet-slip narration (actionable + advisory)."""
+    """Compact Top-N narration prompt (keep short — CPU Ollama timeouts are common)."""
     event = inputs.get("event") or "Upcoming UFC card"
     profile = str(inputs.get("profile") or "paper").upper()
     bankroll = inputs.get("bankroll")
     card_budget = inputs.get("card_budget")
-    tickets = inputs.get("tickets") or []
-    skipped = inputs.get("skipped") or []
+    tickets = list(inputs.get("tickets") or [])[:8]
     warning = str(inputs.get("top5_warning") or TOP5_WARNING)
 
     ticket_lines: list[str] = []
     for t in tickets:
-        tier = "ADVISORY" if t.get("advisory") else "ACTIONABLE"
+        tier = "ADV" if t.get("advisory") or t.get("fun_bet") else "ACT"
         ticket_lines.append(
-            f"- id={t.get('id')} | tier={tier} | side={t.get('side')} | market={t.get('market')} | "
-            f"book={t.get('book') or 'n/a'} | odds={t.get('odds_display') or '-'} | "
-            f"stake_pct={t.get('stake_pct')}% | stake_usd=${t.get('stake_usd')} | "
-            f"model_prob={t.get('prob')} | edge={t.get('edge_pct')}% | "
-            f"confidence={t.get('confidence')} | strength={t.get('strength_score')} | "
-            f"uncertainty={t.get('uncertainty_action') or 'allow'}"
+            f"- id={t.get('id')} | {tier} | {t.get('side')} | {t.get('market')} | "
+            f"book={t.get('book') or 'n/a'} | stake={t.get('stake_pct')}%/${t.get('stake_usd')} | "
+            f"prob={t.get('prob')} | edge={t.get('edge_pct')}% | conf={t.get('confidence')}"
         )
     tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET)"
-
-    skip_lines = [
-        f"- SKIP {s.get('pick') or '-'} | {s.get('fight')} | reason={s.get('skip_reason')} | "
-        f"disagree={s.get('disagreement')} | width={s.get('interval_width')}"
-        for s in skipped[:12]
-    ]
-    skip_section = (
-        "\nExplicit skips (already fail-closed by HA gates — do not recommend):\n"
-        + "\n".join(skip_lines)
-        + "\n"
-        if skip_lines
-        else ""
-    )
-
-    lessons_block = ""
-    try:
-        from src.prediction_bank import lessons_prompt_block
-
-        lessons_block = lessons_prompt_block()
-    except Exception:
-        lessons_block = ""
-    lessons_section = f"\n{lessons_block}\n" if lessons_block else ""
 
     br_txt = f"${float(bankroll):.2f}" if bankroll is not None else "n/a"
     card_txt = f"${float(card_budget):.2f}" if card_budget is not None else "n/a"
@@ -472,42 +447,17 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     n_act = inputs.get("n_actionable")
     n_adv = inputs.get("n_advisory")
 
-    return f"""You are a UFC betting desk. Output ONLY what to bet and why — short and actionable.
-Profile={profile} | Bankroll={br_txt} | Card budget={card_txt}
-WARNING: {warning}
-Stakes on ACTIONABLE rows are FINAL from conf/odds HA sizing (sum ≤ 100% of card). Do NOT change % or $.
-ADVISORY rows must keep stake_pct=0 and stake_usd=0 — research only.
-{lessons_section}{skip_section}
-MODEL-FIRST CONSTRAINTS (mandatory):
-- Use ONLY the tickets listed (up to Top 5). Do NOT invent, flip, add, or drop bets.
-- Do NOT change stake_pct or stake_usd. Copy them exactly into your JSON.
-- NEVER invent odds, edge, or probability.
-- If tickets list is empty → summary must say NO BET and picks=[].
-- One-line reason each: confidence + edge (max ~100 chars). No essays.
-- Summary should mention how many are ACTIONABLE vs ADVISORY when both exist.
+    return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
+{warning}
+Rules: use ONLY listed tickets; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
+ADV stakes stay 0; one-line reason (conf+edge, <=90 chars); empty list => NO BET.
 
-Top 5 tickets to narrate ({n_act} actionable / {n_adv} advisory):
+Tickets ({n_act} ACT / {n_adv} ADV):
 {tickets_block}
+ACT totals: {total_pct}% / ${total_usd}
 
-Card totals (ACTIONABLE only): {total_pct}% / ${total_usd}
-
-Reply with ONLY valid JSON (no markdown). Keep strings short; use apostrophes inside strings, never raw " quotes.
-{{
-  "event": "{event}",
-  "summary": "one short line: top actionable bets / note advisory / or NO BET",
-  "picks": [
-    {{
-      "id": "same id from input",
-      "side": "same side",
-      "market": "same market",
-      "book": "same book",
-      "stake_pct": 0.0,
-      "stake_usd": 0.0,
-      "reason": "conf + edge one-liner",
-      "conviction": "high|medium|low"
-    }}
-  ]
-}}"""
+Return JSON:
+{{"event":"{event}","summary":"short line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"...","conviction":"high|medium|low"}}]}}"""
 
 
 def _ticket_slip_id(ticket: dict[str, Any]) -> str:
@@ -534,12 +484,20 @@ def _ticket_to_slip_row(
         str(ticket.get("market_type") or "").lower() == "prop"
         or str(ticket.get("prop_key") or "") == "over_1_5_rounds"
     )
+    fight = str(ticket.get("fight") or "").strip()
     if is_parlay:
         market = "2-leg parlay"
         side = str(ticket.get("pick_line") or ticket.get("picks") or ticket.get("display_label") or "")
     elif is_prop:
         market = "Over 1.5 Rounds"
-        side = str(ticket.get("display_label") or ticket.get("label") or ticket.get("pick_line") or "")
+        label = str(
+            ticket.get("display_label")
+            or ticket.get("label")
+            or ticket.get("prop_short")
+            or ticket.get("pick_line")
+            or "Over 1.5 Rounds"
+        )
+        side = f"{fight} — {label}" if fight and fight not in label else label
     else:
         market = "moneyline"
         side = str(
@@ -574,6 +532,7 @@ def _ticket_to_slip_row(
     if tier_l == "advisory":
         stake_pct = 0.0
         stake_usd = 0.0
+    bet_tier = str(ticket.get("bet_tier") or "").strip().lower()
     return {
         "id": _ticket_slip_id(ticket) or f"ticket-{rank}",
         "rank": rank,
@@ -590,12 +549,17 @@ def _ticket_to_slip_row(
         "strength_score": ticket.get("strength_score"),
         "uncertainty_action": ticket.get("uncertainty_action") or "allow",
         "fight": ticket.get("fight"),
-        "pick": ticket.get("pick"),
+        "pick": ticket.get("pick") or (side if is_prop else ticket.get("pick")),
+        "prop_key": ticket.get("prop_key") if is_prop else "",
+        "market_type": "prop" if is_prop else ("parlay" if is_parlay else "moneyline"),
         "is_parlay": is_parlay,
         "reason": "",
         "conviction": "high" if conf_l == "high" else ("low" if conf_l == "low" else "medium"),
         "tier": tier_l,
         "advisory": tier_l == "advisory",
+        "bet_tier": bet_tier or None,
+        "fun_bet": bool(ticket.get("fun_bet")),
+        "tier_reason": ticket.get("tier_reason") or "",
     }
 
 
@@ -607,7 +571,7 @@ TOP5_WARNING = (
 
 
 def _candidate_dedupe_key(ticket: dict[str, Any]) -> str:
-    return str(
+    base = str(
         ticket.get("fight_id")
         or ticket.get("fight")
         or ticket.get("pick_line")
@@ -616,6 +580,15 @@ def _candidate_dedupe_key(ticket: dict[str, Any]) -> str:
         or ticket.get("id")
         or ""
     ).strip().lower()
+    is_prop = (
+        str(ticket.get("market_type") or "").lower() == "prop"
+        or str(ticket.get("prop_key") or "") == "over_1_5_rounds"
+        or "over 1.5" in str(ticket.get("market") or "").lower()
+    )
+    if is_prop:
+        pkey = str(ticket.get("prop_key") or "over_1_5_rounds").strip().lower()
+        return f"{base}|prop|{pkey}"
+    return base
 
 
 def collect_card_analysis_inputs(
@@ -629,22 +602,23 @@ def collect_card_analysis_inputs(
     allowed_fights: set[str] | None = None,
 ) -> dict[str, Any]:
     """
-    Gather HA-gated + conf/odds-sized tickets for Ollama bet-slip narration.
+    Gather HA-gated + fun-tier tickets for Ollama bet-slip narration.
 
-    Always builds a Top 5 list:
-    - ACTIONABLE: cleared HA ticket cap + sized stakes
-    - ADVISORY: next-best ranked picks with $0 (research only), when fewer than 5
-      actionable tickets exist
+    Builds one merged Top N list (default 5):
+    - CLEARS GATES (HA-sized) first
+    - then DECENT FUN / caution fillers
+    - props (Over 1.5) compete in the same pool — never concatenated past Top N
 
-    Does not invent bets — uses aggregate_overview_recommendations + top singles pool.
+    Dedupes on (fight_id, market_type, selection, book) via dedupe_rank_top_tickets.
     """
+    from src.bet_slip import dedupe_rank_top_tickets
     from src.strategy import (
         aggregate_overview_recommendations,
         aggregate_top_recommended_bets,
     )
 
     fight_cap = max_fights if max_fights is not None else config.GROK_MAX_FIGHTS
-    _ = max_props  # props come through overview Over 1.5 path
+    prop_cap = max_props if max_props is not None else int(getattr(config, "GROK_MAX_PROPS", 6) or 6)
     bs = budget_state or {}
     prof = profile or config.UFC_PROFILE
     top_n = max(3, min(5, int(fight_cap)))
@@ -665,23 +639,22 @@ def collect_card_analysis_inputs(
             + list(slip.get("parlays") or [])
         )
 
-    # Actionable: positive stake after fail-closed checks
-    actionable_raw: list[dict[str, Any]] = []
-    for i, t in enumerate(items, start=1):
-        row = _ticket_to_slip_row(t, rank=i, tier="actionable")
-        if float(row.get("stake_usd") or 0) > 0 and float(row.get("stake_pct") or 0) > 0:
-            actionable_raw.append(t)
+    raw_candidates: list[dict[str, Any]] = []
 
-    actionable_by_key = {_candidate_dedupe_key(t): t for t in actionable_raw}
+    # HA / overview sized tickets
+    for t in items:
+        row = _ticket_to_slip_row(t, rank=0, tier="actionable")
+        stake_ok = float(row.get("stake_usd") or 0) > 0 and float(row.get("stake_pct") or 0) > 0
+        if stake_ok:
+            row["bet_tier"] = "blue"
+            row["fun_bet"] = False
+            row["advisory"] = False
+            raw_candidates.append(row)
+        else:
+            adv = _ticket_to_slip_row(t, rank=0, tier="advisory")
+            raw_candidates.append(adv)
 
-    # Ranked pool to fill Top 5 (actionable first, then other strong singles)
-    ranked_pool: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for t in actionable_raw:
-        key = _candidate_dedupe_key(t)
-        if key and key not in seen:
-            seen.add(key)
-            ranked_pool.append(t)
+    # Extra ranked singles (may overlap — dedupe later)
     try:
         extra = aggregate_top_recommended_bets(
             books, bs, limit=top_n, per_book_cap=2, profile=prof
@@ -689,26 +662,9 @@ def collect_card_analysis_inputs(
     except Exception:
         extra = []
     for t in list(slip.get("prop_singles") or []) + list(slip.get("parlays") or []) + list(extra):
-        key = _candidate_dedupe_key(t)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        ranked_pool.append(t)
-        if len(ranked_pool) >= top_n:
-            break
+        raw_candidates.append(_ticket_to_slip_row(t, rank=0, tier="advisory"))
 
-    tickets: list[dict[str, Any]] = []
-    for i, t in enumerate(ranked_pool[:top_n], start=1):
-        key = _candidate_dedupe_key(t)
-        if key in actionable_by_key:
-            row = _ticket_to_slip_row(actionable_by_key[key], rank=i, tier="actionable")
-            # Re-apply rank after merge order
-            if float(row.get("stake_usd") or 0) > 0:
-                tickets.append(row)
-                continue
-        tickets.append(_ticket_to_slip_row(t, rank=i, tier="advisory"))
-
-    # If pool was empty but we somehow have nothing, keep empty (NO BET)
+    # Skips (context only — not in top list)
     skipped_payload: list[dict[str, Any]] = []
     for book_data in (books or {}).values():
         alerts = (book_data or {}).get("alerts") or {}
@@ -740,15 +696,131 @@ def collect_card_analysis_inputs(
     except Exception:
         pass
 
-    actionable_only = [t for t in tickets if not t.get("advisory")]
+    fun_tiers: dict[str, Any] = {}
+    prop_tiers: dict[str, Any] = {}
+    try:
+        from src.bet_tiers import (
+            TIER_BLUE,
+            TIER_GREEN,
+            TIER_YELLOW,
+            classify_prop_bet_tier,
+            collect_props_from_books,
+            merge_bet_tier_dicts,
+            rank_card_bet_tiers,
+            rank_prop_bet_tiers,
+        )
+
+        cleared: list[dict[str, Any]] = []
+        preds = None
+        for book_data in (books or {}).values():
+            if not isinstance(book_data, dict):
+                continue
+            cleared.extend((book_data.get("alerts") or {}).get("singles") or [])
+            if preds is None:
+                p = book_data.get("predictions")
+                if isinstance(p, pd.DataFrame) and not p.empty:
+                    preds = p
+        overview = (books or {}).get("Overview") or {}
+        if preds is None and isinstance(overview.get("predictions"), pd.DataFrame):
+            preds = overview.get("predictions")
+        fun_tiers = rank_card_bet_tiers(preds, cleared_singles=cleared, limit_per_tier=6)
+
+        raw_props = collect_props_from_books(
+            books, limit=prop_cap, allowed_fights=allowed_fights
+        )
+        sized_props = {
+            _candidate_dedupe_key(t): t for t in list(slip.get("prop_singles") or [])
+        }
+        merged_props: list[dict[str, Any]] = []
+        seen_props: set[str] = set()
+        for t in list(slip.get("prop_singles") or []) + raw_props:
+            key = _candidate_dedupe_key(t)
+            if not key or key in seen_props:
+                continue
+            seen_props.add(key)
+            merged_props.append(sized_props.get(key) or t)
+        prop_tiers = rank_prop_bet_tiers(merged_props, limit_per_tier=prop_cap)
+        fun_tiers = merge_bet_tier_dicts(fun_tiers, prop_tiers, limit_per_tier=8)
+
+        # Fun ML + prop candidates compete in the SAME pool (merged below)
+        for fun in list(fun_tiers.get(TIER_GREEN) or []) + list(fun_tiers.get(TIER_YELLOW) or []):
+            row = _ticket_to_slip_row(fun, rank=0, tier="advisory")
+            row["bet_tier"] = fun.get("bet_tier") or TIER_GREEN
+            row["fun_bet"] = True
+            row["advisory"] = True
+            row["stake_usd"] = 0.0
+            row["stake_pct"] = 0.0
+            row["reason"] = fun.get("brief") or row.get("reason") or "Fun tier (not HA-sized)"
+            raw_candidates.append(row)
+
+        for tier_name in (TIER_BLUE, TIER_GREEN, TIER_YELLOW):
+            for p in prop_tiers.get(tier_name) or []:
+                key = _candidate_dedupe_key(p)
+                src = sized_props.get(key) or p
+                stake_ok = float(src.get("suggested_stake") or src.get("stake_usd") or 0) > 0 and float(
+                    src.get("stake_pct") or 0
+                ) > 0
+                row = _ticket_to_slip_row(
+                    src,
+                    rank=0,
+                    tier="actionable" if stake_ok else "advisory",
+                )
+                row["bet_tier"] = p.get("bet_tier") or tier_name
+                row["fun_bet"] = bool(p.get("fun_bet")) and not stake_ok
+                row["tier_reason"] = p.get("tier_reason") or row.get("tier_reason") or ""
+                if not stake_ok:
+                    row["stake_usd"] = 0.0
+                    row["stake_pct"] = 0.0
+                    row["advisory"] = True
+                    row["fun_bet"] = True
+                else:
+                    row["bet_tier"] = TIER_BLUE
+                    row["fun_bet"] = False
+                    row["advisory"] = False
+                raw_candidates.append(row)
+    except Exception as exc:
+        logger.debug("fun/prop tier build skipped: %s", exc)
+
+    # Annotate missing bet_tier before merge
+    for t in raw_candidates:
+        if t.get("bet_tier"):
+            continue
+        if float(t.get("stake_usd") or 0) > 0:
+            t["bet_tier"] = "blue"
+            continue
+        if str(t.get("market_type") or "") == "prop" or "Over 1.5" in str(t.get("market") or ""):
+            try:
+                from src.bet_tiers import classify_prop_bet_tier
+
+                tier, reason = classify_prop_bet_tier(t, debug=False)
+                t["bet_tier"] = tier
+                t["tier_reason"] = reason
+            except Exception:
+                t["bet_tier"] = "yellow"
+        else:
+            t["bet_tier"] = "yellow"
+
+    tickets = dedupe_rank_top_tickets(
+        raw_candidates,
+        limit=top_n,
+        event=event_label,
+        log=logger,
+    )
+
+    actionable_only = [t for t in tickets if not t.get("advisory") and float(t.get("stake_usd") or 0) > 0]
     total_pct = round(sum(float(t.get("stake_pct") or 0) for t in actionable_only), 1)
     total_usd = round(sum(float(t.get("stake_usd") or 0) for t in actionable_only), 2)
     br = float(bs.get("total_bankroll") or config.DEFAULT_TOTAL_BANKROLL)
 
     fights = [t for t in tickets if t.get("market") == "moneyline"]
-    props = [t for t in tickets if "Over 1.5" in str(t.get("market") or "")]
+    props = [
+        t
+        for t in tickets
+        if "Over 1.5" in str(t.get("market") or "")
+        or str(t.get("market_type") or "") == "prop"
+    ]
     n_actionable = len(actionable_only)
-    n_advisory = sum(1 for t in tickets if t.get("advisory"))
+    n_advisory = sum(1 for t in tickets if t.get("advisory") or t.get("fun_bet"))
 
     return {
         "event": event_label,
@@ -766,6 +838,10 @@ def collect_card_analysis_inputs(
         "top5_warning": TOP5_WARNING,
         "n_actionable": n_actionable,
         "n_advisory": n_advisory,
+        "fun_tiers": fun_tiers,
+        "prop_tiers": prop_tiers,
+        "top_n": top_n,
+        "top_n_shown": len(tickets),
     }
 
 
@@ -947,7 +1023,11 @@ def _save_cache(key: str, result: dict[str, Any]) -> None:
         logger.debug("Grok cache write failed: %s", exc)
 
 
-def query_ollama(prompt: str) -> tuple[str, str]:
+def query_ollama(
+    prompt: str,
+    *,
+    timeout_sec: int | None = None,
+) -> tuple[str, str]:
     """Call local Ollama. Returns (model_used, response_text). Never calls xAI."""
     from src.ollama_client import ollama_available, ollama_complete, ollama_status_message
 
@@ -960,12 +1040,16 @@ def query_ollama(prompt: str) -> tuple[str, str]:
         "You are a concise UFC betting analyst. "
         "Respond with valid JSON only — no commentary outside the JSON object."
     )
+    # Card narrate is short JSON — don't burn the full 600s budget on CPU.
+    configured = int(getattr(config, "OLLAMA_TIMEOUT_SEC", 600) or 600)
+    effective = int(timeout_sec) if timeout_sec is not None else min(configured, 180)
+    effective = max(45, effective)
     model_used, text = ollama_complete(
         prompt,
         system=system,
-        timeout_sec=int(getattr(config, "OLLAMA_TIMEOUT_SEC", 600)),
+        timeout_sec=effective,
         json_mode=True,
-        temperature=0.25,
+        temperature=0.2,
     )
     logger.info("Ollama analysis complete model=%s chars=%s", model_used, len(text or ""))
     if not str(text or "").strip():
@@ -1052,6 +1136,9 @@ def analyze_card_with_grok(
             "top5_warning": inputs.get("top5_warning") or TOP5_WARNING,
             "n_actionable": inputs.get("n_actionable"),
             "n_advisory": inputs.get("n_advisory"),
+            "fun_tiers": inputs.get("fun_tiers") or {},
+            "prop_tiers": inputs.get("prop_tiers") or {},
+            "props": inputs.get("props") or [],
         }
         out.update(extra)
         return out
@@ -1062,21 +1149,23 @@ def analyze_card_with_grok(
             _latency_ms(),
         )
         return _base_result(
-            ok=False,
-            error="Ollama disabled — set OLLAMA_ENABLED=true in .env",
-            error_class="disabled",
-            health_banner="Ollama offline — showing model tickets only",
+            ok=True,
+            warning="Ollama disabled — set OLLAMA_ENABLED=true in .env",
+            error_class="ok",
+            health_banner="Ollama disabled — showing HA tickets",
             summary=no_bet_reason
-            or "HA bet slip ready — Ollama reasons unavailable.",
+            or "HA bet slip ready — Ollama narrative skipped.",
             model=getattr(config, "OLLAMA_MODEL", "ollama"),
+            narrative_degraded=True,
+            ollama_error_class="disabled",
         )
 
     health = check_ollama_health(force=True)
     health_class = str(health.get("error_class") or "other")
     if health_class in {"offline", "model_missing"} or not health.get("reachable"):
-        banner = str(
-            health.get("banner") or "Ollama offline — showing model tickets only"
-        )
+        banner = "Ollama offline — showing HA tickets"
+        if health_class == "model_missing":
+            banner = "Ollama model missing — showing HA tickets"
         logger.warning(
             "Ollama health error_class=%s latency_ms=%s — %s",
             health_class,
@@ -1084,15 +1173,17 @@ def analyze_card_with_grok(
             banner,
         )
         return _base_result(
-            ok=False,
-            error=health.get("error") or ollama_status_message(),
-            error_class=health_class if health_class != "ok" else "offline",
+            ok=True,
+            warning=str(health.get("error") or ollama_status_message())[:240],
+            error_class="ok",
             health_banner=banner,
             ollama_latency_ms=health.get("latency_ms"),
             summary=no_bet_reason
-            or "HA bet slip ready — Ollama reasons unavailable.",
+            or "HA bet slip ready — Ollama narrative skipped.",
             model=health.get("resolved_model")
             or getattr(config, "OLLAMA_MODEL", "ollama"),
+            narrative_degraded=True,
+            ollama_error_class=health_class if health_class != "ok" else "offline",
         )
 
     # Explicit NO BET when no odds or nothing at all to show
@@ -1154,16 +1245,18 @@ def analyze_card_with_grok(
         model_used, raw_text = query_ollama(prompt)
         try:
             parsed = _extract_json_blob(raw_text)
-        except ValueError:
-            logger.warning("Primary JSON parse failed; requesting Ollama repair pass")
-            fix_prompt = (
-                "Fix the following into ONE valid JSON object with keys "
-                "event, summary, picks. Keep all complete picks. "
-                "Output JSON only.\n\n"
-                f"{raw_text[:12000]}"
-            )
-            model_used, raw_text = query_ollama(fix_prompt)
-            parsed = _extract_json_blob(raw_text)
+        except ValueError as parse_exc:
+            # Do NOT spend another full Ollama call on repair — salvage or degrade.
+            logger.warning("Ollama JSON parse failed (%s); using salvage/HA reasons", parse_exc)
+            salvaged = _salvage_pick_objects(_repair_json_text(raw_text))
+            if salvaged:
+                parsed = {
+                    "summary": "Partial narrative (salvaged picks).",
+                    "picks": salvaged,
+                    "partial": True,
+                }
+            else:
+                raise
         result = normalize_grok_result(parsed, event_label=event_label or inputs.get("event", ""))
         result["ok"] = True
         result["from_cache"] = False
@@ -1181,6 +1274,9 @@ def analyze_card_with_grok(
         result["top5_warning"] = inputs.get("top5_warning") or TOP5_WARNING
         result["n_actionable"] = inputs.get("n_actionable")
         result["n_advisory"] = inputs.get("n_advisory")
+        result["fun_tiers"] = inputs.get("fun_tiers") or {}
+        result["prop_tiers"] = inputs.get("prop_tiers") or {}
+        result["props"] = inputs.get("props") or []
         result["latency_ms"] = _latency_ms()
         result["error_class"] = "ok"
         result["health_banner"] = health.get("banner")
@@ -1212,31 +1308,227 @@ def analyze_card_with_grok(
         err_class = classify_ollama_error(exc)
         latency = _latency_ms()
         logger.warning(
-            "Ollama analysis failed error_class=%s latency_ms=%s: %s",
+            "Ollama narrative unavailable error_class=%s latency_ms=%s: %s — "
+            "returning HA slip with deterministic reasons",
             err_class,
             latency,
             exc,
         )
-        banner = (
-            "Ollama offline — showing model tickets only"
-            if err_class in {"offline", "model_missing", "timeout"}
-            else "Ollama error — showing model tickets only"
+        # Never hard-fail the tab when HA tickets exist — narrative is optional.
+        slip = merge_ollama_reasons_into_slip(tickets, [])
+        n_act = int(inputs.get("n_actionable") or 0)
+        n_adv = int(inputs.get("n_advisory") or 0)
+        summary = no_bet_reason or (
+            f"Top {len(slip)}: {n_act} actionable, {n_adv} advisory "
+            f"(HA slip — Ollama narrative skipped: {err_class})."
         )
-        if err_class == "timeout":
-            banner = "Ollama timeout — showing model tickets only"
+        banner = {
+            "timeout": "Ollama slow — showing HA tickets (model reasons)",
+            "offline": "Ollama offline — showing HA tickets",
+            "model_missing": "Ollama model missing — showing HA tickets",
+            "disabled": "Ollama disabled — showing HA tickets",
+        }.get(err_class, "Ollama narrative skipped — showing HA tickets")
         return _base_result(
-            ok=False,
-            error=str(exc),
-            error_class=err_class,
+            ok=True,
+            error=None,
+            warning=str(exc)[:240],
+            error_class="ok",
             health_banner=banner,
-            summary=no_bet_reason
-            or "HA bet slip ready — Ollama reasons unavailable.",
+            summary=summary,
             model=getattr(config, "OLLAMA_MODEL", "ollama"),
             source="ha_slip",
+            narrative_degraded=True,
+            ollama_error_class=err_class,
+            bet_slip=slip,
         )
 
 
 analyze_card_with_ollama = analyze_card_with_grok
+
+
+def build_best_bets_briefing(
+    result: dict[str, Any] | None,
+    *,
+    predictions: Any = None,
+    cleared_singles: list[dict[str, Any]] | None = None,
+) -> str:
+    """Best-bet briefing with Blue/Green/Yellow/Red — HA gates unchanged for Blue."""
+    from src.bet_tiers import (
+        TIER_BLUE,
+        format_tiered_best_bets,
+        rank_card_bet_tiers,
+    )
+
+    event = ""
+    slip: list[dict[str, Any]] = []
+    if isinstance(result, dict):
+        event = str(result.get("event") or "").strip()
+        slip = list(result.get("bet_slip") or [])
+        if result.get("fun_tiers"):
+            return format_tiered_best_bets(result["fun_tiers"], event=event)
+
+    singles = list(cleared_singles or [])
+    if not singles:
+        singles = [b for b in slip if not b.get("advisory") and not b.get("fun_bet")]
+
+    preds = predictions
+    if preds is None and isinstance(result, dict):
+        preds = result.get("predictions")
+
+    try:
+        import pandas as pd
+
+        if preds is not None and not isinstance(preds, pd.DataFrame):
+            preds = None
+    except Exception:
+        preds = None
+
+    tiers = rank_card_bet_tiers(preds, cleared_singles=singles, limit_per_tier=6)
+    # Ensure blue from slip when preds didn't mark them
+    if not tiers.get(TIER_BLUE) and singles:
+        for s in singles[:5]:
+            item = dict(s)
+            item["bet_tier"] = TIER_BLUE
+            item["tier"] = TIER_BLUE
+            item["fun_bet"] = False
+            tiers[TIER_BLUE].append(item)
+
+    if not isinstance(result, dict) and preds is None and not singles:
+        return (
+            "No card analysis loaded yet. Run Refresh Next Two, then Run Ollama Analysis "
+            "(or ask again after the slip appears)."
+        )
+
+    return format_tiered_best_bets(tiers, event=event or "Current card")
+
+
+def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
+    """Compact grounded context for follow-up Ollama Q&A."""
+    briefing = build_best_bets_briefing(result)
+    if not isinstance(result, dict):
+        return briefing
+    slip = list(result.get("bet_slip") or [])
+    extra: list[str] = []
+    for b in slip[:8]:
+        reason = str(b.get("reason") or b.get("ollama_reason") or "").strip()
+        if reason:
+            side = str(b.get("side") or b.get("pick") or "—")
+            extra.append(f"- {side}: {reason[:180]}")
+    if extra:
+        return briefing + "\n\nTicket reasons:\n" + "\n".join(extra)
+    return briefing
+
+
+def answer_ollama_chat(
+    question: str,
+    *,
+    analysis_result: dict[str, Any] | None = None,
+    event_label: str = "",
+) -> dict[str, Any]:
+    """Answer a user question about the current card using grounded HA slip context.
+
+    Best-bet style questions get the deterministic briefing first; Ollama may add
+    a short commentary but must not invent new tickets.
+    """
+    from src.ollama_client import check_ollama_health, ollama_complete, ollama_status_message
+
+    q = " ".join(str(question or "").split()).strip()
+    if not q:
+        return {"ok": False, "error": "Empty question.", "answer": "", "briefing": ""}
+
+    briefing = build_best_bets_briefing(analysis_result)
+    q_low = q.lower()
+    best_intent = any(
+        k in q_low
+        for k in (
+            "best bet",
+            "best bets",
+            "what should i bet",
+            "what to bet",
+            "recommend",
+            "top ticket",
+            "top 5",
+            "which bet",
+            "which fight",
+            "value bet",
+            "actionable",
+        )
+    )
+
+    # Best-bet / stats questions: instant HA briefing (never invent tickets, never wait on LLM).
+    if best_intent:
+        return {
+            "ok": True,
+            "answer": briefing,
+            "briefing": briefing,
+            "source": "ha_briefing",
+            "model": "stats",
+        }
+
+    health = check_ollama_health(force=False)
+    if not health.get("reachable") or not bool(getattr(config, "OLLAMA_ENABLED", True)):
+        return {
+            "ok": True,
+            "answer": briefing
+            + "\n\n(Ollama offline — showing HA/stats briefing only. "
+            + (health.get("banner") or ollama_status_message())
+            + ")",
+            "briefing": briefing,
+            "source": "ha_briefing",
+            "model": "stats",
+            "health_banner": health.get("banner"),
+        }
+
+    context = _analysis_context_for_chat(analysis_result)
+    event = event_label or (
+        str((analysis_result or {}).get("event") or "") if analysis_result else ""
+    )
+    system = (
+        "You are a concise UFC betting assistant for this dashboard. "
+        "Use ONLY the provided ticket/stats context. "
+        "Never invent fights, odds, edges, or stakes. "
+        "If nothing cleared gates, say NO BET. "
+        "Prefer actionable HA tickets over advisory. "
+        "Keep answers under 180 words with short bullets when listing bets."
+    )
+    prompt = (
+        f"Event: {event or 'current card'}\n\n"
+        f"GROUNDED CONTEXT (source of truth):\n{context}\n\n"
+        f"USER QUESTION: {q}\n\n"
+        "Answer the question using the context. If they ask for best bets, lead with "
+        "the actionable tickets and stakes from context, then a one-line caution."
+    )
+    try:
+        model_used, text = ollama_complete(
+            prompt,
+            system=system,
+            timeout_sec=min(120, int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)),
+            json_mode=False,
+            temperature=0.2,
+        )
+        answer = " ".join(str(text or "").split())
+        if not answer:
+            answer = briefing
+        elif best_intent and briefing not in answer:
+            # Keep stats visible even when the model paraphrases.
+            answer = f"{briefing}\n\n---\n{answer}"
+        return {
+            "ok": True,
+            "answer": answer,
+            "briefing": briefing,
+            "source": "ollama_chat",
+            "model": model_used,
+        }
+    except Exception as exc:
+        logger.warning("Ollama chat failed: %s", exc)
+        return {
+            "ok": True,
+            "answer": f"{briefing}\n\n(Ollama chat failed: {exc})",
+            "briefing": briefing,
+            "source": "ha_briefing",
+            "model": "stats",
+            "error": str(exc),
+        }
 
 
 def _lookup_pick(grok_picks: list[dict[str, Any]], bet: dict[str, Any]) -> dict[str, Any] | None:

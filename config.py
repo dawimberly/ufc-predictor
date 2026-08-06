@@ -363,19 +363,19 @@ NARRATIVE_LOW_CONVICTION_FORCE_ONE = env_bool("NARRATIVE_LOW_CONVICTION_FORCE_ON
 NARRATIVE_TILT_LOG = DATA_DIR / "logs" / "narrative_tilts.jsonl"
 
 # Local Ollama analysis (default engine for dashboard "Run Ollama Analysis")
-# Prefer accuracy; raise OLLAMA_TIMEOUT_SEC on CPU-only hosts.
+# Prefer a mid-size coder model; 14b often times out on CPU for card narrate.
 OLLAMA_ENABLED = env_bool("OLLAMA_ENABLED", "true")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 OLLAMA_FALLBACK_MODELS = os.getenv(
     "OLLAMA_FALLBACK_MODELS",
-    "",  # empty: do not silently downgrade to a weaker model
+    "qwen2.5-coder:7b,llama3.2:3b,qwen2.5:7b",
 )
 OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "600"))
-OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1600"))
+OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
 OLLAMA_USE_CHAT_API = env_bool("OLLAMA_USE_CHAT_API", "true")
 OLLAMA_JSON_FORMAT = env_bool("OLLAMA_JSON_FORMAT", "true")
-OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
 
 # --- Backtest / bankroll ---
 INITIAL_BANKROLL = float(os.getenv("INITIAL_BANKROLL", "75"))
@@ -752,13 +752,16 @@ def refresh_runtime_env() -> None:
     NARRATIVE_LOW_CONVICTION_FORCE_ONE = env_bool("NARRATIVE_LOW_CONVICTION_FORCE_ONE", "true")
     OLLAMA_ENABLED = env_bool("OLLAMA_ENABLED", "true")
     OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:14b")
-    OLLAMA_FALLBACK_MODELS = os.getenv("OLLAMA_FALLBACK_MODELS", "")
+    OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+    OLLAMA_FALLBACK_MODELS = os.getenv(
+        "OLLAMA_FALLBACK_MODELS",
+        "qwen2.5-coder:7b,llama3.2:3b,qwen2.5:7b",
+    )
     OLLAMA_TIMEOUT_SEC = int(os.getenv("OLLAMA_TIMEOUT_SEC", "600"))
-    OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "1600"))
+    OLLAMA_NUM_PREDICT = int(os.getenv("OLLAMA_NUM_PREDICT", "512"))
     OLLAMA_USE_CHAT_API = env_bool("OLLAMA_USE_CHAT_API", "true")
     OLLAMA_JSON_FORMAT = env_bool("OLLAMA_JSON_FORMAT", "true")
-    OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "8192"))
+    OLLAMA_NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
     ARB_ALERT_THRESHOLD_PCT = float(os.getenv("ARB_ALERT_THRESHOLD_PCT", "2.5"))
     ARB_ALERT_POLL_SEC = int(os.getenv("ARB_ALERT_POLL_SEC", "45"))
     ARB_ALERT_SOUND = env_bool("ARB_ALERT_SOUND", "true")

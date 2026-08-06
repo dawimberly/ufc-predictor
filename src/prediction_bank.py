@@ -423,6 +423,11 @@ def _fighters_match(a: str, b: str) -> bool:
         return ca.split()[-1] == cb.split()[-1] and len(ca.split()[-1]) > 3
 
 
+def _last_token(name: str) -> str:
+    parts = _clean(name).lower().split()
+    return parts[-1] if parts else ""
+
+
 def settle_open_predictions(
     *,
     historical: pd.DataFrame | None = None,
@@ -456,6 +461,14 @@ def settle_open_predictions(
     hist["_f1"] = hist[f1c].map(_clean)
     hist["_f2"] = hist[f2c].map(_clean)
     hist["_w"] = hist["winner"].map(_clean)
+    # Index by last-name pairs so we don't scan 25k fights per open bank row.
+    hist_index: dict[tuple[str, str], list[Any]] = {}
+    for _, h in hist.iterrows():
+        a, b = _last_token(h["_f1"]), _last_token(h["_f2"])
+        if not a or not b:
+            continue
+        key = tuple(sorted((a, b)))
+        hist_index.setdefault(key, []).append(h)
 
     settled = 0
     for idx, row in df.iterrows():
@@ -463,8 +476,9 @@ def settle_open_predictions(
             continue
         f1, f2 = str(row.get("fighter_1") or ""), str(row.get("fighter_2") or "")
         pick = str(row.get("pick") or "")
+        candidates = hist_index.get(tuple(sorted((_last_token(f1), _last_token(f2)))), [])
         hit = None
-        for _, h in hist.iterrows():
+        for h in candidates:
             if (_fighters_match(f1, h["_f1"]) and _fighters_match(f2, h["_f2"])) or (
                 _fighters_match(f1, h["_f2"]) and _fighters_match(f2, h["_f1"])
             ):

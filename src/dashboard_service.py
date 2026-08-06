@@ -323,6 +323,28 @@ def _load_book_odds(
         odds_df = getattr(mod, fn_name)(force_refresh=force_refresh_odds)
         merged = merge_predictions_with_odds(combined.copy(), odds_df, fetch_if_missing=False)
         matched = int(merged.get("odds_matched", pd.Series(False)).sum())
+        # ODDS_FETCH_ONCE can lock a prior-card cache (e.g. Belgrade vs next week's slate).
+        # If match rate is poor, clear once-caches and pull live odds one time.
+        if book_name == "Odds API" and len(combined) > 0:
+            min_ok = max(3, (len(combined) + 1) // 2)
+            if matched < min_ok:
+                from src.odds_providers.odds_api_client import clear_odds_api_fetch_once_caches
+
+                cleared = clear_odds_api_fetch_once_caches()
+                if cleared or matched == 0:
+                    logger.warning(
+                        "Odds API matched only %s/%s (need >=%s) — cleared fetch-once cache "
+                        "(%s files) and retrying live pull once",
+                        matched,
+                        len(combined),
+                        min_ok,
+                        len(cleared),
+                    )
+                    odds_df = getattr(mod, fn_name)(force_refresh=True)
+                    merged = merge_predictions_with_odds(
+                        combined.copy(), odds_df, fetch_if_missing=False
+                    )
+                    matched = int(merged.get("odds_matched", pd.Series(False)).sum())
         if book_name == "BetNow.eu" and matched == 0:
             raise ValueError("BetNow scraper returned no matched fights")
         if book_name == "DraftKings":

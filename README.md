@@ -7,6 +7,9 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 ```
 UFC-Predictor/
 ├── src/                       Python modules + dashboard
+│   ├── bet_tiers.py           Blue/Green/Yellow/Red color rules
+│   ├── bet_slip.py            Top recommended dedupe + ranking
+│   └── ufc_dashboard.py       CustomTkinter GUI
 ├── data/
 │   ├── raw/                   fights.csv
 │   ├── processed/             fight_features.csv
@@ -53,11 +56,12 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 
 | Tab | Purpose |
 |-----|---------|
-| **Overview** | Card summary, fight table, HA / fail-closed messaging |
+| **Overview** | Card sections, color-ranked fight tables, Top recommended bubble |
 | **Odds API** | Primary free-tier moneylines + edges |
-| **Odds API Props** | Over/Under 1.5 totals (HA actionable = **Over 1.5 only**) |
+| **Odds API Props** | Over/Under 1.5 totals (HA Blue props = **Over 1.5 only**, live books) |
+| **MyBookie** | Optional scraper tab (when `MYBOOKIE_ENABLED=true`) |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
-| **Ollama Analysis** | Local LLM Top 5: **ACTIONABLE** ($ sized) + **ADVISORY** ($0 research) |
+| **Ollama Analysis** | Local LLM Top 5: HA Blue ($) + fun Green/Yellow ($0) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin stats |
 | **Grok Analysis** | Optional cloud narrative (off by default) |
 
@@ -66,14 +70,37 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | Control | Behavior |
 |---------|----------|
 | **Refresh** | Reload next two UFC.com cards + predictions; reuses odds cache when `ODDS_FETCH_ONCE=true` |
-| **Soft Update** | Reload `.env` + attach Odds API lines/props from cache (does not burn credits when fetch-once is on) |
+| **Soft Update** | Reload `.env` + attach book lines/props from cache (does not burn Odds API credits when fetch-once is on) |
 | **Bankroll $** | Total roll (persisted). Auto card budget = bankroll × profile risk % |
 
-### Green edge vs NO BET
+### Color legend (fight table + Top recommended)
 
-- **Green** in the fight table = model shows a **positive edge** vs the price. That is **not** a bet ticket.
-- **NO BET / don’t bet** = nothing cleared **HA gates** (wide uncertainty interval, ensemble disagreement, missing/untrusted odds, etc.).
-- Ollama **ADVISORY** rows are research only (`$0`). Only green **$** sized rows are actionable.
+Row color comes from pick-side math + HA decision — **not** from fight name vibes.
+
+| Color | Meaning | Money |
+|-------|---------|-------|
+| **Blue** | Clears HA gates (usable odds + uncertainty + edge/prob floors) | Real stake ($) |
+| **Green** | Strong model lean / +EV, but **SKIP** (e.g. `wide_interval`) | Fun `$0` only |
+| **Yellow** | Caution — thin edge, borderline prob | Fun `$0` |
+| **Red** | Don't bet — negative edge, low prob, or `no_odds` | Fun `$0` |
+
+**Blue is rare on noisy cards.** High model % with a huge confidence interval still paints **Green** (or Red if no odds) — that is intentional fail-closed HA.
+
+Default fight-table sort (Overview + book tabs):
+
+1. Color rank: Blue → Green → Yellow → Red  
+2. Edge descending  
+3. Model probability descending  
+4. Fight name ascending  
+
+Header clicks still override sort for that table until Refresh rebuilds it.
+
+### Top recommended
+
+- Cap **5** picks, deduped across books (same fight/market/selection collapsed).
+- Prefer Blue (clears gates) → higher edge → stake.
+- Red is excluded from Top recommended when any non-red option exists.
+- Ollama narrates the same pool; if the LLM times out, the HA slip still shows with a soft banner.
 
 ## Odds API credits (`ODDS_FETCH_ONCE`)
 
@@ -123,6 +150,7 @@ python main.py --backtest-2025
 data_loader → feature_engineering (+ fighter_cache) → model_trainer (LGBM+XGB)
       → predictor → uncertainty_gates + high_accuracy_strategy
       → dashboard_service (books / props / Soft Update)
+      → bet_tiers + bet_slip (color rank + Top 5)
       → ufc_dashboard (+ optional Ollama / Grok)
       → background_runner (scheduled; cache-first when ODDS_FETCH_ONCE)
 ```
@@ -132,9 +160,10 @@ data_loader → feature_engineering (+ fighter_cache) → model_trainer (LGBM+XG
 | Data | `data_loader` | UFC.com cards, multi-source history |
 | Model | `predictor`, `ensemble` | Calibrated LGBM+XGB |
 | Gates | `uncertainty_gates`, `high_accuracy_strategy` | Fail-closed HA sizing |
+| Color | `bet_tiers` | Blue/Green/Yellow/Red from decision + edge/prob |
 | Odds | `odds_providers/*`, `odds_api_client` | Cache-first Odds API + optional books |
-| Dashboard | `ufc_dashboard`, `dashboard_service` | GUI, Soft Update, Top 5 slip |
-| Narrative | `grok_analysis` | Ollama (local) / Grok (optional cloud) |
+| Dashboard | `ufc_dashboard`, `dashboard_service`, `bet_slip` | GUI, Soft Update, Top 5 slip |
+| Narrative | `grok_analysis`, `ollama_client` | Ollama (local, default `qwen2.5-coder:7b`) / Grok optional |
 
 ## Background runner
 
@@ -156,6 +185,7 @@ Prefer `START_DASHBOARD.bat` / Python for day-to-day use. Frozen dashboard may f
 ## Safety
 
 - **HA fail-closed** — no sized bets without usable odds + uncertainty clearance
+- **Blue = real money only** — Green/Yellow/Red never get HA stake
 - **Daily loss circuit breaker** — `src/circuit_breaker.py`
 - **Peak drawdown halt** — `risk_manager.DrawdownHalt`
 - **Alert cooldown + fingerprint dedup**
@@ -172,7 +202,9 @@ Copy `.env.example` → `.env`. Important keys:
 | `THE_ODDS_API_KEY` | — | Odds API key |
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
 | `ENABLE_PROPS` | false | Prop tabs (Over 1.5 HA when enabled) |
+| `MYBOOKIE_ENABLED` | false | Optional MyBookie scraper |
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
+| `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Local analysis model (14b often times out) |
 | `GROK_ENABLED` | false | Optional cloud narrative |
 
 ## Ops artifacts
@@ -190,6 +222,8 @@ Copy `.env.example` → `.env`. Important keys:
 ```bash
 python -m pytest tests/ -q
 ```
+
+Includes color-tier rules, fight-table sort order, Top recommended dedupe, and Ollama props wiring.
 
 ## Design notes
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -748,70 +749,121 @@ def _sort_preds_by_model_prob(preds: pd.DataFrame) -> pd.DataFrame:
     return scored.sort_values("_sort_prob", ascending=False).drop(columns="_sort_prob").reset_index(drop=True)
 
 
+_FIGHT_TIER_SORT_RANK = {"blue": 0, "green": 1, "yellow": 2, "red": 3}
+
+
+def _fight_table_sort_key(row: dict[str, Any]) -> tuple:
+    """Stable fight-table order: color → edge↓ → model_prob↓ → fight name↑."""
+    tier = str(row.get("tier") or "").strip().lower()
+    edge = row.get("sort_edge")
+    try:
+        edge_f = float(edge) if edge is not None else -999.0
+    except (TypeError, ValueError):
+        edge_f = -999.0
+    try:
+        prob_f = float(row.get("sort_prob") or 0.0)
+    except (TypeError, ValueError):
+        prob_f = 0.0
+    fight = str(row.get("sort_fight") or "").strip().lower()
+    return (
+        _FIGHT_TIER_SORT_RANK.get(tier, 4),
+        -edge_f,
+        -prob_f,
+        fight,
+    )
+
+
 def _rows_for_table(
     preds: pd.DataFrame,
     bankroll: float,
     strategy,
     *,
     compact: bool = False,
-) -> list[tuple]:
-    rows: list[tuple] = []
+    cleared_keys: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    from src.bet_tiers import classify_bet_tier, row_clears_gates
+
+    rows: list[dict[str, Any]] = []
+    cleared = cleared_keys or set()
+    min_model_prob = float(getattr(strategy, "min_model_prob", 0.70) or 0.70)
     for _, row in _sort_preds_by_model_prob(preds).iterrows():
         edge, pick = _pick_edge(row)
         f1, f2 = str(row.get("fighter_1", "")), str(row.get("fighter_2", ""))
+        fight_name = f"{f1} vs {f2}"
         prob = row.get("predicted_prob", row.get("prob_f1_win"))
         if pd.notna(prob) and pick == f2 and pd.notna(row.get("prob_f2_win")):
             prob = row["prob_f2_win"]
         edge_txt = f"{edge * 100:+.1f}%" if edge is not None else "-"
         prob_txt = f"{float(prob):.0%}" if pd.notna(prob) else "-"
         sort_prob = _model_prob_for_row(row)
+        clears = row_clears_gates(row, cleared)
+        kelly_txt = _kelly_pct(row, bankroll, strategy)
+        # Color from pick-side math + Kelly/status — never from opponent/fight string alone.
+        # SKIP status forces non-blue even if clears_gates is somehow set.
+        tier, reason = classify_bet_tier(
+            row,
+            clears_gates=clears and "SKIP" not in str(kelly_txt).upper(),
+            min_model_prob=min_model_prob,
+            status=kelly_txt,
+            edge=float(edge) if edge is not None else None,
+            model_prob=float(prob) if pd.notna(prob) else None,
+            pick=str(pick or "") or None,
+            debug=True,
+        )
+        _debug_log(
+            f"fight_row_color pick={pick!r} prob={prob_txt} edge={edge_txt} "
+            f"status={kelly_txt!r} stake={'yes' if clears else 'no'} "
+            f"color={tier} reason={reason}"
+        )
+        book = str(
+            row.get("bookmaker")
+            or row.get("odds_book")
+            or row.get("odds_source")
+            or "-"
+        ).strip() or "-"
+        if book.lower() in {"the_odds_api", "odds_api"}:
+            book = "Odds API"
         if compact:
-            book = str(
-                row.get("bookmaker")
-                or row.get("odds_book")
-                or row.get("odds_source")
-                or "-"
-            ).strip() or "-"
-            if book.lower() in {"the_odds_api", "odds_api"}:
-                book = "Odds API"
-            rows.append(
-                (
-                    f"{f1} vs {f2}",
-                    pick or "-",
-                    prob_txt,
-                    _site_odds(row, pick),
-                    edge_txt,
-                    book,
-                    _kelly_pct(row, bankroll, strategy),
-                    sort_prob,
-                )
+            values: tuple = (
+                fight_name,
+                pick or "-",
+                prob_txt,
+                _site_odds(row, pick),
+                edge_txt,
+                book,
+                kelly_txt,
             )
         else:
             brief = build_fight_brief(row, edge_pct=edge * 100 if edge else None)[:120]
-            book = str(
-                row.get("bookmaker")
-                or row.get("odds_book")
-                or row.get("odds_source")
-                or "-"
-            ).strip() or "-"
-            if book.lower() in {"the_odds_api", "odds_api"}:
-                book = "Odds API"
-            rows.append(
-                (
-                    f"{f1} vs {f2}",
-                    pick or "-",
-                    prob_txt,
-                    _site_odds(row, pick),
-                    edge_txt,
-                    book,
-                    _kelly_pct(row, bankroll, strategy),
-                    brief,
-                    _top_shap(row) or "-",
-                    sort_prob,
-                )
+            values = (
+                fight_name,
+                pick or "-",
+                prob_txt,
+                _site_odds(row, pick),
+                edge_txt,
+                book,
+                kelly_txt,
+                brief,
+                _top_shap(row) or "-",
             )
-    rows.sort(key=lambda r: r[-1], reverse=True)
-    return [r[:-1] for r in rows]
+        rows.append(
+            {
+                "values": values,
+                "tier": tier,
+                "pick": str(pick or "") or "-",
+                "sort_prob": sort_prob,
+                "sort_edge": float(edge) if edge is not None else -999.0,
+                "sort_fight": fight_name,
+            }
+        )
+    rows.sort(key=_fight_table_sort_key)
+    order_bits = []
+    for r in rows:
+        edge_v = r.get("sort_edge")
+        edge_s = f"{float(edge_v) * 100:+.1f}%" if edge_v is not None and float(edge_v) > -900 else "-"
+        order_bits.append(f"{r.get('pick')}|{r.get('tier')}|{edge_s}")
+    _debug_log(f"fight_table_sorted order: {' > '.join(order_bits)}")
+    return [{"values": r["values"], "tier": r["tier"]} for r in rows]
 
 
 def _norm_event_name(name: str) -> str:
@@ -1052,6 +1104,21 @@ def _preds_for_card(
     return base
 
 
+def _cleared_fight_keys_from_payload(payload: "DashboardPayload | None") -> set[str]:
+    """Fight ids / labels that cleared HA singles gates (BLUE)."""
+    from src.bet_tiers import singles_cleared_keys
+
+    if payload is None:
+        return set()
+    keys: set[str] = set()
+    books = getattr(payload, "books", None) or {}
+    for data in books.values():
+        if not isinstance(data, dict):
+            continue
+        keys |= singles_cleared_keys((data.get("alerts") or {}).get("singles") or [])
+    return keys
+
+
 def _render_grouped_fight_tables(
     parent,
     cards: list[dict[str, Any]],
@@ -1064,6 +1131,8 @@ def _render_grouped_fight_tables(
     payload: "DashboardPayload | None" = None,
 ) -> None:
     """Render one bordered section per upcoming card, or a single flat table."""
+    from src.bet_tiers import format_tier_legend
+
     for w in list(parent.winfo_children()):
         try:
             w.destroy()
@@ -1079,7 +1148,17 @@ def _render_grouped_fight_tables(
         )
 
     multi = len(cards) > 1
+    cleared = _cleared_fight_keys_from_payload(payload)
     _debug_log(f"Grouped fight tables: {len(cards)} card section(s), multi={multi}")
+
+    legend = ctk.CTkLabel(
+        parent,
+        text=format_tier_legend(),
+        font=ctk.CTkFont(size=11),
+        text_color="#94a3b8",
+        anchor="w",
+    )
+    legend.pack(fill="x", padx=8, pady=(2, 0))
 
     if not multi:
         tbl = DataTable(parent, height=table_height, compact=compact)
@@ -1087,7 +1166,7 @@ def _render_grouped_fight_tables(
         flat = _dedupe_fight_rows(preds)
         if cards:
             flat = _preds_for_card(preds, cards[0].get("predictions", pd.DataFrame()), cards[0].get("event_name", ""))
-        tbl.load_rows(_rows_for_table(flat, bankroll, strategy, compact=compact))
+        tbl.load_rows(_rows_for_table(flat, bankroll, strategy, compact=compact, cleared_keys=cleared))
         return
 
     border_colors = ("#fbbf24", "#38bdf8", "#a78bfa", "#34d399")
@@ -1115,7 +1194,9 @@ def _render_grouped_fight_tables(
         ).pack(fill="x", padx=12, pady=(10, 4))
         sub = DataTable(section, height=table_height, compact=compact)
         sub.pack(fill="x", padx=8, pady=(0, 10))
-        sub.load_rows(_rows_for_table(sub_df, bankroll, strategy, compact=compact))
+        sub.load_rows(
+            _rows_for_table(sub_df, bankroll, strategy, compact=compact, cleared_keys=cleared)
+        )
         _debug_log(f"  Card section {idx}: {ev!r} -> {len(sub_df)} rows")
 
 
@@ -1376,7 +1457,7 @@ def _render_ranked_parlays(
 
 
 class DataTable(_CTK_FRAME):
-    """Scrollable ttk tree table with edge coloring."""
+    """Scrollable ttk tree table with edge coloring and clickable column sort."""
 
     COLUMNS = (
         "Fight",
@@ -1390,13 +1471,40 @@ class DataTable(_CTK_FRAME):
         "SHAP",
     )
     COMPACT_COLUMNS = ("Fight", "Pick", "Prob", "Odds", "Edge", "Book", "Kelly")
+    _NUMERIC_COLS = frozenset({"Prob", "Odds", "Edge", "Kelly"})
 
     def __init__(self, master, *, height: int = 12, compact: bool = False, **kwargs) -> None:
         super().__init__(master, **kwargs)
         self._compact = compact
         columns = self.COMPACT_COLUMNS if compact else self.COLUMNS
+        self._columns = columns
+        self._rows_data: list[tuple[tuple[Any, ...], tuple[str, ...]]] = []
+        self._sort_col: str | None = None
+        self._sort_desc = True
         style = ttk.Style()
         style.theme_use("clam")
+        # Tk 8.6.9+ on Windows: default Treeview style map overrides item tag
+        # colors. Strip !disabled/!selected so per-row tier tags can paint fg.
+        def _fixed_map(option: str):
+            return [
+                elm
+                for elm in style.map("Treeview", query_opt=option)
+                if elm[:2] != ("!disabled", "!selected")
+            ]
+
+        try:
+            style.map(
+                "Treeview",
+                foreground=_fixed_map("foreground"),
+                background=_fixed_map("background"),
+            )
+            style.map(
+                "Dash.Treeview",
+                foreground=[("disabled", "#64748b"), ("selected", "#ffffff")],
+                background=[("disabled", "#1e1e1e"), ("selected", "#334155")],
+            )
+        except Exception:
+            pass
         row_h = 26 if compact else 30
         style.configure(
             "Dash.Treeview",
@@ -1425,7 +1533,12 @@ class DataTable(_CTK_FRAME):
         else:
             widths = (200, 120, 58, 58, 68, 90, 68, 280, 130)
         for col, w in zip(columns, widths):
-            self.tree.heading(col, text=col, anchor="w")
+            self.tree.heading(
+                col,
+                text=col,
+                anchor="w",
+                command=lambda c=col: self._on_heading_click(c),
+            )
             stretch = col in ("Fight", "Brief")
             self.tree.column(col, width=w, minwidth=48, anchor="w", stretch=stretch)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -1437,8 +1550,14 @@ class DataTable(_CTK_FRAME):
             hsb.grid(row=1, column=0, sticky="ew")
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
-        self.tree.tag_configure("pos", foreground="#34d399")
-        self.tree.tag_configure("neg", foreground="#f87171")
+        # Namespaced tags + shared TIER_COLORS (avoids theme keyword collisions).
+        from src.bet_tiers import TIER_COLORS
+
+        for _tier, _hex in TIER_COLORS.items():
+            self.tree.tag_configure(f"tier_{_tier}", foreground=_hex)
+            self.tree.tag_configure(_tier, foreground=_hex)  # legacy tag names
+        self.tree.tag_configure("pos", foreground=TIER_COLORS["green"])
+        self.tree.tag_configure("neg", foreground=TIER_COLORS["red"])
         self.tree.tag_configure("neutral", foreground="#b0b0b0")
         self.tree.tag_configure("even", background="#1a1f2e")
         self.tree.tag_configure("odd", background="#1e1e1e")
@@ -1452,13 +1571,86 @@ class DataTable(_CTK_FRAME):
         self.tree.bind("<MouseWheel>", _on_wheel)
         self.tree.bind("<Enter>", lambda _e: self.tree.focus_set())
 
-    def load_rows(self, rows: list[tuple]) -> None:
+    @staticmethod
+    def _cell_sort_key(value: Any, *, numeric: bool) -> tuple[int, Any]:
+        """Folder-style sort key: missing values sink; numbers parse from display text."""
+        s = str(value if value is not None else "").strip()
+        if s in {"", "-", "—", "n/a", "N/A", "."}:
+            return (1, 0.0 if numeric else "")
+        if numeric:
+            cleaned = s.replace("%", "").replace(",", "").replace("$", "")
+            m = re.search(r"[-+]?\d*\.?\d+", cleaned)
+            if m:
+                try:
+                    return (0, float(m.group(0)))
+                except ValueError:
+                    pass
+            return (1, 0.0)
+        return (0, s.casefold())
+
+    def _on_heading_click(self, col: str) -> None:
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col = col
+            # Stats: best on top first click; names: A→Z first click.
+            self._sort_desc = col in self._NUMERIC_COLS
+        self._redraw_sorted()
+
+    def _refresh_heading_labels(self) -> None:
+        for c in self._columns:
+            label = str(c)
+            if c == self._sort_col:
+                label = f"{c} {'▼' if self._sort_desc else '▲'}"
+            self.tree.heading(
+                c,
+                text=label,
+                anchor="w",
+                command=lambda col=c: self._on_heading_click(col),
+            )
+
+    def _redraw_sorted(self) -> None:
+        self._refresh_heading_labels()
         try:
             self.tree.delete(*self.tree.get_children())
         except Exception:
             pass
+        rows = list(self._rows_data)
+        if self._sort_col and rows:
+            try:
+                idx = list(self._columns).index(self._sort_col)
+            except ValueError:
+                idx = -1
+            if idx >= 0:
+                numeric = self._sort_col in self._NUMERIC_COLS
+                rows.sort(
+                    key=lambda item: self._cell_sort_key(
+                        item[0][idx] if idx < len(item[0]) else "",
+                        numeric=numeric,
+                    ),
+                    reverse=self._sort_desc,
+                )
+        for i, (values, tags) in enumerate(rows):
+            raw = str(tags[0] if tags else "neutral").strip().lower()
+            tier_tag = raw if raw.startswith("tier_") else (
+                f"tier_{raw}" if raw in {"blue", "green", "yellow", "red"} else raw
+            )
+            zebra = "even" if i % 2 == 0 else "odd"
+            # Zebra first, tier last — last tag wins overlapping options on Windows ttk.
+            self.tree.insert(
+                "", "end", values=_ascii_row(values), tags=(zebra, tier_tag)
+            )
+
+    def load_rows(self, rows: list[Any]) -> None:
+        try:
+            self.tree.delete(*self.tree.get_children())
+        except Exception:
+            pass
+        self._rows_data = []
         empty_cols = 7 if self._compact else 9
         if not rows:
+            self._sort_col = None
+            self._refresh_heading_labels()
             self.tree.insert(
                 "",
                 "end",
@@ -1467,16 +1659,24 @@ class DataTable(_CTK_FRAME):
                 ),
             )
             return
-        for i, row in enumerate(rows):
-            edge_txt = row[4] if len(row) > 4 else ""
-            edge_tag = "neutral"
-            if edge_txt not in ("-", ""):
-                try:
-                    edge_tag = "pos" if float(str(edge_txt).replace("%", "").replace("+", "")) > 0 else "neg"
-                except ValueError:
-                    pass
-            zebra = "even" if i % 2 == 0 else "odd"
-            self.tree.insert("", "end", values=_ascii_row(row), tags=(edge_tag, zebra))
+        for row in rows:
+            tier = "neutral"
+            if isinstance(row, dict):
+                values = tuple(row.get("values") or ())
+                tier = str(row.get("tier") or "neutral")
+            else:
+                values = tuple(row)
+                edge_txt = values[4] if len(values) > 4 else ""
+                if edge_txt not in ("-", ""):
+                    try:
+                        edge_v = float(str(edge_txt).replace("%", "").replace("+", ""))
+                        tier = "green" if edge_v > 0 else "red"
+                    except ValueError:
+                        pass
+            self._rows_data.append((values, (tier,)))
+        # Preserve caller order (color → edge → prob → fight). Only re-sort after
+        # the user clicks a column header (_sort_col set).
+        self._redraw_sorted()
 
 
 class TopRecommendedBetsPanel(_CTK_FRAME):
@@ -1514,7 +1714,10 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         ).pack(fill="x")
         ctk.CTkLabel(
             title_block,
-            text="Actionable picks from selected books - stakes as % of card budget (sum 100%)",
+            text=(
+                "Blue = clears HA gates · Green = decent fun · "
+                "Yellow = caution · Red = don't bet"
+            ),
             font=ctk.CTkFont(size=11),
             text_color="#64748b",
             anchor="w",
@@ -1553,143 +1756,77 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         dec = str(bet.get("odds_display") or "-")
         return f"{book}  {am} ({dec})"
 
-    def _render_hero(self, bet: dict[str, Any]) -> None:
-        card = ctk.CTkFrame(
-            self.list_frame,
-            fg_color=self._HERO_BG,
-            corner_radius=10,
-            border_width=2,
-            border_color=self._HERO_BORDER,
+    def _pick_line_text(self, bet: dict[str, Any], rank: int) -> tuple[str, str]:
+        """Return (display line, tier color) for one pick inside the shared bubble."""
+        from src.bet_tiers import TIER_COLORS, TIER_LABELS
+
+        # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
+        tier = str(bet.get("bet_tier") or "").strip().lower()
+        if tier not in TIER_COLORS:
+            if bet.get("fun_bet") or bet.get("advisory"):
+                tier = "green"
+            else:
+                tier = (
+                    "blue"
+                    if float(bet.get("suggested_stake") or bet.get("stake_usd") or 0) > 0
+                    else "yellow"
+                )
+        color = TIER_COLORS.get(tier, "#e2e8f0")
+        label = str(
+            bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
         )
-        card.pack(fill="x", pady=(0, 8))
-
-        ribbon = ctk.CTkFrame(card, fg_color="#fbbf24", corner_radius=6, height=28)
-        ribbon.pack(fill="x", padx=10, pady=(10, 6))
-        ribbon.pack_propagate(False)
-        ctk.CTkLabel(
-            ribbon,
-            text="#1  BEST BET",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#1c1917",
-        ).pack(side="left", padx=12, pady=4)
-
         edge_pct = float(bet.get("edge_pct") or 0)
-        ctk.CTkLabel(
-            ribbon,
-            text=f"{edge_pct:+.1f}% model edge",
-            font=ctk.CTkFont(size=12, weight="bold"),
-            text_color="#1c1917",
-        ).pack(side="right", padx=12)
+        tier_lbl = TIER_LABELS.get(tier, tier).upper()
+        if bet.get("fun_bet") or tier in {"green", "yellow", "red"}:
+            money = "fun $0"
+        else:
+            money = _format_ticket_stake(bet)
+        line = (
+            f"#{rank}  [{tier_lbl}]  {label}  ·  {edge_pct:+.1f}%  ·  {money}"
+        )
+        return _ascii_ui(line), color
 
-        body = ctk.CTkFrame(card, fg_color="transparent")
-        body.pack(fill="x", padx=14, pady=(0, 12))
-        bet_type = str(bet.get("bet_type") or "Bet")
-        ctk.CTkLabel(
-            body,
-            text=bet_type,
-            font=ctk.CTkFont(size=10, weight="bold"),
-            text_color="#a5b4fc",
-            anchor="w",
-        ).pack(fill="x")
-        ctk.CTkLabel(
-            body,
-            text=_ascii_ui(str(bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-")),
-            font=ctk.CTkFont(size=17, weight="bold"),
-            text_color="#f8fafc",
-            anchor="w",
-            wraplength=900,
-            justify="left",
-        ).pack(fill="x", pady=(4, 6))
-        ctk.CTkLabel(
-            body,
-            text=_ascii_ui(self._odds_line(bet)),
-            font=ctk.CTkFont(size=13),
-            text_color="#cbd5e1",
-            anchor="w",
-        ).pack(fill="x")
+    def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
+        """All top picks in a single bubble (colored lines, not separate cards)."""
+        from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
 
-        stake = float(bet.get("suggested_stake") or 0)
-        stake_row = ctk.CTkFrame(body, fg_color="#312e81", corner_radius=8)
-        stake_row.pack(fill="x", pady=(10, 0))
-        ctk.CTkLabel(
-            stake_row,
-            text=_ascii_ui(_format_ticket_stake(bet)),
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color="#fde68a",
-            anchor="w",
-        ).pack(side="left", padx=12, pady=8)
-        prob = bet.get("prob")
-        if prob is not None:
-            ctk.CTkLabel(
-                stake_row,
-                text=f"Model win prob {float(prob):.0%}",
-                font=ctk.CTkFont(size=11),
-                text_color="#94a3b8",
-                anchor="e",
-            ).pack(side="right", padx=12)
-
-    def _render_row(self, bet: dict[str, Any], rank: int) -> None:
-        row = ctk.CTkFrame(
+        bets = dedupe_rank_top_tickets(list(bets or []), limit=5)
+        bubble = ctk.CTkFrame(
             self.list_frame,
             fg_color=self._ROW_BG,
-            corner_radius=8,
-            border_width=1,
-            border_color=self._BORDER,
+            corner_radius=12,
+            border_width=2,
+            border_color="#475569",
         )
-        row.pack(fill="x", pady=3)
-
-        rank_colors = ("#fbbf24", "#cbd5e1", "#cd7f32", "#94a3b8", "#94a3b8")
-        rank_color = rank_colors[min(rank - 1, 4)]
-
-        left = ctk.CTkFrame(row, fg_color="transparent", width=44)
-        left.pack(side="left", padx=(12, 4), pady=10)
-        left.pack_propagate(False)
+        bubble.pack(fill="x", padx=4, pady=(0, 6))
         ctk.CTkLabel(
-            left,
-            text=f"#{rank}",
-            font=ctk.CTkFont(size=16, weight="bold"),
-            text_color=rank_color,
-        ).pack(anchor="w")
-
-        mid = ctk.CTkFrame(row, fg_color="transparent")
-        mid.pack(side="left", fill="x", expand=True, padx=4, pady=10)
-        label = _ascii_ui(str(bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"))
-        ctk.CTkLabel(
-            mid,
-            text=label,
+            bubble,
+            text=top_recommended_label(len(bets), limit=5),
             font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#f1f5f9",
+            text_color="#f8fafc",
             anchor="w",
-            wraplength=420,
-            justify="left",
-        ).pack(fill="x")
+        ).pack(fill="x", padx=14, pady=(12, 4))
+
+        for bet in bets:
+            rank = int(bet.get("rank") or 0) or (bets.index(bet) + 1)
+            line, color = self._pick_line_text(bet, rank)
+            ctk.CTkLabel(
+                bubble,
+                text=line,
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=color,
+                anchor="w",
+                justify="left",
+                wraplength=900,
+            ).pack(fill="x", padx=14, pady=(0, 2))
+
         ctk.CTkLabel(
-            mid,
-            text=self._odds_line(bet),
-            font=ctk.CTkFont(size=11),
-            text_color="#94a3b8",
+            bubble,
+            text="Blue sized · Green/Yellow fun $0 · Red don't bet",
+            font=ctk.CTkFont(size=10),
+            text_color="#64748b",
             anchor="w",
-        ).pack(fill="x", pady=(2, 0))
-
-        edge_pct = float(bet.get("edge_pct") or 0)
-        edge_color = "#34d399" if edge_pct > 0 else "#f87171"
-        ctk.CTkLabel(
-            row,
-            text=f"{edge_pct:+.1f}%",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color=edge_color,
-            width=56,
-        ).pack(side="left", padx=4, pady=10)
-
-        stake = float(bet.get("suggested_stake") or 0)
-        ctk.CTkLabel(
-            row,
-            text=_ascii_ui(_format_ticket_stake(bet)),
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#fde68a",
-            width=130,
-            anchor="e",
-        ).pack(side="right", padx=14, pady=10)
+        ).pack(fill="x", padx=14, pady=(6, 12))
 
     def render(
         self,
@@ -1716,23 +1853,23 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         if pool_status:
             self.pool_label.configure(text=_ascii_ui(pool_status))
         else:
-            # Fallback: never invent a leftover $12 pool — derive from stakes only
-            allocated = sum(float(b.get("suggested_stake") or 0) for b in bets)
-            sum_pct = sum(float(b.get("stake_pct") or 0) for b in bets)
+            allocated = sum(
+                float(b.get("suggested_stake") or 0)
+                for b in bets
+                if not b.get("fun_bet")
+            )
+            sum_pct = sum(
+                float(b.get("stake_pct") or 0) for b in bets if not b.get("fun_bet")
+            )
             auto = float(bets[0].get("card_pool_usd") or 0)
             self.pool_label.configure(
                 text=_ascii_ui(
                     f"Auto card ${auto:,.2f} · Allocated ${allocated:,.2f} "
-                    f"({sum_pct:.0f}%) · Tickets {len(bets)}"
+                    f"({sum_pct:.0f}%) · Picks {len(bets)}"
                 )
             )
 
-        for bet in bets:
-            rank = int(bet.get("rank") or 0)
-            if rank == 1:
-                self._render_hero(bet)
-            elif rank > 1:
-                self._render_row(bet, rank)
+        self._render_picks_bubble(bets)
 
 
 def _format_grok_user_error(err: Any) -> str:
@@ -1767,11 +1904,22 @@ def _format_grok_user_error(err: Any) -> str:
 class GrokAnalysisPanel(_CTK_FRAME):
     """Optional Ollama narrative read on top fights/props (runs in background thread)."""
 
-    def __init__(self, master, *, on_run: Callable[[], None] | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        master,
+        *,
+        on_run: Callable[[], None] | None = None,
+        on_chat: Callable[[str], None] | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(master, fg_color="#111827", corner_radius=10, **kwargs)
         self._on_run = on_run
+        self._on_chat = on_chat
         self._think_after_id: str | None = None
         self._think_started_at: float | None = None
+        self._chat_busy = False
+        self._chat_ask_busy = False
+        self._last_result: dict[str, Any] | None = None
 
         hdr = ctk.CTkFrame(self, fg_color="transparent")
         hdr.pack(fill="x", padx=12, pady=(12, 6))
@@ -1802,7 +1950,7 @@ class GrokAnalysisPanel(_CTK_FRAME):
         )
         self.run_btn.pack(side="left")
 
-        from src.ollama_client import list_model_choices
+        from src.ollama_client import list_model_choices, model_speed_hint
 
         model_choices = list_model_choices()
         current = str(getattr(config, "OLLAMA_MODEL", model_choices[0]) or model_choices[0])
@@ -1819,7 +1967,7 @@ class GrokAnalysisPanel(_CTK_FRAME):
             btn_row,
             values=model_choices,
             variable=self.model_var,
-            width=180,
+            width=200,
             command=self._on_model_selected,
         )
         self.model_menu.pack(side="left")
@@ -1827,7 +1975,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
         timeout_s = int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)
         self.hint_label = ctk.CTkLabel(
             btn_row,
-            text=f"Top 5: HA-sized + advisory ($0) · timeout {timeout_s}s",
+            text=(
+                f"Model = narrative only (HA stakes unchanged) · "
+                f"{model_speed_hint(current)} · timeout {timeout_s}s"
+            ),
             font=ctk.CTkFont(size=11),
             text_color="#64748b",
             anchor="w",
@@ -1840,15 +1991,122 @@ class GrokAnalysisPanel(_CTK_FRAME):
         self.progress.pack_forget()
 
         self.scroll = ctk.CTkScrollableFrame(self, label_text="Top 5 recommended")
-        self.scroll.pack(fill="both", expand=True, padx=10, pady=(4, 12))
+        self.scroll.pack(fill="both", expand=True, padx=10, pady=(4, 6))
+
+        # --- Communication / chat bar ---
+        chat_wrap = ctk.CTkFrame(self, fg_color="#0f172a", corner_radius=8)
+        chat_wrap.pack(fill="x", padx=10, pady=(0, 10))
+        ctk.CTkLabel(
+            chat_wrap,
+            text="Ask Ollama",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#e2e8f0",
+            anchor="w",
+        ).pack(fill="x", padx=10, pady=(8, 2))
+        self.chat_log = ctk.CTkTextbox(
+            chat_wrap,
+            height=120,
+            font=ctk.CTkFont(size=12),
+            fg_color="#111827",
+            text_color="#cbd5e1",
+            wrap="word",
+            activate_scrollbars=True,
+        )
+        self.chat_log.pack(fill="x", padx=10, pady=(0, 6))
+        self.chat_log.insert(
+            "1.0",
+            "Ask which bets look best, or click Best bets for an automatic HA/stats briefing.\n",
+        )
+        self.chat_log.configure(state="disabled")
+
+        bar = ctk.CTkFrame(chat_wrap, fg_color="transparent")
+        bar.pack(fill="x", padx=10, pady=(0, 10))
+        self.chat_entry = ctk.CTkEntry(
+            bar,
+            placeholder_text="e.g. Which are the best bets on this card?",
+            height=32,
+        )
+        self.chat_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.chat_entry.bind("<Return>", self._on_chat_return)
+        self.best_bets_btn = ctk.CTkButton(
+            bar,
+            text="Best bets",
+            width=90,
+            fg_color="#1d4ed8",
+            hover_color="#2563eb",
+            command=self._on_best_bets_click,
+        )
+        self.best_bets_btn.pack(side="left", padx=(0, 6))
+        self.ask_btn = ctk.CTkButton(
+            bar,
+            text="Ask",
+            width=70,
+            fg_color="#0f766e",
+            hover_color="#14b8a6",
+            command=self._on_ask_click,
+        )
+        self.ask_btn.pack(side="left")
 
     def _on_model_selected(self, value: str) -> None:
-        from src.ollama_client import set_active_model
+        from src.ollama_client import last_model_warn, model_speed_hint, set_active_model
 
-        chosen = set_active_model(value)
+        requested = str(value or "").strip()
+        chosen = set_active_model(requested)
         self.model_var.set(chosen)
-        self.status_label.configure(text=f"Model set to {chosen}")
-        _debug_log(f"Ollama model selected: {chosen}")
+        self.refresh_model_choices()
+        timeout_s = int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)
+        warn = last_model_warn()
+        if warn:
+            note = warn
+            status = warn
+        else:
+            note = model_speed_hint(chosen)
+            status = f"Model set to {chosen}"
+        try:
+            self.hint_label.configure(
+                text=(
+                    f"Model = narrative only (HA stakes unchanged) · "
+                    f"{note} · timeout {timeout_s}s"
+                )
+            )
+        except Exception:
+            pass
+        self.status_label.configure(text=status)
+        _debug_log(f"Ollama model selected: requested={requested!r} active={chosen!r}")
+
+    def sync_active_model(self) -> str:
+        """Apply the dropdown selection to runtime config before any Ollama call."""
+        from src.ollama_client import (
+            _is_heavy_model,
+            _model_param_b,
+            last_model_warn,
+            ollama_installed_models,
+            set_active_model,
+        )
+
+        requested = str(self.model_var.get() or "").strip()
+        installed = ollama_installed_models()
+        # Prefer 7b when UI still has a heavy model selected (common timeout cause).
+        if requested and installed and (
+            _is_heavy_model(requested) or _model_param_b(requested) >= 14
+        ):
+            for pref in ("qwen2.5-coder:7b", "qwen2.5:7b", "llama3.2:3b"):
+                if pref in installed:
+                    requested = pref
+                    break
+        chosen = set_active_model(requested)
+        try:
+            self.model_var.set(chosen)
+            self.refresh_model_choices()
+        except Exception:
+            pass
+        warn = last_model_warn()
+        if warn:
+            try:
+                self.status_label.configure(text=warn)
+            except Exception:
+                pass
+        return chosen
 
     def refresh_model_choices(self) -> None:
         try:
@@ -1861,6 +2119,53 @@ class GrokAnalysisPanel(_CTK_FRAME):
             self.model_menu.configure(values=choices)
             if current:
                 self.model_var.set(current)
+        except Exception:
+            pass
+
+    def _on_chat_return(self, _event: Any = None) -> str:
+        self._on_ask_click()
+        return "break"
+
+    def _on_ask_click(self) -> None:
+        if self._chat_busy:
+            return
+        q = str(self.chat_entry.get() or "").strip()
+        if not q:
+            q = "Which are the best bets on this card? Include stakes and edge stats."
+        self.chat_entry.delete(0, "end")
+        self.append_chat("You", q)
+        if self._on_chat:
+            self._on_chat(q)
+
+    def _on_best_bets_click(self) -> None:
+        if self._chat_busy:
+            return
+        q = "Which are the best bets on this card? Include stakes and edge stats."
+        self.chat_entry.delete(0, "end")
+        self.append_chat("You", q)
+        if self._on_chat:
+            self._on_chat(q)
+
+    def append_chat(self, role: str, text: str) -> None:
+        body = _ascii_ui(str(text or "").strip())
+        if not body:
+            return
+        stamp = datetime.now().strftime("%H:%M")
+        try:
+            self.chat_log.configure(state="normal")
+            self.chat_log.insert("end", f"\n[{stamp}] {role}\n{body}\n")
+            self.chat_log.see("end")
+            self.chat_log.configure(state="disabled")
+        except Exception:
+            pass
+
+    def set_chat_busy(self, busy: bool) -> None:
+        self._chat_busy = bool(busy)
+        state = "disabled" if busy else "normal"
+        try:
+            self.ask_btn.configure(state=state)
+            self.best_bets_btn.configure(state=state)
+            self.chat_entry.configure(state=state)
         except Exception:
             pass
 
@@ -1890,6 +2195,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
             self.model_menu.configure(state=state)
         except Exception:
             pass
+        if busy:
+            self.set_chat_busy(True)
+        elif not self._chat_ask_busy:
+            self.set_chat_busy(False)
         self._cancel_think_tick()
         if busy:
             self._think_started_at = time.time()
@@ -1914,6 +2223,8 @@ class GrokAnalysisPanel(_CTK_FRAME):
         for w in self.scroll.winfo_children():
             w.destroy()
         self.refresh_model_choices()
+        if isinstance(result, dict):
+            self._last_result = result
 
         health_banner = ""
         error_class = ""
@@ -1955,7 +2266,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
 
         if health_banner and (
             not result.get("ok")
+            or result.get("narrative_degraded")
             or error_class in {"offline", "timeout", "model_missing", "disabled"}
+            or str(result.get("ollama_error_class") or "")
+            in {"offline", "timeout", "model_missing", "disabled"}
         ):
             self._pack_message(health_banner, "", color="#fbbf24", title_size=13)
 
@@ -1988,6 +2302,17 @@ class GrokAnalysisPanel(_CTK_FRAME):
 
         # Always show Top 5 structure warning when there is a slip
         slip = list(result.get("bet_slip") or [])
+        try:
+            from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
+
+            slip = dedupe_rank_top_tickets(slip, limit=5)
+            result["bet_slip"] = slip
+            try:
+                self.scroll.configure(label_text=top_recommended_label(len(slip), limit=5))
+            except Exception:
+                pass
+        except Exception:
+            slip = slip[:5]
         warn = str(result.get("top5_warning") or "").strip()
         if slip and warn:
             n_act = result.get("n_actionable")
@@ -2060,30 +2385,23 @@ class GrokAnalysisPanel(_CTK_FRAME):
             )
             self._pack_message("NO BET", no_bet_body, color="#fbbf24")
         elif slip:
-            self._pack_message(
-                "Top 5 recommended",
-                "Green $ = actionable HA ticket. Amber ADVISORY = research only ($0).",
-                color="#94a3b8",
-                title_size=12,
-            )
-            for bet in slip:
-                self._render_bet_slip_row(bet)
-
-            actionable = [b for b in slip if not b.get("advisory")]
+            self._render_bet_slip_bubble(slip)
+            actionable = [
+                b for b in slip if not b.get("advisory") and not b.get("fun_bet")
+            ]
             sum_pct = sum(float(b.get("stake_pct") or 0) for b in actionable)
             sum_usd = sum(float(b.get("stake_usd") or 0) for b in actionable)
-            self._pack_message(
-                "Card total (actionable only)",
-                f"{sum_pct:.1f}% of card  ·  ${sum_usd:.2f}",
-                color="#86efac",
-                title_size=13,
-            )
-            if result.get("no_bet") and actionable:
-                pass
-            elif result.get("no_bet"):
+            if actionable:
+                self._pack_message(
+                    "Card total (actionable only)",
+                    f"{sum_pct:.1f}% of card  ·  ${sum_usd:.2f}",
+                    color="#86efac",
+                    title_size=13,
+                )
+            if result.get("no_bet") and not actionable:
                 self._pack_message(
                     "NO BET (sized)",
-                    "No HA-sized tickets this card — advisory rows above are research only.",
+                    "No HA-sized tickets this card — colored fun picks above are $0 research only.",
                     color="#fbbf24",
                     title_size=12,
                 )
@@ -2124,94 +2442,103 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 wraplength=1000,
             ).pack(fill="x", padx=12, pady=(0, 10))
 
-    def _render_bet_slip_row(self, bet: dict[str, Any]) -> None:
-        """Primary actionable row: side / market / book / % / $ + one-line reason."""
-        rank = bet.get("rank") or ""
-        side = str(bet.get("side") or bet.get("pick_line") or bet.get("pick") or "—")
-        market = str(bet.get("market") or "moneyline")
-        book = str(bet.get("book") or "n/a")
-        pct = float(bet.get("stake_pct") or 0)
-        dollars = float(bet.get("stake_usd") or 0)
-        reason = str(bet.get("reason") or "").strip()
-        conf = str(bet.get("confidence") or bet.get("conviction") or "")
-        edge = bet.get("edge_pct")
-        odds = str(bet.get("odds_display") or "")
-        advisory = bool(bet.get("advisory") or str(bet.get("tier") or "").lower() == "advisory")
+    def _render_bet_slip_bubble(self, slip: list[dict[str, Any]]) -> None:
+        """All recommended picks in one bubble (tier-colored lines)."""
+        from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
+        from src.bet_tiers import TIER_COLORS, TIER_LABELS, format_tier_legend
 
-        border = "#f59e0b" if advisory else "#334155"
-        frame = ctk.CTkFrame(
-            self.scroll, fg_color="#0f172a", corner_radius=8, border_width=1, border_color=border
+        # Fail-safe: never show duplicates / >5 even if upstream missed a merge
+        slip = dedupe_rank_top_tickets(list(slip or []), limit=5)
+
+        bubble = ctk.CTkFrame(
+            self.scroll,
+            fg_color="#0f172a",
+            corner_radius=10,
+            border_width=2,
+            border_color="#475569",
         )
-        frame.pack(fill="x", padx=4, pady=5)
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.pack(fill="x", padx=12, pady=(10, 2))
-        badge = "ADVISORY  " if advisory else ""
+        bubble.pack(fill="x", padx=4, pady=6)
         ctk.CTkLabel(
-            hdr,
-            text=f"#{rank}  {badge}{side}",
+            bubble,
+            text=top_recommended_label(len(slip), limit=5),
             font=ctk.CTkFont(size=14, weight="bold"),
-            text_color="#fbbf24" if advisory else "#f8fafc",
+            text_color="#f8fafc",
             anchor="w",
-        ).pack(side="left", fill="x", expand=True)
-        stake_txt = "research only · $0" if advisory else f"{pct:.1f}%  ·  ${dollars:.2f}"
+        ).pack(fill="x", padx=12, pady=(10, 2))
         ctk.CTkLabel(
-            hdr,
-            text=stake_txt,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            text_color="#fbbf24" if advisory else "#34d399",
-        ).pack(side="right")
-
-        meta = f"{market}  ·  {book}"
-        if odds and odds != "-":
-            meta += f"  ·  {odds}"
-        if conf:
-            meta += f"  ·  conf {conf}"
-        if edge is not None:
-            try:
-                meta += f"  ·  edge {float(edge):.1f}%"
-            except (TypeError, ValueError):
-                pass
-        ctk.CTkLabel(
-            frame,
-            text=meta,
+            bubble,
+            text=format_tier_legend(),
             font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
             anchor="w",
-        ).pack(fill="x", padx=12, pady=(0, 2))
+        ).pack(fill="x", padx=12, pady=(0, 8))
 
-        if reason:
+        for i, bet in enumerate(slip, start=1):
+            rank = bet.get("rank") or i
+            side = str(bet.get("side") or bet.get("pick_line") or bet.get("pick") or "—")
+            market = str(bet.get("market") or "moneyline")
+            book = str(bet.get("book") or "n/a")
+            pct = float(bet.get("stake_pct") or 0)
+            dollars = float(bet.get("stake_usd") or 0)
+            edge = bet.get("edge_pct")
+            if edge is None and bet.get("edge") is not None:
+                try:
+                    edge = float(bet.get("edge")) * 100.0
+                except (TypeError, ValueError):
+                    edge = None
+            bet_tier = str(bet.get("bet_tier") or "").strip().lower()
+            if bet_tier not in TIER_COLORS:
+                if bet.get("fun_bet") or bet.get("advisory"):
+                    bet_tier = "green"
+                elif dollars > 0:
+                    bet_tier = "blue"
+                else:
+                    bet_tier = "yellow"
+            color = TIER_COLORS.get(bet_tier, "#e2e8f0")
+            tier_lbl = TIER_LABELS.get(bet_tier, bet_tier).upper()
+            if bet.get("fun_bet") or bet_tier in {"green", "yellow"}:
+                money = "fun $0"
+            elif bet.get("advisory"):
+                money = "research $0"
+            else:
+                money = f"{pct:.1f}% · ${dollars:.2f}"
+            edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
+            line = (
+                f"#{rank}  [{tier_lbl}]  {side}  ·  {market} @ {book}  ·  "
+                f"edge {edge_s}  ·  {money}"
+            )
             ctk.CTkLabel(
-                frame,
-                text=reason,
-                font=ctk.CTkFont(size=12),
-                text_color="#cbd5e1",
+                bubble,
+                text=_ascii_ui(line),
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=color,
                 anchor="w",
                 justify="left",
                 wraplength=980,
-            ).pack(fill="x", padx=12, pady=(0, 10))
-        else:
-            ctk.CTkLabel(
-                frame,
-                text="(reason pending)",
-                font=ctk.CTkFont(size=11),
-                text_color="#64748b",
-                anchor="w",
-            ).pack(fill="x", padx=12, pady=(0, 10))
+            ).pack(fill="x", padx=12, pady=(0, 3))
+
+        ctk.CTkFrame(bubble, fg_color="transparent", height=8).pack(fill="x")
+
+    def _render_bet_slip_row(self, bet: dict[str, Any]) -> None:
+        """Legacy single-row path — fold into the shared bubble."""
+        self._render_bet_slip_bubble([bet])
 
     def _render_pick_card(self, pick: dict[str, Any]) -> None:
-        """Legacy narrative card — maps into bet-slip row when possible."""
-        self._render_bet_slip_row(
-            {
-                "rank": pick.get("rank") or "",
-                "side": pick.get("side") or pick.get("id") or pick.get("pick") or "Pick",
-                "market": pick.get("market") or pick.get("pick_type") or "moneyline",
-                "book": pick.get("book") or "n/a",
-                "stake_pct": pick.get("stake_pct") or 0,
-                "stake_usd": pick.get("stake_usd") or 0,
-                "reason": pick.get("reason") or pick.get("narrative_edge") or "",
-                "confidence": pick.get("conviction") or "",
-                "odds_display": pick.get("odds_display") or "",
-            }
+        """Legacy narrative card — maps into bet-slip bubble when possible."""
+        self._render_bet_slip_bubble(
+            [
+                {
+                    "rank": pick.get("rank") or "",
+                    "side": pick.get("side") or pick.get("id") or pick.get("pick") or "Pick",
+                    "market": pick.get("market") or pick.get("pick_type") or "moneyline",
+                    "book": pick.get("book") or "n/a",
+                    "stake_pct": pick.get("stake_pct") or 0,
+                    "stake_usd": pick.get("stake_usd") or 0,
+                    "reason": pick.get("reason") or pick.get("narrative_edge") or "",
+                    "confidence": pick.get("conviction") or "",
+                    "odds_display": pick.get("odds_display") or "",
+                }
+            ]
         )
 
 class BookTab(_CTK_FRAME):
@@ -2521,10 +2848,14 @@ class PropsTable(_CTK_FRAME):
     """Prop singles table: type+fight, fighter, book odds, edge, budget-scaled stake."""
 
     COLUMNS = ("Prop Type", "Fighter", "Odds", "Edge", "Min Bet")
+    _NUMERIC_COLS = frozenset({"Odds", "Edge", "Min Bet"})
 
     def __init__(self, master, *, height: int = 14, book_name: str = "", **kwargs) -> None:
         super().__init__(master, **kwargs)
         self.book_name = book_name
+        self._rows_data: list[tuple[tuple[Any, ...], tuple[str, ...]]] = []
+        self._sort_col: str | None = None
+        self._sort_desc = True
         style = ttk.Style()
         style.theme_use("clam")
         style.configure(
@@ -2551,7 +2882,12 @@ class PropsTable(_CTK_FRAME):
         )
         widths = (280, 130, 120, 88, 108)
         for col, w in zip(self.COLUMNS, widths):
-            self.tree.heading(col, text=col, anchor="w")
+            self.tree.heading(
+                col,
+                text=col,
+                anchor="w",
+                command=lambda c=col: self._on_heading_click(c),
+            )
             stretch = col == "Prop Type"
             self.tree.column(col, width=w, minwidth=56, anchor="w", stretch=stretch)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -2563,8 +2899,9 @@ class PropsTable(_CTK_FRAME):
         self.tree.tag_configure("pos", foreground="#34d399")
         self.tree.tag_configure("neg", foreground="#f87171")
         self.tree.tag_configure("neutral", foreground="#b0b0b0")
-        self.tree.tag_configure("synth", foreground="#fbbf24")
-        self.tree.tag_configure("relaxed", foreground="#fbbf24")
+        # Synthetic / relaxed = slate (not amber/orange — that looked like a 5th bet tier)
+        self.tree.tag_configure("synth", foreground="#94a3b8")
+        self.tree.tag_configure("relaxed", foreground="#94a3b8")
         self.tree.tag_configure("even", background="#1a1f2e")
         self.tree.tag_configure("odd", background="#1e1e1e")
         self.tree.bind("<MouseWheel>", self._on_wheel)
@@ -2573,6 +2910,49 @@ class PropsTable(_CTK_FRAME):
     def _on_wheel(self, event) -> None:
         if event.delta:
             self.tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_heading_click(self, col: str) -> None:
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col = col
+            self._sort_desc = col in self._NUMERIC_COLS
+        self._redraw_sorted()
+
+    def _refresh_heading_labels(self) -> None:
+        for c in self.COLUMNS:
+            label = str(c)
+            if c == self._sort_col:
+                label = f"{c} {'▼' if self._sort_desc else '▲'}"
+            self.tree.heading(
+                c,
+                text=label,
+                anchor="w",
+                command=lambda col=c: self._on_heading_click(col),
+            )
+
+    def _redraw_sorted(self) -> None:
+        self._refresh_heading_labels()
+        self.tree.delete(*self.tree.get_children())
+        rows = list(self._rows_data)
+        if self._sort_col and rows:
+            try:
+                idx = list(self.COLUMNS).index(self._sort_col)
+            except ValueError:
+                idx = -1
+            if idx >= 0:
+                numeric = self._sort_col in self._NUMERIC_COLS
+                rows.sort(
+                    key=lambda item: DataTable._cell_sort_key(
+                        item[0][idx] if idx < len(item[0]) else "",
+                        numeric=numeric,
+                    ),
+                    reverse=self._sort_desc,
+                )
+        for i, (values, tags) in enumerate(rows):
+            edge_tag = tags[0] if tags else "neutral"
+            zebra = "even" if i % 2 == 0 else "odd"
+            self.tree.insert("", "end", values=_ascii_row(values), tags=(edge_tag, zebra))
 
     @staticmethod
     def _format_odds(s: dict[str, Any], book_name: str) -> str:
@@ -2591,7 +2971,10 @@ class PropsTable(_CTK_FRAME):
 
     def load_singles(self, singles: list[dict[str, Any]]) -> None:
         self.tree.delete(*self.tree.get_children())
+        self._rows_data = []
         if not singles:
+            self._sort_col = None
+            self._refresh_heading_labels()
             self.tree.insert(
                 "",
                 "end",
@@ -2599,7 +2982,7 @@ class PropsTable(_CTK_FRAME):
                 tags=("neutral", "even"),
             )
             return
-        for i, s in enumerate(singles):
+        for s in singles:
             fight = str(s.get("fight", ""))
             prop_title = str(
                 s.get("prop_short") or s.get("prop_type") or s.get("prop_key", "")
@@ -2625,7 +3008,6 @@ class PropsTable(_CTK_FRAME):
                 edge_txt = "-"
                 edge_tag = "neutral"
 
-            stake = float(s.get("suggested_stake") or 0)
             if s.get("book_disabled"):
                 stake_txt = "Book off"
             else:
@@ -2638,8 +3020,11 @@ class PropsTable(_CTK_FRAME):
                 edge_txt,
                 stake_txt,
             )
-            zebra = "even" if i % 2 == 0 else "odd"
-            self.tree.insert("", "end", values=_ascii_row(row), tags=(edge_tag, zebra))
+            self._rows_data.append((row, (edge_tag,)))
+        if self._sort_col is None:
+            self._sort_col = "Edge"
+            self._sort_desc = True
+        self._redraw_sorted()
 
 
 class ArbScannerTab(_CTK_FRAME):
@@ -2999,7 +3384,7 @@ class ArbScannerTab(_CTK_FRAME):
         tree.pack(fill="x")
         tree.tag_configure("pos", foreground="#34d399")
         tree.tag_configure("strong", foreground="#ecfdf5", background="#166534")
-        tree.tag_configure("synth", foreground="#fbbf24")
+        tree.tag_configure("synth", foreground="#94a3b8")
         tree.tag_configure("even", background="#1a1f2e")
         tree.tag_configure("odd", background="#1e1e1e")
 
@@ -3484,7 +3869,7 @@ class BookPropsTab(_CTK_FRAME):
         if total_found:
             parts = [f"Showing {shown} of {total_found} ranked props"]
             if synth_n:
-                parts.append(f"{synth_n} synthetic (amber, model %)")
+                parts.append(f"{synth_n} synthetic (slate, model %)")
             if live_prop_n:
                 parts.append(f"{live_prop_n} live edge")
             self.filter_label.configure(text="  |  ".join(parts))
@@ -4517,10 +4902,11 @@ class UFCDashboardApp(_CTK_BASE):
         return keys
 
     def _overview_recommendations(self) -> list[dict[str, Any]]:
-        """Top 3-5 picks for Overview, respecting budget, books, profile, and Grok."""
+        """Top picks: BLUE HA tickets first, then GREEN/YELLOW fun bets (never loosens gates)."""
         if self._payload is None:
             return []
         profile = self._profile_from_menu(self.profile_var.get())
+        items: list[dict[str, Any]] = []
         try:
             from src.strategy import (
                 aggregate_overview_recommendations,
@@ -4534,7 +4920,6 @@ class UFCDashboardApp(_CTK_BASE):
                 profile=profile,
                 allowed_fights=self._allowed_fight_keys(self._payload.combined),
             )
-            # Narrative tilt after model sizing (uncertainty + strategy rating already applied)
             tilted = apply_narrative_tilt_after_model_sizing(recs, self._grok_result)
             if isinstance(tilted, dict):
                 items = list(tilted.get("items") or [])
@@ -4552,7 +4937,6 @@ class UFCDashboardApp(_CTK_BASE):
             else:
                 items = list(tilted or [])
                 pool = float(items[0].get("card_pool_usd") or 0) if items else 0.0
-            # Re-normalize % after tilt so card stakes still sum to 100%
             if items and pool > 0:
                 try:
                     from src.strategy import allocate_card_budget_pct
@@ -4562,17 +4946,15 @@ class UFCDashboardApp(_CTK_BASE):
                         t["rank"] = i
                 except Exception as exc:
                     _debug_log(f"Overview stake re-alloc skipped: {exc}")
-            _debug_log(f"Overview recommendations: {len(items)} pick(s) from aggregate")
-            return items
         except Exception as exc:
             _debug_log(f"Overview recommendations fallback: {exc}")
             overview = self._payload.books.get("Overview", {}).get("alerts") or {}
             singles = overview.get("singles") or []
-            out: list[dict[str, Any]] = []
+            items = []
             for i, s in enumerate(singles[:5], start=1):
                 fight = str(s.get("fight") or "")
                 pick = str(s.get("pick") or "")
-                out.append(
+                items.append(
                     {
                         "rank": i,
                         "pick_line": f"{pick} over {fight.split(' vs ')[-1] if ' vs ' in fight else fight}",
@@ -4590,7 +4972,78 @@ class UFCDashboardApp(_CTK_BASE):
                         ),
                     }
                 )
-            return out
+
+        for t in items:
+            t.setdefault("bet_tier", "blue")
+            t.setdefault("tier", "blue")
+            t["fun_bet"] = False
+
+        # Fill remaining slots with GREEN/YELLOW fun rankings (HA gates unchanged).
+        try:
+            from src.bet_tiers import (
+                TIER_BLUE,
+                TIER_GREEN,
+                TIER_YELLOW,
+                collect_props_from_books,
+                merge_bet_tier_dicts,
+                rank_card_bet_tiers,
+                rank_prop_bet_tiers,
+            )
+
+            overview_alerts = (self._payload.books.get("Overview") or {}).get("alerts") or {}
+            cleared = list(overview_alerts.get("singles") or [])
+            for book_data in (self._payload.books or {}).values():
+                if isinstance(book_data, dict):
+                    cleared.extend((book_data.get("alerts") or {}).get("singles") or [])
+            preds = self._payload.combined
+            if _df_is_empty(preds):
+                preds = (self._payload.books.get("Overview") or {}).get("predictions")
+            tiers = rank_card_bet_tiers(
+                preds if isinstance(preds, pd.DataFrame) else None,
+                cleared_singles=cleared,
+                limit_per_tier=5,
+            )
+            try:
+                prop_rows = collect_props_from_books(self._payload.books or {}, limit=6)
+                prop_tiers = rank_prop_bet_tiers(prop_rows, limit_per_tier=5)
+                tiers = merge_bet_tier_dicts(tiers, prop_tiers, limit_per_tier=8)
+            except Exception:
+                pass
+            for fun in list(tiers.get(TIER_GREEN) or []) + list(tiers.get(TIER_YELLOW) or []):
+                items.append(fun)
+            if not items:
+                items = list(tiers.get("best_fun") or [])
+            for t in items:
+                if t.get("bet_tier") in {TIER_GREEN, TIER_YELLOW}:
+                    t["suggested_stake"] = 0.0
+                    t["stake_usd"] = 0.0
+                    t["stake_pct"] = 0.0
+                    t["fun_bet"] = True
+                elif not t.get("bet_tier"):
+                    t["bet_tier"] = TIER_BLUE
+        except Exception as exc:
+            _debug_log(f"Fun tier fill skipped: {exc}")
+
+        # Single merge: dedupe + rank + true Top 5 (never concat HA + fun past N)
+        try:
+            from src.bet_slip import dedupe_rank_top_tickets
+
+            items = dedupe_rank_top_tickets(
+                items,
+                limit=5,
+                event=str(getattr(self._payload, "event_label", "") or ""),
+            )
+            _debug_log(
+                f"Overview recommendations shown={len(items)} "
+                f"(blue={sum(1 for t in items if t.get('bet_tier')=='blue')}, "
+                f"fun={sum(1 for t in items if t.get('fun_bet'))})"
+            )
+        except Exception as exc:
+            _debug_log(f"Overview dedupe/rank skipped: {exc}")
+            items = items[:5]
+            for i, t in enumerate(items, start=1):
+                t["rank"] = i
+        return items
 
     def _payload_has_usable_odds(self) -> bool:
         if self._payload is None:
@@ -4636,12 +5089,19 @@ class UFCDashboardApp(_CTK_BASE):
     def _refresh_top_recommendations(self) -> None:
         if hasattr(self, "top_bets_panel"):
             items = self._overview_recommendations()
-            status = self._card_allocation_status_line(items)
+            status = self._card_allocation_status_line(
+                [b for b in items if not b.get("fun_bet")]
+            )
             empty_reason = None
             if not items and self._payload is not None and not self._payload_has_usable_odds():
                 empty_reason = "NO BET — no usable odds (fail-closed)"
             elif not items and self._payload is not None:
-                empty_reason = "NO BET — nothing cleared HA gates for this card (fail-closed)."
+                empty_reason = "No BLUE/GREEN edges on this card."
+            elif items and all(b.get("fun_bet") for b in items):
+                status = (
+                    (status + " · " if status else "")
+                    + "No BLUE HA tickets — showing GREEN/YELLOW fun picks ($0)"
+                )
             self.top_bets_panel.render(
                 items, pool_status=status, empty_reason=empty_reason
             )
@@ -4841,8 +5301,10 @@ class UFCDashboardApp(_CTK_BASE):
         self.grok_panel = GrokAnalysisPanel(
             self.tab_grok,
             on_run=self._wrap_button_click("Run Ollama Analysis Tab", self._on_grok_analysis),
+            on_chat=self._wrap_button_click("Ollama Chat Ask", self._on_ollama_chat),
         )
         _configure_expandable_page(self.tab_grok, self.grok_panel)
+        self._grok_result: dict[str, Any] | None = None
 
         self.odds_api_tab = BookTab(self.tab_odds_api, "Odds API")
         _configure_expandable_page(self.tab_odds_api, self.odds_api_tab)
@@ -5912,17 +6374,7 @@ class UFCDashboardApp(_CTK_BASE):
         self.grok_panel.set_busy(True, "Ollama is thinking...")
         if hasattr(self, "grok_btn"):
             self.grok_btn.configure(state="disabled")
-        model = str(
-            getattr(self.grok_panel, "model_var", None)
-            and self.grok_panel.model_var.get()
-            or getattr(config, "OLLAMA_MODEL", "qwen2.5-coder:14b")
-        )
-        try:
-            from src.ollama_client import set_active_model
-
-            set_active_model(model)
-        except Exception:
-            pass
+        model = self.grok_panel.sync_active_model()
         timeout_s = int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)
         self._set_status(f"Ollama is thinking... ({model}, timeout {timeout_s}s)")
         payload = self._payload
@@ -5947,7 +6399,7 @@ class UFCDashboardApp(_CTK_BASE):
                 _button_debug(
                     f"analyze_card_with_ollama(event_label={event_label!r}) "
                     f"profile={profile!r} "
-                    f"model={getattr(config, 'OLLAMA_MODEL', '')} "
+                    f"model={model!r} "
                     f"timeout={getattr(config, 'OLLAMA_TIMEOUT_SEC', 60)}"
                 )
                 result = analyze_card_with_ollama(
@@ -5959,20 +6411,51 @@ class UFCDashboardApp(_CTK_BASE):
                 )
                 self.after(0, lambda: self._apply_grok_result(result))
             except Exception as exc:
+                # Last-resort: still try to surface HA tickets instead of empty fail.
                 err = _format_grok_user_error(exc)
-                self.after(
-                    0,
-                    lambda: self._apply_grok_result(
-                        {
-                            "ok": False,
-                            "error": err,
-                            "error_class": "other",
-                            "health_banner": "Ollama error — showing model tickets only",
-                            "picks": [],
-                            "bet_slip": [],
-                        }
-                    ),
-                )
+                fallback: dict[str, Any] = {
+                    "ok": True,
+                    "warning": err,
+                    "error_class": "ok",
+                    "health_banner": "Ollama narrative skipped — showing HA tickets",
+                    "narrative_degraded": True,
+                    "summary": "HA bet slip ready — Ollama narrative skipped.",
+                    "picks": [],
+                    "bet_slip": [],
+                    "source": "ha_slip",
+                }
+                try:
+                    from src.grok_analysis import collect_card_analysis_inputs, merge_ollama_reasons_into_slip
+
+                    inputs = collect_card_analysis_inputs(
+                        payload.books if payload else {},
+                        budget,
+                        event_label=event_label,
+                        profile=profile,
+                        allowed_fights=allowed or None,
+                    )
+                    tickets = list(inputs.get("tickets") or [])
+                    fallback["bet_slip"] = merge_ollama_reasons_into_slip(tickets, [])
+                    fallback["fun_tiers"] = inputs.get("fun_tiers") or {}
+                    fallback["n_actionable"] = inputs.get("n_actionable")
+                    fallback["n_advisory"] = inputs.get("n_advisory")
+                    fallback["total_stake_pct"] = inputs.get("total_stake_pct")
+                    fallback["total_stake_usd"] = inputs.get("total_stake_usd")
+                    fallback["card_budget"] = inputs.get("card_budget")
+                    fallback["bankroll"] = inputs.get("bankroll")
+                    fallback["event"] = event_label
+                    n = len(fallback["bet_slip"])
+                    fallback["summary"] = (
+                        f"Top {n} HA tickets (Ollama skipped: {err[:80]})"
+                        if n
+                        else "NO BET — nothing cleared HA gates for this card."
+                    )
+                    fallback["no_bet"] = n == 0 or bool(inputs.get("no_bet"))
+                except Exception:
+                    fallback["ok"] = False
+                    fallback["error"] = err
+                    fallback["error_class"] = "other"
+                self.after(0, lambda fb=fallback: self._apply_grok_result(fb))
             finally:
                 self.after(0, self._finish_grok_busy)
 
@@ -6009,6 +6492,24 @@ class UFCDashboardApp(_CTK_BASE):
                 )
             if self._payload is not None:
                 self._render_overview_section(self._payload)
+            try:
+                from src.grok_analysis import build_best_bets_briefing
+
+                preds = None
+                cleared: list[dict[str, Any]] = []
+                if self._payload is not None:
+                    preds = self._payload.combined
+                    for book_data in (self._payload.books or {}).values():
+                        if isinstance(book_data, dict):
+                            cleared.extend(
+                                (book_data.get("alerts") or {}).get("singles") or []
+                            )
+                briefing = build_best_bets_briefing(
+                    result, predictions=preds, cleared_singles=cleared
+                )
+                self.grok_panel.append_chat("Stats", briefing)
+            except Exception as exc:
+                _debug_log(f"Auto best-bets briefing failed: {exc}")
         else:
             err = _format_grok_user_error(result.get("error"))
             prefix = banner or "Ollama failed"
@@ -6020,6 +6521,95 @@ class UFCDashboardApp(_CTK_BASE):
         try:
             if hasattr(self, "grok_btn"):
                 self.grok_btn.configure(state="normal")
+        except Exception:
+            pass
+
+    def _on_ollama_chat(self, question: str) -> None:
+        """Answer Ask / Best bets from the Ollama tab communication bar."""
+        q = str(question or "").strip()
+        if not q:
+            return
+        if self._grok_busy:
+            self.grok_panel.append_chat(
+                "System", "Wait for the current Ollama analysis to finish, then ask again."
+            )
+            return
+
+        result = self._grok_result or getattr(self.grok_panel, "_last_result", None)
+        event_label = ""
+        if self._payload is not None:
+            event_label = str(getattr(self._payload, "event_label", "") or "")
+
+        # Attach live preds so best-bet asks can rank GREEN/YELLOW fun picks.
+        if isinstance(result, dict) and self._payload is not None:
+            result = dict(result)
+            if self._payload.combined is not None:
+                result["predictions"] = self._payload.combined
+            if not result.get("fun_tiers"):
+                try:
+                    from src.bet_tiers import (
+                        collect_props_from_books,
+                        merge_bet_tier_dicts,
+                        rank_card_bet_tiers,
+                        rank_prop_bet_tiers,
+                    )
+
+                    cleared: list[dict[str, Any]] = []
+                    for book_data in (self._payload.books or {}).values():
+                        if isinstance(book_data, dict):
+                            cleared.extend(
+                                (book_data.get("alerts") or {}).get("singles") or []
+                            )
+                    ml_tiers = rank_card_bet_tiers(
+                        self._payload.combined,
+                        cleared_singles=cleared,
+                        limit_per_tier=6,
+                    )
+                    prop_rows = collect_props_from_books(
+                        self._payload.books or {}, limit=6
+                    )
+                    prop_tiers = rank_prop_bet_tiers(prop_rows, limit_per_tier=6)
+                    result["fun_tiers"] = merge_bet_tier_dicts(
+                        ml_tiers, prop_tiers, limit_per_tier=8
+                    )
+                    result["prop_tiers"] = prop_tiers
+                except Exception:
+                    pass
+
+        model = self.grok_panel.sync_active_model()
+        self.grok_panel._chat_ask_busy = True
+        self.grok_panel.set_chat_busy(True)
+        try:
+            self.grok_panel.status_label.configure(text=f"Answering... ({model})")
+        except Exception:
+            pass
+
+        def worker() -> None:
+            try:
+                from src.grok_analysis import answer_ollama_chat
+
+                out = answer_ollama_chat(
+                    q,
+                    analysis_result=result if isinstance(result, dict) else None,
+                    event_label=event_label,
+                )
+                answer = str(out.get("answer") or out.get("error") or "No answer.")
+                source = str(out.get("source") or "")
+                role = "Stats" if source == "ha_briefing" else "Ollama"
+                self.after(0, lambda a=answer, r=role: self._finish_ollama_chat(r, a))
+            except Exception as exc:
+                msg = f"Chat failed: {exc}"
+                self.after(0, lambda m=msg: self._finish_ollama_chat("System", m))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_ollama_chat(self, role: str, answer: str) -> None:
+        self.grok_panel._chat_ask_busy = False
+        if not self._grok_busy:
+            self.grok_panel.set_chat_busy(False)
+        self.grok_panel.append_chat(role, answer)
+        try:
+            self.grok_panel.status_label.configure(text="Ready")
         except Exception:
             pass
 
@@ -6115,8 +6705,8 @@ class UFCDashboardApp(_CTK_BASE):
         if not recs and n_fights > 0:
             self.top_bets_panel.empty_label.configure(
                 text=(
-                    f"No qualifying edges on loaded card ({n_fights} fights). "
-                    "Try Quick Odds + Props or check book tabs below."
+                    f"No BLUE/GREEN edges on loaded card ({n_fights} fights). "
+                    "Red = don't bet · try Soft Update if odds look missing."
                 )
             )
             self.top_bets_panel.empty_label.pack(fill="x", padx=16, pady=(0, 14))

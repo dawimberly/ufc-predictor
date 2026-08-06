@@ -93,6 +93,41 @@ def ensure_live_odds_api_allowed(*, context: str = "") -> None:
     logger.warning(msg)
     raise OddsApiFetchBlocked(msg)
 
+
+def clear_odds_api_fetch_once_caches() -> list[str]:
+    """Delete Odds API / DK fetch-once cache files so a new live download is allowed.
+
+    Used when the locked cache is from a prior card (low match rate to the loaded roster).
+    """
+    cache_dir = Path(getattr(config, "CACHE_DIR", "") or ".")
+    candidates = [
+        getattr(config, "ODDS_CACHE_PATH", None),
+        cache_dir / "ufc_odds_api.csv",
+        cache_dir / "the_odds_api_prop_odds.csv",
+        cache_dir / "the_odds_api_prop_odds.once",
+        cache_dir / "draftkings_odds.csv",
+        cache_dir / "draftkings_prop_odds.csv",
+    ]
+    removed: list[str] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw)
+        key = str(p.resolve()) if p.exists() else str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if p.is_file():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as exc:
+            logger.debug("Could not remove odds cache %s: %s", p, exc)
+    if removed:
+        logger.info("Cleared Odds API fetch-once caches: %s", ", ".join(removed))
+    return removed
+
 _SESSION: requests.Session | None = None
 
 

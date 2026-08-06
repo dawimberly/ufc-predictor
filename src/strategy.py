@@ -2122,18 +2122,54 @@ def _overview_over_15_props(
 
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for book in (*_cfg.BUDGET_BOOKS, "Overview"):
+    book_order = list(
+        dict.fromkeys(
+            (
+                *(_cfg.BUDGET_BOOKS or ()),
+                "Odds API",
+                "MyBookie",
+                "Overview",
+                "Consensus",
+                *tuple(books or {}),
+            )
+        )
+    )
+    for book in book_order:
         book_data = books.get(book) or {}
+        if not isinstance(book_data, dict):
+            continue
         alerts = book_data.get("alerts") or {}
         props = list(alerts.get("prop_singles") or [])
-        # Props may also live on book_data["props"]
+        # Dashboard props live at books[X]["props"]["singles"]
+        props_blob = book_data.get("props")
+        if isinstance(props_blob, dict):
+            props.extend(list(props_blob.get("singles") or []))
         extra = book_data.get("prop_singles") or book_data.get("ranked_props") or []
         if isinstance(extra, list):
             props.extend(extra)
         for p in props:
+            if not isinstance(p, dict):
+                continue
             key = str(p.get("prop_key") or "").strip().lower()
-            label = str(p.get("prop_type") or p.get("label") or "").lower()
+            label = str(p.get("prop_type") or p.get("label") or p.get("prop_short") or "").lower()
             if key != "over_1_5_rounds" and "over 1.5" not in label:
+                continue
+            # HA overview slip: only strict + live Over 1.5 (relaxed/synthetic stay fun-only)
+            try:
+                from src.props import is_live_prop_odds_source
+
+                odds_src = str(p.get("odds_source") or "")
+                if not is_live_prop_odds_source(odds_src):
+                    continue
+            except Exception:
+                if str(p.get("odds_source") or "").strip().lower() in {
+                    "",
+                    "synthetic",
+                    "model",
+                    "fair",
+                }:
+                    continue
+            if p.get("strict_qualified") is False:
                 continue
             fid = str(p.get("fight_id") or p.get("fight") or "")
             if not fid or fid in seen:
@@ -2146,6 +2182,11 @@ def _overview_over_15_props(
                     edge = float(p["edge_pct"]) / 100.0
                 except (TypeError, ValueError):
                     edge = 0.0
+            edge_pct = p.get("edge_pct")
+            try:
+                edge_pct_f = float(edge_pct) if edge_pct is not None else edge * 100.0
+            except (TypeError, ValueError):
+                edge_pct_f = edge * 100.0
             row = {
                 **dict(p),
                 "fight_id": fid,
@@ -2153,9 +2194,14 @@ def _overview_over_15_props(
                 "market_type": "prop",
                 "bet_type": "Over 1.5 Rounds",
                 "is_parlay": False,
-                "display_label": str(p.get("display_label") or p.get("label") or "Over 1.5 Rounds"),
+                "display_label": str(
+                    p.get("display_label")
+                    or p.get("label")
+                    or p.get("prop_short")
+                    or "Over 1.5 Rounds"
+                ),
                 "edge": edge,
-                "edge_pct": float(p.get("edge_pct") or edge * 100),
+                "edge_pct": edge_pct_f,
                 "book": book_display_name(book),
                 "book_key": book,
             }
