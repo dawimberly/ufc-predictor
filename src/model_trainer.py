@@ -1005,7 +1005,31 @@ def train_model(
         "feature_rows": len(features),
         "features_fingerprint": _training_fingerprint(features),
         "enrichment_at": _enrichment_timestamp_iso(),
+        "feature_schema_version": int(getattr(config, "FEATURE_SCHEMA_VERSION", 0) or 0),
+        "enable_high_value_features": bool(
+            getattr(config, "ENABLE_HIGH_VALUE_FEATURES", False)
+        ),
+        "n_features": len(feature_cols),
+        "high_value_feature_columns": [
+            c
+            for c in (getattr(config, "HIGH_VALUE_FEATURE_COLUMNS", None) or [])
+            if c in feature_cols
+        ],
     }
+    logger.info(
+        "Model artifact: n_features=%s schema_v=%s HV=%s fingerprint=%s path=%s",
+        artifact["n_features"],
+        artifact["feature_schema_version"],
+        artifact["enable_high_value_features"],
+        artifact["features_fingerprint"],
+        out_path,
+    )
+    if artifact["high_value_feature_columns"]:
+        logger.info(
+            "HV columns in model (%s): %s",
+            len(artifact["high_value_feature_columns"]),
+            ", ".join(artifact["high_value_feature_columns"]),
+        )
     save_model(artifact, out_path)
 
     backtest_summary = None

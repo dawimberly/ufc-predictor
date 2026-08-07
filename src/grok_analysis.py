@@ -428,6 +428,7 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     bankroll = inputs.get("bankroll")
     card_budget = inputs.get("card_budget")
     tickets = list(inputs.get("tickets") or [])[:8]
+    parlays = list(inputs.get("recommended_parlays") or [])[:2]
     warning = str(inputs.get("top5_warning") or TOP5_WARNING)
 
     ticket_lines: list[str] = []
@@ -440,6 +441,15 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
         )
     tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET)"
 
+    parlay_lines: list[str] = []
+    for p in parlays:
+        parlay_lines.append(
+            f"- id={p.get('id')} | {p.get('n_legs')}-leg | {p.get('picks')} | "
+            f"combined_prob={float(p.get('combined_prob') or 0):.0%} | "
+            f"ha_qualified={bool(p.get('ha_qualified'))}"
+        )
+    parlays_block = "\n".join(parlay_lines) if parlay_lines else "- (none)"
+
     br_txt = f"${float(bankroll):.2f}" if bankroll is not None else "n/a"
     card_txt = f"${float(card_budget):.2f}" if card_budget is not None else "n/a"
     total_pct = inputs.get("total_stake_pct")
@@ -449,15 +459,18 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
 
     return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
 {warning}
-Rules: use ONLY listed tickets; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
-ADV stakes stay 0; one-line reason (conf+edge, <=90 chars); empty list => NO BET.
+Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
+ADV stakes stay 0; parlays are research ($0) unless already ACT; one-line reason (<=90 chars); empty list => NO BET.
 
 Tickets ({n_act} ACT / {n_adv} ADV):
 {tickets_block}
 ACT totals: {total_pct}% / ${total_usd}
 
+Auto parlays (one 2-leg + one 3-leg when card allows - narrate only, do not invent legs):
+{parlays_block}
+
 Return JSON:
-{{"event":"{event}","summary":"short line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"...","conviction":"high|medium|low"}}]}}"""
+{{"event":"{event}","summary":"short line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","n_legs":2,"reason":"...","conviction":"high|medium|low"}}]}}"""
 
 
 def _ticket_slip_id(ticket: dict[str, Any]) -> str:
@@ -486,7 +499,8 @@ def _ticket_to_slip_row(
     )
     fight = str(ticket.get("fight") or "").strip()
     if is_parlay:
-        market = "2-leg parlay"
+        n_legs = int(ticket.get("n_legs") or 2)
+        market = f"{n_legs}-leg parlay"
         side = str(ticket.get("pick_line") or ticket.get("picks") or ticket.get("display_label") or "")
     elif is_prop:
         market = "Over 1.5 Rounds"
@@ -702,6 +716,7 @@ def collect_card_analysis_inputs(
         from src.bet_tiers import (
             TIER_BLUE,
             TIER_GREEN,
+            TIER_SKY_BLUE,
             TIER_YELLOW,
             classify_prop_bet_tier,
             collect_props_from_books,
@@ -753,7 +768,7 @@ def collect_card_analysis_inputs(
             row["reason"] = fun.get("brief") or row.get("reason") or "Fun tier (not HA-sized)"
             raw_candidates.append(row)
 
-        for tier_name in (TIER_BLUE, TIER_GREEN, TIER_YELLOW):
+        for tier_name in (TIER_BLUE, TIER_SKY_BLUE, TIER_GREEN, TIER_YELLOW):
             for p in prop_tiers.get(tier_name) or []:
                 key = _candidate_dedupe_key(p)
                 src = sized_props.get(key) or p
@@ -774,7 +789,17 @@ def collect_card_analysis_inputs(
                     row["advisory"] = True
                     row["fun_bet"] = True
                 else:
-                    row["bet_tier"] = TIER_BLUE
+                    from src.bet_tiers import is_sky_blue_ticket
+
+                    if is_sky_blue_ticket(
+                        stake_pct=float(src.get("stake_pct") or 0) or None,
+                        stake_usd=float(src.get("suggested_stake") or src.get("stake_usd") or 0)
+                        or None,
+                        uncertainty_reason=str(src.get("uncertainty_reason") or ""),
+                    ):
+                        row["bet_tier"] = TIER_SKY_BLUE
+                    else:
+                        row["bet_tier"] = TIER_BLUE
                     row["fun_bet"] = False
                     row["advisory"] = False
                 raw_candidates.append(row)
@@ -822,6 +847,39 @@ def collect_card_analysis_inputs(
     n_actionable = len(actionable_only)
     n_advisory = sum(1 for t in tickets if t.get("advisory") or t.get("fun_bet"))
 
+    recommended_parlays: list[dict[str, Any]] = []
+    try:
+        from src.strategy import build_auto_parlay_recommendations
+
+        preds_df = _predictions_frame_from_books(books)
+        if allowed_fights and preds_df is not None and not preds_df.empty:
+            # Soft-filter to loaded card fights when keys are available
+            try:
+                import pandas as pd
+
+                mask = pd.Series(False, index=preds_df.index)
+                if "fight_id" in preds_df.columns:
+                    mask = mask | preds_df["fight_id"].astype(str).isin(allowed_fights)
+                if "fighter_1" in preds_df.columns and "fighter_2" in preds_df.columns:
+                    labels = (
+                        preds_df["fighter_1"].astype(str)
+                        + " vs "
+                        + preds_df["fighter_2"].astype(str)
+                    )
+                    mask = mask | labels.isin(allowed_fights)
+                if bool(mask.any()):
+                    preds_df = preds_df.loc[mask].copy()
+            except Exception:
+                pass
+        recommended_parlays = build_auto_parlay_recommendations(
+            preds_df,
+            ha_singles=_ha_singles_from_books(books),
+        )
+        recommended_parlays = merge_ollama_reasons_into_parlays(recommended_parlays, [])
+    except Exception as exc:
+        logger.debug("auto parlay recommendations skipped: %s", exc)
+        recommended_parlays = []
+
     return {
         "event": event_label,
         "profile": config.normalize_profile(prof),
@@ -842,6 +900,7 @@ def collect_card_analysis_inputs(
         "prop_tiers": prop_tiers,
         "top_n": top_n,
         "top_n_shown": len(tickets),
+        "recommended_parlays": recommended_parlays,
     }
 
 
@@ -924,6 +983,83 @@ def merge_ollama_reasons_into_slip(
     return out
 
 
+def merge_ollama_reasons_into_parlays(
+    parlays: list[dict[str, Any]],
+    ollama_parlays: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Attach Ollama one-line reasons onto auto 2/3-leg parlay recs ($0 research)."""
+    by_id = {
+        str(p.get("id") or "").strip(): p
+        for p in (ollama_parlays or [])
+        if isinstance(p, dict) and p.get("id")
+    }
+    by_legs: dict[int, dict[str, Any]] = {}
+    for p in ollama_parlays or []:
+        if not isinstance(p, dict):
+            continue
+        n = int(p.get("n_legs") or 0)
+        if n >= 2 and n not in by_legs:
+            by_legs[n] = p
+    out: list[dict[str, Any]] = []
+    for p in parlays or []:
+        row = dict(p)
+        match = by_id.get(str(row.get("id") or "").strip())
+        if match is None:
+            match = by_legs.get(int(row.get("n_legs") or 0))
+        if match:
+            reason = str(match.get("reason") or match.get("narrative_edge") or "").strip()
+            reason = " ".join(reason.replace("\n", " ").split())
+            if len(reason) > 120:
+                reason = reason[:119].rstrip() + "…"
+            if reason:
+                row["reason"] = reason
+            conv = str(match.get("conviction") or "").lower()
+            if conv in {"high", "medium", "low"}:
+                row["conviction"] = conv
+        if not row.get("reason"):
+            comb = float(row.get("combined_prob") or 0)
+            tag = "HA legs" if row.get("ha_qualified") else "research"
+            row["reason"] = (
+                f"ADVISORY: auto {row.get('n_legs')}-leg · {comb:.0%} combined · {tag}"
+            )
+        elif not str(row.get("reason") or "").upper().startswith("ADVISORY"):
+            row["reason"] = f"ADVISORY: {row['reason']}"
+        row["advisory"] = True
+        row["suggested_stake"] = 0.0
+        row["stake_usd"] = 0.0
+        row["stake_pct"] = 0.0
+        out.append(row)
+    return out
+
+
+def _predictions_frame_from_books(books: dict[str, dict[str, Any]] | None):
+    """Best available card predictions DataFrame across books."""
+    import pandas as pd
+
+    if not books:
+        return None
+    preferred = ("Overview", "Odds API", "MyBookie", "Consensus")
+    order = list(dict.fromkeys((*preferred, *tuple(books))))
+    for book in order:
+        data = books.get(book) or {}
+        if not isinstance(data, dict):
+            continue
+        preds = data.get("predictions")
+        if isinstance(preds, pd.DataFrame) and not preds.empty:
+            return preds
+    return None
+
+
+def _ha_singles_from_books(books: dict[str, dict[str, Any]] | None) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for data in (books or {}).values():
+        if not isinstance(data, dict):
+            continue
+        alerts = data.get("alerts") or {}
+        out.extend(list(alerts.get("singles") or []))
+    return out
+
+
 def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict[str, Any]:
     """Normalize Grok/Ollama JSON into dashboard-friendly structure."""
     picks_in = raw.get("picks") or raw.get("analyses") or []
@@ -977,10 +1113,36 @@ def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict
     if len(summary) > 160:
         summary = summary[:159].rstrip() + "…"
 
+    parlays_in = raw.get("parlays") or []
+    if not isinstance(parlays_in, list):
+        parlays_in = []
+    ollama_parlays: list[dict[str, Any]] = []
+    for row in parlays_in:
+        if not isinstance(row, dict):
+            continue
+        reason = str(row.get("reason") or row.get("narrative_edge") or "").strip()
+        reason = " ".join(reason.replace("\n", " ").split())
+        if len(reason) > 120:
+            reason = reason[:119].rstrip() + "…"
+        n_raw = row.get("n_legs")
+        try:
+            n_legs = int(n_raw) if n_raw is not None else None
+        except (TypeError, ValueError):
+            n_legs = None
+        ollama_parlays.append(
+            {
+                "id": str(row.get("id") or "").strip(),
+                "n_legs": n_legs,
+                "reason": reason,
+                "conviction": str(row.get("conviction") or "medium").lower(),
+            }
+        )
+
     return {
         "event": str(raw.get("event") or event_label or ""),
         "summary": summary,
         "picks": picks,
+        "ollama_parlays": ollama_parlays,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "source": "ollama",
     }
@@ -1117,10 +1279,15 @@ def analyze_card_with_grok(
 
     def _base_result(**extra: Any) -> dict[str, Any]:
         slip = merge_ollama_reasons_into_slip(tickets, []) if tickets else []
+        parlays = merge_ollama_reasons_into_parlays(
+            list(inputs.get("recommended_parlays") or []),
+            [],
+        )
         out: dict[str, Any] = {
             "event": event_label or inputs.get("event") or "",
             "picks": [],
             "bet_slip": slip,
+            "recommended_parlays": parlays,
             "skipped": skipped,
             "total_stake_pct": inputs.get("total_stake_pct") if slip else 0.0,
             "total_stake_usd": inputs.get("total_stake_usd") if slip else 0.0,
@@ -1196,6 +1363,10 @@ def analyze_card_with_grok(
             "summary": no_bet_reason or "NO BET — nothing cleared HA gates for this card.",
             "picks": [],
             "bet_slip": [],
+            "recommended_parlays": merge_ollama_reasons_into_parlays(
+                list(inputs.get("recommended_parlays") or []),
+                [],
+            ),
             "skipped": skipped,
             "total_stake_pct": 0.0,
             "total_stake_usd": 0.0,
@@ -1223,6 +1394,10 @@ def analyze_card_with_grok(
             out["ok"] = True
             out["bet_slip"] = merge_ollama_reasons_into_slip(
                 tickets, out.get("picks") or []
+            )
+            out["recommended_parlays"] = merge_ollama_reasons_into_parlays(
+                list(inputs.get("recommended_parlays") or []),
+                out.get("ollama_parlays") or out.get("parlays") or [],
             )
             out["skipped"] = skipped
             out["total_stake_pct"] = inputs.get("total_stake_pct")
@@ -1265,6 +1440,10 @@ def analyze_card_with_grok(
         result["no_bet"] = bool(inputs.get("no_bet"))
         result["no_usable_odds"] = no_odds
         result["bet_slip"] = merge_ollama_reasons_into_slip(tickets, result.get("picks") or [])
+        result["recommended_parlays"] = merge_ollama_reasons_into_parlays(
+            list(inputs.get("recommended_parlays") or []),
+            result.get("ollama_parlays") or [],
+        )
         result["skipped"] = skipped
         result["total_stake_pct"] = inputs.get("total_stake_pct")
         result["total_stake_usd"] = inputs.get("total_stake_usd")

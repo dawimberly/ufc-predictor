@@ -2,13 +2,18 @@
 
 Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. **Not tied to PythonTrading** — all paths are relative to this project root (`C:\UFC-Predictor`).
 
+**Repos:** [dawimberly/ufc-predictor](https://github.com/dawimberly/ufc-predictor) · [infinite-robots/ufc-predictor](https://github.com/infinite-robots/ufc-predictor) (private)
+
 ## Project layout
 
 ```
 UFC-Predictor/
 ├── src/                       Python modules + dashboard
-│   ├── bet_tiers.py           Blue/Green/Yellow/Red color rules
+│   ├── bet_tiers.py           Deep Blue / Sky Blue / Green / Yellow / Red
 │   ├── bet_slip.py            Top recommended dedupe + ranking
+│   ├── high_value_features.py Phase-1 HV feature block (production default)
+│   ├── strategy.py            HA sizing + auto 2/3-leg parlay recs
+│   ├── uncertainty_gates.py   Conformal CI gates + Paper wide override
 │   └── ufc_dashboard.py       CustomTkinter GUI
 ├── data/
 │   ├── raw/                   fights.csv
@@ -50,7 +55,7 @@ Or:
 pythonw -u src/ufc_dashboard.py
 ```
 
-Working directory must be the project root so `.env` and `data/` resolve correctly.
+Working directory must be the project root so `.env` and `data/` resolve correctly. Desktop shortcuts can be rebuilt with `scripts/create_dashboard_shortcut.ps1` (prefers Python 3.14).
 
 ## Dashboard
 
@@ -65,7 +70,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Props - MyBookie** | Optional MyBookie prop lines |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin |
-| **Ollama Analysis** | Local LLM narrative over HA Top 5 (+ fun $0 fillers) |
+| **Ollama Analysis** | Local LLM narrative over HA Top 5 (+ fun $0 fillers + auto parlays) |
 | **Arb Scanner** | Cross-book arb scan |
 
 BetNow / DraftKings (and their Props tabs) appear only when those scrapers are enabled in `.env` (keep DraftKings off to protect Odds API quota).
@@ -78,22 +83,38 @@ BetNow / DraftKings (and their Props tabs) appear only when those scrapers are e
 |---------|----------|
 | **Refresh** | Load UFC.com next-two cards + predictions; reuses odds cache when `ODDS_FETCH_ONCE=true` |
 | **Soft Update** | Reload `.env` (config) + attach book lines/props from cache — no extra Odds API burn when fetch-once is on |
-| **Restart** | Quit and relaunch so `.env` / code load cleanly |
+| **Restart** | Quit and relaunch so `.env` / code load cleanly (needed after code changes; Soft Update does not reload modules) |
 | **Full** | Toggle fullscreen |
 | **Bankroll $** | Persisted roll; card budget = bankroll × profile risk % |
 
 ### Color legend
 
-Row color = pick-side math + HA decision (not fight-name vibes). Tables sort **Blue → Green → Yellow → Red**, then edge↓, model prob↓, fight name↑.
+Row color = pick-side math + HA decision (not fight-name vibes). Tables sort **Deep Blue → Sky Blue → Green → Yellow → Red**, then edge↓, model prob↓, fight name↑.
 
 | Color | Meaning | Money |
 |-------|---------|-------|
-| **Blue** | Clears HA gates | Real ticket ($) |
+| **Deep Blue** `#3b82f6` | Clears full HA gates | Real ticket ($) |
+| **Sky Blue** `#57B9FF` | Paper-only `paper_wide_override` tiny stake | Paper $ only (not Live) |
 | **Green** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | Fun `$0` |
 | **Yellow** | Caution — thin edge / borderline | Fun `$0` |
 | **Red** | Don't bet — negative edge, low prob, or `no_odds` | Fun `$0` |
 
-Top recommended caps at **5**, deduped across books; Blue preferred; Red omitted when non-red options exist.
+Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
+
+### Paper wide override (Sky Blue)
+
+When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can still size a tiny ticket if:
+
+- override enabled (`PAPER_WIDE_OVERRIDE_ENABLED=true`)
+- pure `wide_interval` (no other hard skips)
+- edge ≥ 8% and model prob ≥ 70% (defaults)
+- Kelly multiplier 0.20, stake hard-capped at **1% bankroll**, max **2** override singles per card
+
+**Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
+
+### Auto parlays (Ollama Analysis)
+
+Advisory **2-leg** and **3-leg** research parlays are built from HA singles / high model probs (`build_auto_parlay_recommendations`). Shown in the Ollama Analysis tab as styled cards — **$0 advisory only**, not Live HA-sized.
 
 ### AI narrative
 
@@ -126,20 +147,34 @@ Delete only when you want a fresh live pull:
 
 | Profile | Use |
 |---------|-----|
-| **Paper** (default) | Simulation / dashboard — looser card % |
-| **Live** | Real money — hard USD card cap |
+| **Paper** (default) | Simulation / dashboard — looser card %; Sky Blue override allowed |
+| **Live** | Real money — hard USD card cap; wide CI fail-closed |
 
 Set `UFC_PROFILE=paper` or `live` in `.env`. Legacy `research` → paper.
 
-Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Blue):
+Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Blue):
 
 | Reason | Meaning |
 |--------|---------|
 | `SKIP:wide` / `wide_interval` | Confidence interval too wide |
+| `paper_wide_override` | Paper-only tiny stake after wide skip → Sky Blue |
 | `high_disagreement` | Ensemble models disagree |
 | `low_model_prob` | Pick below min model probability |
 | `no_odds` | No matched / usable price |
 | `min_edge` | Edge below profile floor |
+
+## Model features (HV)
+
+Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV.
+
+Helpers:
+
+```bash
+python scripts/ab_high_value_features.py
+python scripts/productionize_hv_features.py
+python scripts/rescore_2025_upset.py
+python scripts/upset_autopsy_backtest.py
+```
 
 ## CLI
 
@@ -155,23 +190,25 @@ python main.py --backtest-2025
 ## Architecture
 
 ```
-data_loader → feature_engineering (+ fighter_cache) → model_trainer (LGBM+XGB)
-      → predictor → uncertainty_gates + high_accuracy_strategy
+data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LGBM+XGB)
+      → predictor → uncertainty_gates (+ Paper wide override) + high_accuracy_strategy
       → dashboard_service (books / props / Soft Update)
       → bet_tiers + bet_slip (color rank + Top 5)
-      → ufc_dashboard (+ Ollama; optional Grok)
+      → strategy (auto 2/3-leg parlays) → grok_analysis / Ollama
+      → ufc_dashboard
       → background_runner (cache-first when ODDS_FETCH_ONCE)
 ```
 
 | Layer | Modules | Role |
 |-------|---------|------|
 | Data | `data_loader` | UFC.com cards, multi-source history |
+| Features | `feature_engineering`, `high_value_features` | Leakage-safe + HV block |
 | Model | `predictor`, `ensemble` | Calibrated LGBM+XGB |
 | Gates | `uncertainty_gates`, `high_accuracy_strategy` | Fail-closed HA sizing |
-| Color | `bet_tiers` | Blue/Green/Yellow/Red |
+| Color | `bet_tiers` | Deep Blue / Sky Blue / Green / Yellow / Red |
 | Odds | `odds_providers/*`, `odds_api_client` | Odds API + optional scrapers |
 | Dashboard | `ufc_dashboard`, `dashboard_service`, `bet_slip` | GUI + Top 5 |
-| Narrative | `ollama_client`, `grok_analysis` | Ollama default; Grok optional |
+| Narrative | `ollama_client`, `grok_analysis`, `strategy` | Ollama + auto parlays; Grok optional |
 
 ## Background runner
 
@@ -193,7 +230,9 @@ Prefer `START_DASHBOARD.bat` / Python day-to-day. Frozen builds may hit PyArrow 
 ## Safety
 
 - **HA fail-closed** — no sized bets without usable odds + uncertainty clearance
-- **Blue = real money only** — Green/Yellow/Red never get HA stake
+- **Live wide CI fail-closed** — Paper sky-blue override never applies to Live
+- **Deep Blue / Sky Blue = money tickets** — Green/Yellow/Red never get HA stake
+- **Sky Blue caps** — 1% bankroll + max 2 override singles/card
 - **Daily loss circuit breaker** — `src/circuit_breaker.py`
 - **Peak drawdown halt** — `risk_manager.DrawdownHalt`
 - **Alert cooldown + fingerprint dedup**
@@ -210,6 +249,13 @@ Copy `.env.example` → `.env`. Important keys:
 | `THE_ODDS_API_KEY` | — | Odds API key |
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
 | `ENABLE_PROPS` | false | Prop tabs (Over 1.5 HA when on) |
+| `ENABLE_HIGH_VALUE_FEATURES` | true | Phase-1 HV feature block |
+| `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper sky-blue tiny stakes on wide CI |
+| `PAPER_WIDE_OVERRIDE_MIN_EDGE` | 0.08 | Min edge for override |
+| `PAPER_WIDE_OVERRIDE_MIN_PROB` | 0.70 | Min model prob for override |
+| `PAPER_WIDE_OVERRIDE_KELLY_MULT` | 0.20 | Kelly shrink for override |
+| `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
+| `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
@@ -232,7 +278,7 @@ Copy `.env.example` → `.env`. Important keys:
 python -m pytest tests/ -q
 ```
 
-Includes color-tier rules, fight-table sort, Top recommended dedupe, and Ollama props wiring.
+Includes color-tier rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, and Ollama props wiring.
 
 ## Design notes
 

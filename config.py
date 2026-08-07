@@ -180,7 +180,21 @@ MIN_FIGHTS_PER_FIGHTER = int(os.getenv("MIN_FIGHTS_PER_FIGHTER", "3"))
 # Bump when FEATURE_COLUMNS / feature defs change so models auto-retrain.
 # v3: Sherdog career + CompuBox-style striking (KD / target / range mix).
 # v4: Prior-sport base tiers (wrestling/BJJ/boxing/MT/…) + matchup level advantage.
-FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "4"))
+FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "5"))
+
+# Optional high-value feature block (Phase 1). Always computed in FE; gated into the model list.
+ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
+HIGH_VALUE_FEATURE_COLUMNS = [
+    "hv_short_notice_flag_diff",
+    "hv_long_layoff_flag_diff",
+    "first_fight_new_wc_flag_diff",
+    "finish_rate_l5_diff",
+    "division_age_adj_diff",
+    "hv_td_pressure_diff",
+    "hv_control_clash",
+    "wins_vs_better_record_l5_diff",
+    "ko_losses_career_flag_diff",
+]
 
 FEATURE_COLUMNS = [
     # Differential (primary signals — fighter1 minus fighter2)
@@ -238,6 +252,9 @@ FEATURE_COLUMNS = [
     "is_main_event",
     "scheduled_rounds",
 ]
+# Append HV block when enabled (A/B via ENABLE_HIGH_VALUE_FEATURES=0)
+if ENABLE_HIGH_VALUE_FEATURES:
+    FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(HIGH_VALUE_FEATURE_COLUMNS)
 
 # --- Interaction feature discovery (candidates generated in feature_engineering) ---
 INTERACTION_DISCOVERY_ENABLED = os.getenv(
@@ -277,6 +294,17 @@ PAPER_INTERVAL_WIDTH_SKIP = float(os.getenv("PAPER_INTERVAL_WIDTH_SKIP", "0.52")
 PAPER_INTERVAL_WIDTH_TIGHTEN = float(os.getenv("PAPER_INTERVAL_WIDTH_TIGHTEN", "0.36"))
 PAPER_UNCERTAINTY_EDGE_BUMP = float(os.getenv("PAPER_UNCERTAINTY_EDGE_BUMP", "0.025"))
 PAPER_UNCERTAINTY_KELLY_MULT = float(os.getenv("PAPER_UNCERTAINTY_KELLY_MULT", "0.55"))
+
+# Paper-only: allow tiny tickets on strong +EV rows that fail solely on wide_interval.
+# Live stays fail-closed (no override). Does not loosen disagreement / missing gates.
+PAPER_WIDE_OVERRIDE_ENABLED = env_bool("PAPER_WIDE_OVERRIDE_ENABLED", "true")
+PAPER_WIDE_OVERRIDE_MIN_EDGE = float(os.getenv("PAPER_WIDE_OVERRIDE_MIN_EDGE", "0.08"))
+PAPER_WIDE_OVERRIDE_MIN_PROB = float(os.getenv("PAPER_WIDE_OVERRIDE_MIN_PROB", "0.70"))
+PAPER_WIDE_OVERRIDE_KELLY_MULT = float(os.getenv("PAPER_WIDE_OVERRIDE_KELLY_MULT", "0.20"))
+PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC = float(
+    os.getenv("PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", "0.01")
+)  # 1% of bankroll
+PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "2"))
 
 # Live: stricter
 LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
@@ -673,11 +701,25 @@ def refresh_runtime_env() -> None:
     global PAPER_DISAGREEMENT_SKIP, PAPER_DISAGREEMENT_TIGHTEN
     global PAPER_INTERVAL_WIDTH_SKIP, PAPER_INTERVAL_WIDTH_TIGHTEN
     global PAPER_UNCERTAINTY_EDGE_BUMP, PAPER_UNCERTAINTY_KELLY_MULT
+    global PAPER_WIDE_OVERRIDE_ENABLED, PAPER_WIDE_OVERRIDE_MIN_EDGE
+    global PAPER_WIDE_OVERRIDE_MIN_PROB, PAPER_WIDE_OVERRIDE_KELLY_MULT
+    global PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC, PAPER_WIDE_OVERRIDE_MAX_PER_CARD
     global LIVE_DISAGREEMENT_SKIP, LIVE_DISAGREEMENT_TIGHTEN
     global LIVE_INTERVAL_WIDTH_SKIP, LIVE_INTERVAL_WIDTH_TIGHTEN
     global LIVE_UNCERTAINTY_EDGE_BUMP, LIVE_UNCERTAINTY_KELLY_MULT
+    global ENABLE_HIGH_VALUE_FEATURES, FEATURE_COLUMNS, HIGH_VALUE_FEATURE_COLUMNS
+    global INTERACTION_DISCOVERY_ENABLED
 
     ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
+    ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
+    INTERACTION_DISCOVERY_ENABLED = env_bool("INTERACTION_DISCOVERY_ENABLED", "true")
+    # Rebuild model feature list so A/B scripts can flip the flag at runtime.
+    _base_cols = [c for c in FEATURE_COLUMNS if c not in set(HIGH_VALUE_FEATURE_COLUMNS)]
+    FEATURE_COLUMNS = (
+        list(_base_cols) + list(HIGH_VALUE_FEATURE_COLUMNS)
+        if ENABLE_HIGH_VALUE_FEATURES
+        else list(_base_cols)
+    )
     MYBOOKIE_ENABLED = env_bool("MYBOOKIE_ENABLED", "false")
     BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
     DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")
@@ -781,6 +823,17 @@ def refresh_runtime_env() -> None:
     PAPER_INTERVAL_WIDTH_TIGHTEN = float(os.getenv("PAPER_INTERVAL_WIDTH_TIGHTEN", "0.36"))
     PAPER_UNCERTAINTY_EDGE_BUMP = float(os.getenv("PAPER_UNCERTAINTY_EDGE_BUMP", "0.025"))
     PAPER_UNCERTAINTY_KELLY_MULT = float(os.getenv("PAPER_UNCERTAINTY_KELLY_MULT", "0.55"))
+    global PAPER_WIDE_OVERRIDE_ENABLED, PAPER_WIDE_OVERRIDE_MIN_EDGE
+    global PAPER_WIDE_OVERRIDE_MIN_PROB, PAPER_WIDE_OVERRIDE_KELLY_MULT
+    global PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC, PAPER_WIDE_OVERRIDE_MAX_PER_CARD
+    PAPER_WIDE_OVERRIDE_ENABLED = env_bool("PAPER_WIDE_OVERRIDE_ENABLED", "true")
+    PAPER_WIDE_OVERRIDE_MIN_EDGE = float(os.getenv("PAPER_WIDE_OVERRIDE_MIN_EDGE", "0.08"))
+    PAPER_WIDE_OVERRIDE_MIN_PROB = float(os.getenv("PAPER_WIDE_OVERRIDE_MIN_PROB", "0.70"))
+    PAPER_WIDE_OVERRIDE_KELLY_MULT = float(os.getenv("PAPER_WIDE_OVERRIDE_KELLY_MULT", "0.20"))
+    PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC = float(
+        os.getenv("PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", "0.01")
+    )
+    PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "2"))
     LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
     LIVE_DISAGREEMENT_TIGHTEN = float(os.getenv("LIVE_DISAGREEMENT_TIGHTEN", "0.04"))
     LIVE_INTERVAL_WIDTH_SKIP = float(os.getenv("LIVE_INTERVAL_WIDTH_SKIP", str(UNCERTAINTY_HIGH_WIDTH)))

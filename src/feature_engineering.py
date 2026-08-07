@@ -17,6 +17,13 @@ from src.greco_stats import apply_greco_to_features, fill_history_from_greco, gr
 from src.prior_sport import BASE_SPORTS, fill_history_from_prior_sport
 from src.sherdog import fill_history_from_sherdog
 from src.wikipedia_fighters import fill_history_from_wikipedia
+from src.high_value_features import (
+    HIGH_VALUE_DIFF_COLUMNS,
+    HV_FIGHTER_STAT_FIELDS,
+    apply_hv_rolling_extras,
+    build_hv_matchup_features,
+    log_hv_coverage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +51,14 @@ KEY_DIFF_COVERAGE_COLS = [
     "same_primary_base",
     "base_family_clash",
     "multi_base_flag_diff",
+    "hv_short_notice_flag_diff",
+    "hv_long_layoff_flag_diff",
+    "first_fight_new_wc_flag_diff",
+    "finish_rate_l5_diff",
+    "division_age_adj_diff",
+    "hv_td_pressure_diff",
+    "wins_vs_better_record_l5_diff",
+    "ko_losses_career_flag_diff",
 ]
 
 # Narrative note when one fighter's SOS (avg opp Elo / win rate) is clearly harder.
@@ -135,6 +150,8 @@ FIGHTER_STAT_FIELDS = [
     "base_other",
 ]
 
+FIGHTER_STAT_FIELDS = list(FIGHTER_STAT_FIELDS) + list(HV_FIGHTER_STAT_FIELDS)
+
 # Differential feature names produced for modeling.
 DIFF_FEATURE_FIELDS = [
     "age_diff",
@@ -183,6 +200,8 @@ DIFF_FEATURE_FIELDS = [
     "base_family_clash",
     "multi_base_flag_diff",
 ]
+
+DIFF_FEATURE_FIELDS = list(DIFF_FEATURE_FIELDS) + list(HIGH_VALUE_DIFF_COLUMNS)
 
 # --- Interaction candidates (products of base diffs; subset selected at train time) ---
 @dataclass(frozen=True)
@@ -846,6 +865,7 @@ def build_matchup_features(
         ),
         "multi_base_flag_diff": f1["multi_base"] - f2["multi_base"],
     }
+    features.update(build_hv_matchup_features(f1, f2))
     return pd.Series(features, dtype=float)
 
 
@@ -1451,6 +1471,7 @@ def _rolling_stats(history: pd.DataFrame) -> pd.DataFrame:
             axis=1,
         )
     )
+    history = apply_hv_rolling_extras(history, date_col=config.DATE_COLUMN)
     return history
 
 
@@ -1508,6 +1529,13 @@ def _fighter_stat_row(row: pd.Series, *, prefix: str) -> dict[str, float]:
         "base_sambo": f"{prefix}_base_sambo",
         "base_judo": f"{prefix}_base_judo",
         "base_other": f"{prefix}_base_other",
+        "hv_short_notice_flag": f"{prefix}_hv_short_notice_flag",
+        "hv_long_layoff_flag": f"{prefix}_hv_long_layoff_flag",
+        "first_fight_new_wc_flag": f"{prefix}_first_fight_new_wc_flag",
+        "finish_rate_l5": f"{prefix}_finish_rate_l5",
+        "division_age_adj": f"{prefix}_division_age_adj",
+        "wins_vs_better_record_l5": f"{prefix}_wins_vs_better_record_l5",
+        "ko_losses_career_flag": f"{prefix}_ko_losses_career_flag",
     }
     return {k: _series_get(row, col, np.nan) for k, col in mapping.items()}
 
@@ -1552,6 +1580,13 @@ def _build_impute_values(features: pd.DataFrame) -> dict[str, float]:
     values.setdefault("long_layoff_flag", 0.0)
     values.setdefault("short_notice_win_rate", 0.5)
     values.setdefault("long_layoff_win_rate", 0.5)
+    values.setdefault("hv_short_notice_flag", 0.0)
+    values.setdefault("hv_long_layoff_flag", 0.0)
+    values.setdefault("first_fight_new_wc_flag", 0.0)
+    values.setdefault("finish_rate_l5", 0.4)
+    values.setdefault("division_age_adj", 0.0)
+    values.setdefault("wins_vs_better_record_l5", 0.0)
+    values.setdefault("ko_losses_career_flag", 0.0)
     values.setdefault("kd_rate", 0.2)
     values.setdefault("head_strike_pct", 0.70)
     values.setdefault("body_strike_pct", 0.18)
@@ -1642,6 +1677,13 @@ _FIELD_TO_COL_SUFFIX = {
     "base_sambo": "base_sambo",
     "base_judo": "base_judo",
     "base_other": "base_other",
+    "hv_short_notice_flag": "hv_short_notice_flag",
+    "hv_long_layoff_flag": "hv_long_layoff_flag",
+    "first_fight_new_wc_flag": "first_fight_new_wc_flag",
+    "finish_rate_l5": "finish_rate_l5",
+    "division_age_adj": "division_age_adj",
+    "wins_vs_better_record_l5": "wins_vs_better_record_l5",
+    "ko_losses_career_flag": "ko_losses_career_flag",
 }
 
 
@@ -1690,6 +1732,15 @@ def fit_imputer(train_df: pd.DataFrame) -> ImputerStats:
         "same_primary_base": 0.0,
         "base_family_clash": 0.0,
         "multi_base_flag_diff": 0.0,
+        "hv_short_notice_flag_diff": 0.0,
+        "hv_long_layoff_flag_diff": 0.0,
+        "first_fight_new_wc_flag_diff": 0.0,
+        "finish_rate_l5_diff": 0.0,
+        "division_age_adj_diff": 0.0,
+        "hv_td_pressure_diff": 0.0,
+        "hv_control_clash": 0.0,
+        "wins_vs_better_record_l5_diff": 0.0,
+        "ko_losses_career_flag_diff": 0.0,
     }
     diff_fills: dict[str, float] = {}
     for col in DIFF_FEATURE_FIELDS:
@@ -2003,6 +2054,13 @@ def _assemble_wide_feature_matrix(
         "base_judo": "f2_base_judo",
         "base_other": "f2_base_other",
         "primary_base": "f2_primary_base",
+        "hv_short_notice_flag": "f2_hv_short_notice_flag",
+        "hv_long_layoff_flag": "f2_hv_long_layoff_flag",
+        "first_fight_new_wc_flag": "f2_first_fight_new_wc_flag",
+        "finish_rate_l5": "f2_finish_rate_l5",
+        "division_age_adj": "f2_division_age_adj",
+        "wins_vs_better_record_l5": "f2_wins_vs_better_record_l5",
+        "ko_losses_career_flag": "f2_ko_losses_career_flag",
         config.FIGHT_ID_COLUMN: config.FIGHT_ID_COLUMN,
     }
     f2_subset = f2[[c for c in f2_rename if c in f2.columns]].rename(columns=f2_rename)
@@ -2060,6 +2118,13 @@ def _assemble_wide_feature_matrix(
         "base_judo": "f1_base_judo",
         "base_other": "f1_base_other",
         "primary_base": "f1_primary_base",
+        "hv_short_notice_flag": "f1_hv_short_notice_flag",
+        "hv_long_layoff_flag": "f1_hv_long_layoff_flag",
+        "first_fight_new_wc_flag": "f1_first_fight_new_wc_flag",
+        "finish_rate_l5": "f1_finish_rate_l5",
+        "division_age_adj": "f1_division_age_adj",
+        "wins_vs_better_record_l5": "f1_wins_vs_better_record_l5",
+        "ko_losses_career_flag": "f1_ko_losses_career_flag",
     }
     features = f1.rename(columns=f1_rename)
     features = features.merge(f2_subset, on=config.FIGHT_ID_COLUMN, how="inner")
@@ -2133,6 +2198,7 @@ def _assemble_wide_feature_matrix(
         features, reference_year=2025, only_unlabeled=keep_unlabeled
     )
     log_feature_diff_coverage(features, year=2025, label="after fallback")
+    log_hv_coverage(features, year=2025, label="after fallback")
 
     features = build_interaction_candidates(features)
 

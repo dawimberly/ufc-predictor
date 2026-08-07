@@ -28,6 +28,7 @@ SKIP_WIDE_INTERVAL = "wide_interval"
 SKIP_MISSING = "missing_uncertainty"
 TIGHTEN_DISAGREEMENT = "elevated_disagreement"
 TIGHTEN_INTERVAL = "elevated_interval_width"
+PAPER_WIDE_OVERRIDE = "paper_wide_override"
 
 
 @dataclass
@@ -100,6 +101,89 @@ def read_uncertainty_metrics(row: pd.Series | dict[str, Any] | None) -> tuple[fl
     return disagree, width
 
 
+def _row_edge_and_prob(row: pd.Series | dict[str, Any] | None) -> tuple[float | None, float | None]:
+    """Best available pick-side edge + model prob for Paper wide override checks."""
+    if row is None:
+        return None, None
+    series = pd.Series(row) if isinstance(row, dict) else row
+    edge = None
+    pick = None
+    try:
+        from src.alerts import _pick_edge
+
+        edge, pick = _pick_edge(series)
+    except Exception:
+        edge, pick = None, None
+    prob = None
+    try:
+        f1 = str(series.get("fighter_1") or series.get("fighter1") or "")
+        f2 = str(series.get("fighter_2") or series.get("fighter2") or "")
+        if pick and pick == f2 and pd.notna(series.get("prob_f2_win")):
+            prob = float(series["prob_f2_win"])
+        elif pick and pick == f1 and pd.notna(series.get("prob_f1_win")):
+            prob = float(series["prob_f1_win"])
+        elif pd.notna(series.get("predicted_prob")):
+            prob = float(series["predicted_prob"])
+        elif pd.notna(series.get("prob_f1_win")):
+            prob = float(series["prob_f1_win"])
+    except Exception:
+        prob = None
+    return _safe_float(edge), _safe_float(prob)
+
+
+def maybe_paper_wide_override(
+    gate: UncertaintyGateResult,
+    row: pd.Series | dict[str, Any] | None = None,
+) -> UncertaintyGateResult:
+    """
+    Paper-only: convert pure ``wide_interval`` skips into a tiny-stake tighten
+    when edge/prob clear floors. Live and disagreement/missing skips unchanged.
+    """
+    if gate.action != "skip":
+        return gate
+    try:
+        if not config.is_paper_profile():
+            return gate
+        if not bool(getattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", False)):
+            return gate
+    except Exception:
+        return gate
+
+    reasons = list(gate.reasons or [])
+    if SKIP_WIDE_INTERVAL not in reasons:
+        return gate
+    if SKIP_HIGH_DISAGREEMENT in reasons or SKIP_MISSING in reasons:
+        return gate
+
+    edge, prob = _row_edge_and_prob(row)
+    min_edge = float(getattr(config, "PAPER_WIDE_OVERRIDE_MIN_EDGE", 0.08) or 0.08)
+    min_prob = float(getattr(config, "PAPER_WIDE_OVERRIDE_MIN_PROB", 0.70) or 0.70)
+    if edge is None or edge < min_edge:
+        return gate
+    if prob is None or prob < min_prob:
+        return gate
+
+    k_mult = float(getattr(config, "PAPER_WIDE_OVERRIDE_KELLY_MULT", 0.20) or 0.20)
+    k_mult = max(0.0, min(1.0, k_mult))
+    bump = float(getattr(config, "PAPER_UNCERTAINTY_EDGE_BUMP", 0.025) or 0.025)
+    logger.info(
+        "Paper wide override: edge=%.3f prob=%.3f width=%s → tighten kelly_mult=%.2f",
+        edge,
+        prob,
+        f"{gate.interval_width:.3f}" if gate.interval_width is not None else "?",
+        k_mult,
+    )
+    return UncertaintyGateResult(
+        action="tighten",
+        reasons=reasons + [PAPER_WIDE_OVERRIDE],
+        primary_reason=PAPER_WIDE_OVERRIDE,
+        disagreement=gate.disagreement,
+        interval_width=gate.interval_width,
+        edge_bump=bump,
+        kelly_mult=k_mult,
+    )
+
+
 def evaluate_uncertainty_gate(
     row: pd.Series | dict[str, Any] | None = None,
     *,
@@ -111,11 +195,29 @@ def evaluate_uncertainty_gate(
     Decide allow / tighten / skip from disagreement + conformal width.
 
     Fail-closed: either metric missing → skip with ``missing_uncertainty``.
+    Paper may convert pure ``wide_interval`` skips into a tiny-stake tighten
+    via ``maybe_paper_wide_override`` (Live unchanged).
     """
+    gate = _evaluate_uncertainty_gate_core(
+        row,
+        disagreement=disagreement,
+        interval_width=interval_width,
+        settings=settings,
+    )
+    return maybe_paper_wide_override(gate, row)
+
+
+def _evaluate_uncertainty_gate_core(
+    row: pd.Series | dict[str, Any] | None = None,
+    *,
+    disagreement: float | None = None,
+    interval_width: float | None = None,
+    settings: dict[str, Any] | None = None,
+) -> UncertaintyGateResult:
+    """Core allow / tighten / skip without Paper wide override."""
     try:
         cfg = settings or config.uncertainty_gate_settings()
     except Exception:
-        # Absolute fail-closed
         return UncertaintyGateResult(
             action="skip",
             reasons=[SKIP_MISSING],
@@ -148,7 +250,6 @@ def evaluate_uncertainty_gate(
     edge_bump = 0.0
     kelly_mult = 1.0
 
-    # Fail-closed on missing metrics
     if disagreement is None or interval_width is None:
         return UncertaintyGateResult(
             action="skip",
@@ -166,7 +267,6 @@ def evaluate_uncertainty_gate(
     w_tight = float(cfg["interval_width_tighten"])
     bump = float(cfg.get("edge_bump") or 0.0)
     k_mult = float(cfg.get("kelly_mult") or 1.0)
-    # Ensure tighten ≤ skip
     if d_tight > d_skip:
         d_tight = d_skip
     if w_tight > w_skip:
@@ -190,7 +290,6 @@ def evaluate_uncertainty_gate(
     if action == "skip":
         edge_bump = bump
         kelly_mult = 0.0
-        # Prefer canonical skip reason names for logging
         primary = SKIP_HIGH_DISAGREEMENT if SKIP_HIGH_DISAGREEMENT in reasons else (
             SKIP_WIDE_INTERVAL if SKIP_WIDE_INTERVAL in reasons else reasons[0]
         )

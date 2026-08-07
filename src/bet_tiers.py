@@ -1,22 +1,25 @@
 """Fight-row / fun-bet color tiers — math + final decision, not vibes.
 
 Legend (exact meaning):
-- Blue  = clears HA gates + real stake (actionable ticket)
-- Green = decent fun bet (positive edge / solid model lean, but NOT a real ticket)
-- Yellow = caution (thin edge, borderline prob, or soft uncertainty)
-- Red   = don't bet (negative edge, low model prob, or hard skip)
+- Deep Blue = full HA ticket (clears gates, normal real stake)
+- Sky Blue  = Paper wide override only (tiny stake, paper_wide_override)
+- Green     = decent fun bet (positive edge / solid model lean, but NOT a real ticket)
+- Yellow    = caution (thin edge, borderline prob, or soft uncertainty)
+- Red       = don't bet (negative edge, low model prob, or hard skip)
 
 Rules (apply in this order):
-1. If final decision is BET / stake% > 0 / clears HA gates → BLUE
-2. Else if edge < 0 → RED
-3. Else if model_prob < 0.52 OR status is hard skip (no_odds / low_model_prob) → RED
-4. Else if edge >= 0.05 AND model_prob >= 0.60 AND SKIP for uncertainty/wide_interval only → GREEN
-5. Else → YELLOW
+1. If Paper + paper_wide_override + stake_pct > 0 → SKY_BLUE
+2. Else if final decision is BET / stake% > 0 / clears HA gates → BLUE (deep)
+3. Else if edge < 0 → RED
+4. Else if model_prob < 0.52 OR status is hard skip (no_odds / low_model_prob) → RED
+5. Else if edge >= 0.05 AND model_prob >= 0.60 AND SKIP for uncertainty/wide_interval only → GREEN
+6. Else → YELLOW
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import pandas as pd
@@ -24,15 +27,25 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 TIER_BLUE = "blue"
+TIER_SKY_BLUE = "sky_blue"
 TIER_GREEN = "green"
 TIER_YELLOW = "yellow"
 TIER_RED = "red"
 
-TIER_ORDER = (TIER_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED)
+# Sort: Deep Blue → Sky Blue → Green → Yellow → Red
+TIER_ORDER = (TIER_BLUE, TIER_SKY_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED)
+TIER_SORT_RANK = {
+    TIER_BLUE: 0,
+    TIER_SKY_BLUE: 1,
+    TIER_GREEN: 2,
+    TIER_YELLOW: 3,
+    TIER_RED: 4,
+}
 
 # Hex must stay visually distinct on dark UI (yellow ≠ red, red ≠ gold).
 TIER_COLORS = {
-    TIER_BLUE: "#3b82f6",
+    TIER_BLUE: "#3b82f6",  # deep blue — full HA
+    TIER_SKY_BLUE: "#57B9FF",  # sky blue — Paper wide override only
     TIER_GREEN: "#22c55e",
     TIER_YELLOW: "#eab308",  # gold yellow — clearly not red
     TIER_RED: "#f87171",  # soft red — clearly not yellow
@@ -40,10 +53,14 @@ TIER_COLORS = {
 
 TIER_LABELS = {
     TIER_BLUE: "Blue",
+    TIER_SKY_BLUE: "Sky Blue",
     TIER_GREEN: "Green",
     TIER_YELLOW: "Yellow",
     TIER_RED: "Red",
 }
+
+_ACTIONABLE_TIERS = frozenset({TIER_BLUE, TIER_SKY_BLUE})
+_PAPER_WIDE_OVERRIDE_TOKEN = "paper_wide_override"
 
 # Color thresholds (do not change HA sizing gates).
 _RED_PROB_FLOOR = 0.52
@@ -63,6 +80,81 @@ _SOFT_UNCERTAINTY_SKIP = frozenset(
         "high_disagreement",
     }
 )
+
+
+def _is_paper_profile() -> bool:
+    try:
+        import config
+
+        return bool(config.is_paper_profile())
+    except Exception:
+        return False
+
+
+def _has_paper_wide_override_reason(
+    *,
+    uncertainty_reason: str | None = None,
+    status: str | None = None,
+    row: pd.Series | dict[str, Any] | None = None,
+) -> bool:
+    blob = " ".join(
+        [
+            str(uncertainty_reason or ""),
+            str(status or ""),
+        ]
+    ).lower().replace("-", "_").replace(" ", "_")
+    if _PAPER_WIDE_OVERRIDE_TOKEN in blob:
+        return True
+    if row is None:
+        return False
+    try:
+        from src.uncertainty_gates import PAPER_WIDE_OVERRIDE, evaluate_uncertainty_gate
+
+        gate = evaluate_uncertainty_gate(row)
+        if gate.primary_reason == PAPER_WIDE_OVERRIDE:
+            return True
+        if PAPER_WIDE_OVERRIDE in (gate.reasons or []):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _parse_stake_pct_from_status(status: str | None) -> float | None:
+    """Parse leading '1.25%' from Kelly/status strings like '1.00% paper_wide_override'."""
+    text = str(status or "").strip()
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*%", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_sky_blue_ticket(
+    *,
+    stake_pct: float | None = None,
+    stake_usd: float | None = None,
+    uncertainty_reason: str | None = None,
+    status: str | None = None,
+    row: pd.Series | dict[str, Any] | None = None,
+) -> bool:
+    """Paper-only sky blue: paper_wide_override + positive stake_pct."""
+    if not _is_paper_profile():
+        return False
+    if not _has_paper_wide_override_reason(
+        uncertainty_reason=uncertainty_reason, status=status, row=row
+    ):
+        return False
+    pct = _safe_float(stake_pct)
+    if pct is None:
+        pct = _parse_stake_pct_from_status(status)
+    if pct is not None and pct > 0:
+        return True
+    # Fallback: positive USD stake counts when pct not carried on the ticket
+    usd = _safe_float(stake_usd)
+    return usd is not None and usd > 0
 
 
 def _safe_float(val: Any) -> float | None:
@@ -283,16 +375,18 @@ def classify_bet_tier(
     edge: float | None = None,
     model_prob: float | None = None,
     pick: str | None = None,
+    uncertainty_reason: str | None = None,
     debug: bool = True,
 ) -> tuple[str, str]:
     """Classify color from final decision/status, edge, model_prob, stake.
 
     HARD RULES:
-    1. BLUE only if stake>0 / BET|TAKE|PLAY. If status contains SKIP → NEVER blue.
-    2. RED if edge < 0
-    3. RED if displayed model_prob < 52% OR no usable odds
-    4. GREEN if edge >= 0.05 and model_prob >= 0.60 and decision is SKIP
-    5. YELLOW otherwise
+    1. SKY_BLUE if Paper + paper_wide_override + stake_pct > 0
+    2. BLUE (deep) only if stake>0 / BET|TAKE|PLAY. If status contains SKIP → NEVER blue.
+    3. RED if edge < 0
+    4. RED if displayed model_prob < 52% OR no usable odds
+    5. GREEN if edge >= 0.05 and model_prob >= 0.60 and decision is SKIP
+    6. YELLOW otherwise
     """
     if row is not None:
         info = resolve_row_decision(
@@ -312,6 +406,11 @@ def classify_bet_tier(
             stake_pct = info.get("stake_pct")
         if stake_usd is None:
             stake_usd = info.get("stake_usd")
+        if uncertainty_reason is None:
+            try:
+                uncertainty_reason = str(pd.Series(row).get("uncertainty_reason") or "") or None
+            except Exception:
+                uncertainty_reason = None
         if status is None:
             if info.get("decision") == "BET":
                 status = "BET"
@@ -333,25 +432,43 @@ def classify_bet_tier(
     prob_f = _safe_float(model_prob)
     stake_pct_f = _safe_float(stake_pct)
     stake_usd_f = _safe_float(stake_usd)
+    if stake_pct_f is None:
+        stake_pct_f = _parse_stake_pct_from_status(status_s)
 
-    # --- Rule 1: BLUE only for real money; SKIP never blue ---
+    # --- Rule 1: SKY BLUE — Paper wide override tiny stake only ---
     is_skip = "SKIP" in status_u or decision == "SKIP"
     has_stake = (stake_pct_f is not None and stake_pct_f > 0) or (
         stake_usd_f is not None and stake_usd_f > 0
     )
     is_bet_word = status_u in {"BET", "TAKE", "PLAY"} or status_u.startswith("BET")
-    if not is_skip and (has_stake or is_bet_word or (clears_gates and decision == "BET")):
+    actionable = not is_skip and (
+        has_stake or is_bet_word or (clears_gates and decision == "BET")
+    )
+    if actionable and is_sky_blue_ticket(
+        stake_pct=stake_pct_f,
+        stake_usd=stake_usd_f,
+        uncertainty_reason=uncertainty_reason,
+        status=status_s,
+        row=row,
+    ):
+        # Require positive stake_pct (or parseable %) for sky; USD-only already gated above
+        tier, reason = TIER_SKY_BLUE, "paper_wide_override"
+        _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
+        return tier, reason
+
+    # --- Rule 2: DEEP BLUE only for real money; SKIP never blue ---
+    if actionable:
         tier, reason = TIER_BLUE, "stake_or_bet_decision"
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
         return tier, reason
 
-    # --- Rule 2: negative edge ---
+    # --- Rule 3: negative edge ---
     if edge_f is not None and edge_f < 0:
         tier, reason = TIER_RED, "negative_edge"
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
         return tier, reason
 
-    # --- Rule 3: low display-prob or no odds ---
+    # --- Rule 4: low display-prob or no odds ---
     # Display-aligned: round(prob*100) < 52 so shown "52%" can still be yellow.
     if edge_f is None or skip_reason == "no_odds":
         tier, reason = TIER_RED, "no_usable_odds"
@@ -362,7 +479,7 @@ def classify_bet_tier(
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
         return tier, reason
 
-    # --- Rule 4: GREEN strong lean + SKIP (e.g. SKIP:wide / Guilherme) ---
+    # --- Rule 5: GREEN strong lean + SKIP (e.g. SKIP:wide / Guilherme) ---
     if (
         is_skip
         and edge_f >= _GREEN_MIN_EDGE
@@ -373,7 +490,7 @@ def classify_bet_tier(
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
         return tier, reason
 
-    # --- Rule 5: YELLOW ---
+    # --- Rule 6: YELLOW ---
     tier, reason = TIER_YELLOW, "borderline_or_thin"
     _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
     return tier, reason
@@ -461,7 +578,7 @@ def _bet_dict_from_row(
         "tier_label": TIER_LABELS.get(tier, tier),
         "tier_reason": reason,
         "fun_bet": tier in {TIER_GREEN, TIER_YELLOW},
-        "advisory": tier != TIER_BLUE,
+        "advisory": tier not in _ACTIONABLE_TIERS,
         "brief": f"{TIER_LABELS.get(tier, tier)} — {reason.replace('_', ' ')}",
         "description": f"{TIER_LABELS.get(tier, tier)} — {reason.replace('_', ' ')}",
     }
@@ -477,6 +594,7 @@ def rank_card_bet_tiers(
     """Classify every fight; return buckets + ranked fun list (green then yellow)."""
     out: dict[str, list[dict[str, Any]]] = {
         TIER_BLUE: [],
+        TIER_SKY_BLUE: [],
         TIER_GREEN: [],
         TIER_YELLOW: [],
         TIER_RED: [],
@@ -489,12 +607,21 @@ def rank_card_bet_tiers(
             if stake <= 0 and stake_pct <= 0:
                 continue
             item = dict(s)
-            item["bet_tier"] = TIER_BLUE
-            item["tier"] = TIER_BLUE
-            item["tier_label"] = TIER_LABELS[TIER_BLUE]
+            unc = str(s.get("uncertainty_reason") or "")
+            if is_sky_blue_ticket(
+                stake_pct=stake_pct if stake_pct > 0 else None,
+                stake_usd=stake if stake > 0 else None,
+                uncertainty_reason=unc,
+            ):
+                tier = TIER_SKY_BLUE
+            else:
+                tier = TIER_BLUE
+            item["bet_tier"] = tier
+            item["tier"] = tier
+            item["tier_label"] = TIER_LABELS[tier]
             item["fun_bet"] = False
             item["advisory"] = False
-            out[TIER_BLUE].append(item)
+            out[tier].append(item)
         return out
 
     if min_model_prob is None:
@@ -513,6 +640,16 @@ def rank_card_bet_tiers(
             pass
 
     cleared = singles_cleared_keys(cleared_singles)
+    # Map fight keys → alert single (for stake + uncertainty_reason on override tickets)
+    cleared_by_key: dict[str, dict[str, Any]] = {}
+    for s in cleared_singles or []:
+        for k in (
+            str(s.get("fight_id") or "").strip(),
+            str(s.get("fight") or "").strip(),
+        ):
+            if k and k not in cleared_by_key:
+                cleared_by_key[k] = s
+
     seen: set[str] = set()
     for _, row in predictions.iterrows():
         keys = _fight_keys(row)
@@ -522,15 +659,38 @@ def rank_card_bet_tiers(
         if dedupe:
             seen.add(dedupe)
         clears = bool(keys & cleared)
+        alert = None
+        for k in keys:
+            if k in cleared_by_key:
+                alert = cleared_by_key[k]
+                break
+        stake_pct = _safe_float(alert.get("stake_pct")) if alert else None
+        stake_usd = None
+        if alert:
+            stake_usd = _safe_float(alert.get("suggested_stake"))
+            if stake_usd is None:
+                stake_usd = _safe_float(alert.get("stake_usd"))
+        unc = str(alert.get("uncertainty_reason") or "") if alert else None
         tier, reason = classify_bet_tier(
             row,
             clears_gates=clears,
+            stake_pct=stake_pct,
+            stake_usd=stake_usd,
+            uncertainty_reason=unc,
             min_model_prob=min_model_prob,
         )
         item = _bet_dict_from_row(row, tier=tier, reason=reason)
+        if alert and tier in _ACTIONABLE_TIERS:
+            if stake_usd is not None and stake_usd > 0:
+                item["suggested_stake"] = stake_usd
+                item["stake_usd"] = stake_usd
+            if stake_pct is not None and stake_pct > 0:
+                item["stake_pct"] = stake_pct
+            if unc:
+                item["uncertainty_reason"] = unc
         out[tier].append(item)
 
-    for tier in (TIER_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED):
+    for tier in TIER_ORDER:
         out[tier].sort(key=lambda b: float(b.get("edge") or 0), reverse=True)
         out[tier] = out[tier][:limit_per_tier]
 
@@ -548,9 +708,10 @@ def rank_card_bet_tiers(
 
 def format_tier_legend() -> str:
     return (
-        "Blue = clears HA gates + real stake · "
-        "Green = decent fun bet (not a real ticket) · "
-        "Yellow = caution / thin · "
+        "Blue = real HA ticket · "
+        "Sky blue = Paper override (tiny) · "
+        "Green = fun · "
+        "Yellow = caution · "
         "Red = don't bet"
     )
 
@@ -597,6 +758,7 @@ def classify_prop_bet_tier(prop: dict[str, Any], *, debug: bool = False) -> tupl
         model_prob=_safe_float(prop.get("prob")),
         stake_pct=_safe_float(prop.get("stake_pct")),
         stake_usd=stake,
+        uncertainty_reason=str(prop.get("uncertainty_reason") or "") or None,
         pick=str(prop.get("label") or prop.get("prop_short") or prop.get("pick") or "Over 1.5"),
         debug=debug,
     )
@@ -730,6 +892,7 @@ def rank_prop_bet_tiers(
     """Classify prop singles into Blue/Green/Yellow/Red buckets."""
     out: dict[str, list[dict[str, Any]]] = {
         TIER_BLUE: [],
+        TIER_SKY_BLUE: [],
         TIER_GREEN: [],
         TIER_YELLOW: [],
         TIER_RED: [],
@@ -740,7 +903,7 @@ def rank_prop_bet_tiers(
         item = prop_bet_dict_from_row(p, tier=tier, reason=reason)
         out[tier].append(item)
 
-    for tier in (TIER_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED):
+    for tier in TIER_ORDER:
         out[tier].sort(key=lambda b: float(b.get("edge") or 0), reverse=True)
         out[tier] = out[tier][:limit_per_tier]
 
@@ -765,6 +928,7 @@ def merge_bet_tier_dicts(
     """Merge ML + prop tier buckets (dedupe by fight_id|prop_key|pick)."""
     base = {
         TIER_BLUE: [],
+        TIER_SKY_BLUE: [],
         TIER_GREEN: [],
         TIER_YELLOW: [],
         TIER_RED: [],
@@ -782,7 +946,7 @@ def merge_bet_tier_dicts(
         )
 
     for src in (primary or {}, secondary or {}):
-        for tier in (TIER_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED):
+        for tier in TIER_ORDER:
             for b in src.get(tier) or []:
                 k = _key(b)
                 if not k or k in seen:
@@ -790,7 +954,7 @@ def merge_bet_tier_dicts(
                 seen.add(k)
                 base[tier].append(dict(b))
 
-    for tier in (TIER_BLUE, TIER_GREEN, TIER_YELLOW, TIER_RED):
+    for tier in TIER_ORDER:
         base[tier].sort(key=lambda b: float(b.get("edge") or 0), reverse=True)
         base[tier] = base[tier][:limit_per_tier]
 
@@ -818,19 +982,27 @@ def format_tiered_best_bets(
         title += f" — {event}"
     lines.append(title)
     lines.append(format_tier_legend())
-    lines.append("Only Blue is sized / actionable. Green/Yellow are fun rankings ($0).")
+    lines.append(
+        "Blue / Sky blue are sized. Green/Yellow are fun rankings ($0)."
+    )
     lines.append("Includes moneyline + Over 1.5 props when available.")
 
     blue = list(tiers.get(TIER_BLUE) or [])
+    sky = list(tiers.get(TIER_SKY_BLUE) or [])
     green = list(tiers.get(TIER_GREEN) or [])
     yellow = list(tiers.get(TIER_YELLOW) or [])
 
     if blue:
-        lines.append(f"BLUE (clears gates) — {len(blue)}:")
+        lines.append(f"BLUE (full HA) — {len(blue)}:")
         for i, b in enumerate(blue[:5], start=1):
             lines.append(_line(b, i))
     else:
-        lines.append("BLUE — none cleared HA gates (NO BET for sized bankroll).")
+        lines.append("BLUE — none cleared full HA gates (NO BET for sized bankroll).")
+
+    if sky:
+        lines.append(f"SKY BLUE (Paper override) — {len(sky)}:")
+        for i, b in enumerate(sky[:5], start=1):
+            lines.append(_line(b, i))
 
     if green:
         lines.append(f"GREEN (decent fun) — {len(green)}:")

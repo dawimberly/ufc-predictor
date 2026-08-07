@@ -14,8 +14,12 @@ if (-not (Test-Path $icon)) {
     exit 1
 }
 
-$pyw = "C:\Users\Owner\AppData\Local\Programs\Python\Python311\pythonw.exe"
-$py = "C:\Users\Owner\AppData\Local\Programs\Python\Python311\python.exe"
+$pyw = "C:\Python314\pythonw.exe"
+$py = "C:\Python314\python.exe"
+if (-not (Test-Path $pyw)) {
+    $pyw = "C:\Users\Owner\AppData\Local\Programs\Python\Python311\pythonw.exe"
+    $py = "C:\Users\Owner\AppData\Local\Programs\Python\Python311\python.exe"
+}
 if (-not (Test-Path $pyw)) {
     $pyw = (Get-Command pythonw.exe).Source
     $py = (Get-Command python.exe).Source

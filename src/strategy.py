@@ -667,6 +667,130 @@ def build_model_only_parlay_candidates(
     return out[:5]
 
 
+def build_auto_parlay_recommendations(
+    card_rows: pd.DataFrame | None,
+    *,
+    ha_singles: list[dict[str, Any]] | None = None,
+    min_pick_prob: float = 0.58,
+    min_combined_prob_2: float = 0.30,
+    min_combined_prob_3: float = 0.18,
+    leg_counts: tuple[int, ...] = (2, 3),
+) -> list[dict[str, Any]]:
+    """
+    Automatically pick one best 2-leg and one best 3-leg research parlay.
+
+    Prefer HA-cleared singles as legs when available; otherwise highest model probs.
+    Advisory only — not Live HA-sized tickets (especially 3-leg).
+    """
+    if card_rows is None or getattr(card_rows, "empty", True):
+        return []
+
+    # Preferred fight ids from HA singles (moneyline)
+    preferred: set[str] = set()
+    for s in ha_singles or []:
+        if s.get("is_parlay") or int(s.get("n_legs") or 1) >= 2:
+            continue
+        stake = float(s.get("suggested_stake") or s.get("stake_usd") or 0)
+        stake_pct = float(s.get("stake_pct") or 0)
+        if stake <= 0 and stake_pct <= 0:
+            continue
+        for k in (str(s.get("fight_id") or "").strip(), str(s.get("fight") or "").strip()):
+            if k:
+                preferred.add(k)
+
+    legs: list[dict[str, Any]] = []
+    for _, row in card_rows.iterrows():
+        pick, prob, fight = _pick_model_prob(row)
+        if not pick or float(prob) < float(min_pick_prob):
+            continue
+        fid = str(row.get("fight_id") or fight).strip()
+        conf = str(row.get("confidence_label") or row.get("confidence") or "").strip().lower()
+        legs.append(
+            {
+                "fight": fight,
+                "pick": str(pick),
+                "prob": float(prob),
+                "fight_id": fid,
+                "confidence": conf or "-",
+                "ha_leg": bool(fid in preferred or fight in preferred),
+                "weight_class": str(row.get("weight_class") or ""),
+            }
+        )
+
+    # Prefer HA legs first, then by prob
+    legs.sort(key=lambda L: (0 if L["ha_leg"] else 1, -L["prob"]))
+    # Cap candidate pool so combinations stay small
+    pool = legs[:10]
+    if len(pool) < 2:
+        return []
+
+    def _best_for_n(n: int, min_comb: float) -> dict[str, Any] | None:
+        if len(pool) < n:
+            return None
+        best: dict[str, Any] | None = None
+        best_key: tuple[float, float, float] = (-1.0, -1.0, -1.0)
+        for combo in combinations(pool, n):
+            # One leg per fight
+            fids = [c["fight_id"] for c in combo]
+            if len(set(fids)) != n:
+                continue
+            combined = float(np.prod([c["prob"] for c in combo]))
+            if combined < min_comb:
+                continue
+            ha_count = sum(1 for c in combo if c["ha_leg"])
+            # Rank: more HA legs, then combined prob, then min leg prob
+            key = (float(ha_count), combined, min(c["prob"] for c in combo))
+            if key > best_key:
+                best_key = key
+                picks_txt = " + ".join(f"{c['pick']} ({c['prob']:.0%})" for c in combo)
+                best = {
+                    "id": f"parlay-{n}leg-" + "-".join(sorted(fids))[:80],
+                    "n_legs": n,
+                    "legs": [
+                        {
+                            "fight_id": c["fight_id"],
+                            "fight": c["fight"],
+                            "pick": c["pick"],
+                            "prob": c["prob"],
+                            "confidence": c["confidence"],
+                            "ha_leg": c["ha_leg"],
+                        }
+                        for c in combo
+                    ],
+                    "combined_prob": combined,
+                    "picks": picks_txt,
+                    "pick_line": picks_txt,
+                    "display_label": picks_txt,
+                    "market": f"{n}-leg parlay",
+                    "market_type": "parlay",
+                    "is_parlay": True,
+                    "model_only": True,
+                    "advisory": True,
+                    "fun_bet": False,
+                    "suggested_stake": 0.0,
+                    "stake_usd": 0.0,
+                    "stake_pct": 0.0,
+                    "ha_legs": ha_count,
+                    "ha_qualified": n == 2 and ha_count == n,
+                    "reason": "",
+                    "brief": (
+                        f"Auto {n}-leg · combined {combined:.0%}"
+                        + (" · HA legs" if ha_count == n else " · research")
+                    ),
+                }
+        return best
+
+    floors = {2: float(min_combined_prob_2), 3: float(min_combined_prob_3)}
+    out: list[dict[str, Any]] = []
+    for n in leg_counts:
+        if int(n) < 2:
+            continue
+        rec = _best_for_n(int(n), floors.get(int(n), 0.15))
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
 def compute_equity_metrics(equity: pd.Series) -> dict[str, float]:
     """Max drawdown % and longest win streak from chronological equity curve."""
     if equity.empty:

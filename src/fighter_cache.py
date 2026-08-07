@@ -35,7 +35,7 @@ FIGHTER_HISTORY_PATH = config.CACHE_DIR / "fighter_history_long.parquet"
 FIGHTER_ELO_PATH = config.CACHE_DIR / "fighter_elo.parquet"
 FIGHTER_CACHE_META_PATH = config.CACHE_DIR / "fighter_cache_meta.json"
 # v4: prior-sport base tiers (wrestling/BJJ/boxing/…) on long history.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 
 
 def _utc_now() -> str:

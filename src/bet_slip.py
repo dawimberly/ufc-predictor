@@ -339,7 +339,7 @@ def ticket_dedupe_key(ticket: dict[str, Any]) -> tuple[str, str, str, str]:
 
 
 def ticket_clears_gates(ticket: dict[str, Any]) -> bool:
-    """True when ticket is a real HA-sized / Blue clears-gates pick."""
+    """True when ticket is a real HA-sized / Blue or Sky Blue clears-gates pick."""
     tier = str(ticket.get("bet_tier") or ticket.get("tier") or "").strip().lower()
     if ticket.get("fun_bet") or ticket.get("advisory"):
         # Explicit fun/advisory never clears, even if stale stake fields linger
@@ -354,7 +354,7 @@ def ticket_clears_gates(ticket: dict[str, Any]) -> bool:
     stake_pct = _safe_float(ticket.get("stake_pct"))
     if stake > 0 or stake_pct > 0:
         return True
-    if tier == "blue" and not ticket.get("fun_bet") and not ticket.get("advisory"):
+    if tier in {"blue", "sky_blue"} and not ticket.get("fun_bet") and not ticket.get("advisory"):
         return True
     return False
 
@@ -393,26 +393,29 @@ def ticket_is_better(candidate: dict[str, Any], incumbent: dict[str, Any]) -> bo
 
 
 def _rank_bucket(ticket: dict[str, Any]) -> int:
-    """Strict color order: blue(0) → green(1) → yellow(2) → red(3) → other(4)."""
+    """Strict color order: blue(0) → sky_blue(1) → green(2) → yellow(3) → red(4)."""
     tier = str(ticket.get("bet_tier") or ticket.get("tier") or "").strip().lower()
     # Normalize aliases that must never outrank their true color
     if tier in {"don't bet", "dont_bet", "dont-bet", "no_bet"}:
         tier = "red"
     if tier in {"caution", "warn", "warning", "amber", "orange"}:
         tier = "yellow"
-    if tier == "red":
-        return 3
-    if ticket_clears_gates(ticket) or tier == "blue":
-        return 0
-    if tier == "green":
+    if tier in {"sky", "skyblue", "light_blue", "lightblue"}:
+        tier = "sky_blue"
+    order = {"blue": 0, "sky_blue": 1, "green": 2, "yellow": 3, "red": 4}
+    if tier in order:
+        return order[tier]
+    # Untiered clears-gates with override reason → sky (after deep blue)
+    unc = str(ticket.get("uncertainty_reason") or "").lower()
+    if "paper_wide_override" in unc and ticket_clears_gates(ticket):
         return 1
-    if tier == "yellow":
-        return 2
+    if ticket_clears_gates(ticket):
+        return 0
     # Untiered: never promote unknown/red-ish rows above yellow
     if ticket.get("fun_bet") and not ticket.get("advisory"):
-        return 1
-    if ticket.get("fun_bet") or ticket.get("advisory"):
         return 2
+    if ticket.get("fun_bet") or ticket.get("advisory"):
+        return 3
     return 4
 
 
@@ -482,7 +485,8 @@ def dedupe_rank_top_tickets(
     )
 
     # Top recommended is for plays / fun leans — drop "don't bet" (red) from the list.
-    playable = [t for t in deduped if _rank_bucket(t) < 3]
+    # Buckets: blue=0, sky_blue=1, green=2, yellow=3, red=4
+    playable = [t for t in deduped if _rank_bucket(t) < 4]
     if not playable:
         playable = deduped  # only reds exist — still show something ranked last
     shown = playable[: max(0, int(limit))]

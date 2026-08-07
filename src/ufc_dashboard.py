@@ -634,8 +634,9 @@ def _site_odds(row: pd.Series, pick: str | None) -> str:
 
 
 def _kelly_pct(row: pd.Series, bankroll: float, strategy) -> str:
+    gate = None
     try:
-        from src.uncertainty_gates import evaluate_uncertainty_gate
+        from src.uncertainty_gates import PAPER_WIDE_OVERRIDE, evaluate_uncertainty_gate
 
         gate = evaluate_uncertainty_gate(row)
         if gate.skip:
@@ -652,10 +653,28 @@ def _kelly_pct(row: pd.Series, bankroll: float, strategy) -> str:
         edge=cand.edge,
         config=strategy,
         row=row,
+        uncertainty_kelly_mult=float(gate.kelly_mult) if gate is not None else 1.0,
     )
+    is_override = False
+    try:
+        from src.uncertainty_gates import PAPER_WIDE_OVERRIDE as _PWO
+
+        is_override = gate is not None and (
+            gate.primary_reason == _PWO or _PWO in (gate.reasons or [])
+        )
+        if is_override:
+            max_frac = float(
+                getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01
+            )
+            stake = min(float(stake), float(bankroll) * max(0.0, max_frac))
+    except Exception:
+        is_override = False
     if stake <= 0:
         return "-"
-    return f"{stake / bankroll * 100:.2f}%"
+    pct = f"{stake / bankroll * 100:.2f}%"
+    if is_override:
+        return f"{pct} paper_wide_override"
+    return pct
 
 
 class _ToolTip:
@@ -749,7 +768,13 @@ def _sort_preds_by_model_prob(preds: pd.DataFrame) -> pd.DataFrame:
     return scored.sort_values("_sort_prob", ascending=False).drop(columns="_sort_prob").reset_index(drop=True)
 
 
-_FIGHT_TIER_SORT_RANK = {"blue": 0, "green": 1, "yellow": 2, "red": 3}
+_FIGHT_TIER_SORT_RANK = {
+    "blue": 0,
+    "sky_blue": 1,
+    "green": 2,
+    "yellow": 3,
+    "red": 4,
+}
 
 
 def _fight_table_sort_key(row: dict[str, Any]) -> tuple:
@@ -2236,7 +2261,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
             if result.get("ollama_latency_ms") is not None:
                 latency_ms = result.get("ollama_latency_ms")
 
-        if not available and not (result and result.get("bet_slip")):
+        if not available and not (
+            result
+            and (result.get("bet_slip") or result.get("recommended_parlays"))
+        ):
             # Offline with no HA slip yet — clear banner, fail-closed (no invented bets)
             banner = health_banner or "Ollama offline — showing model tickets only"
             self.status_label.configure(text=banner)
@@ -2406,6 +2434,8 @@ class GrokAnalysisPanel(_CTK_FRAME):
                     title_size=12,
                 )
 
+        self._render_auto_parlay_recs(list(result.get("recommended_parlays") or []))
+
         skips = list(result.get("skipped") or [])
         if skips:
             lines = [
@@ -2413,6 +2443,92 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 for s in skips[:8]
             ]
             self._pack_message("Skips", "\n".join(lines), color="#f87171", title_size=12)
+
+    def _render_auto_parlay_recs(self, parlays: list[dict[str, Any]]) -> None:
+        """Show auto 2-leg + 3-leg parlays in the same bubble style as Top picks."""
+        from src.bet_tiers import TIER_COLORS, TIER_GREEN, TIER_LABELS, TIER_YELLOW
+
+        if not parlays:
+            return
+        by_n: dict[int, dict[str, Any]] = {}
+        for p in parlays:
+            try:
+                n = int(p.get("n_legs") or 0)
+            except (TypeError, ValueError):
+                continue
+            if n in (2, 3) and n not in by_n:
+                by_n[n] = p
+        ordered = [by_n[n] for n in (2, 3) if n in by_n] or list(parlays)[:2]
+        if not ordered:
+            return
+
+        bubble = ctk.CTkFrame(
+            self.scroll,
+            fg_color="#0f172a",
+            corner_radius=10,
+            border_width=2,
+            border_color="#475569",
+        )
+        bubble.pack(fill="x", padx=4, pady=6)
+        ctk.CTkLabel(
+            bubble,
+            text=f"Parlay recommendations ({len(ordered)})",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#f8fafc",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 2))
+        ctk.CTkLabel(
+            bubble,
+            text="Auto 2-leg + 3-leg · research $0 (not HA-sized) · Green = stronger legs / Yellow = thinner",
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 8))
+
+        for i, p in enumerate(ordered, start=1):
+            n = int(p.get("n_legs") or 0)
+            side = str(p.get("picks") or p.get("pick_line") or p.get("display_label") or "-")
+            market = f"{n}-leg parlay" if n else str(p.get("market") or "parlay")
+            comb = p.get("combined_prob")
+            try:
+                comb_s = f"{float(comb):.0%}" if comb is not None else "n/a"
+            except (TypeError, ValueError):
+                comb_s = "n/a"
+            # Stronger presentation when HA-qualified 2-leg or high combined prob
+            if p.get("ha_qualified") or (comb is not None and float(comb) >= 0.40):
+                bet_tier = TIER_GREEN
+            else:
+                bet_tier = TIER_YELLOW
+            color = TIER_COLORS.get(bet_tier, "#e2e8f0")
+            tier_lbl = TIER_LABELS.get(bet_tier, bet_tier).upper()
+            tag = "HA legs" if p.get("ha_qualified") else "research $0"
+            line = (
+                f"#{i}  [{tier_lbl}]  {side}  ·  {market}  ·  "
+                f"combined {comb_s}  ·  {tag}"
+            )
+            ctk.CTkLabel(
+                bubble,
+                text=_ascii_ui(line),
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color=color,
+                anchor="w",
+                justify="left",
+                wraplength=980,
+            ).pack(fill="x", padx=12, pady=(0, 2))
+            reason = str(p.get("reason") or "").strip()
+            if reason:
+                # Match actionable density: one muted reason under the pick line
+                ctk.CTkLabel(
+                    bubble,
+                    text=_ascii_ui(reason),
+                    font=ctk.CTkFont(size=11),
+                    text_color="#94a3b8",
+                    anchor="w",
+                    justify="left",
+                    wraplength=960,
+                ).pack(fill="x", padx=24, pady=(0, 6))
+
+        ctk.CTkFrame(bubble, fg_color="transparent", height=8).pack(fill="x")
 
     def _pack_message(
         self,
@@ -2502,6 +2618,8 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 money = "research $0"
             else:
                 money = f"{pct:.1f}% · ${dollars:.2f}"
+                if bet_tier == "sky_blue" or str(bet.get("uncertainty_reason") or "") == "paper_wide_override":
+                    money = f"{money} · paper_wide_override"
             edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
             line = (
                 f"#{rank}  [{tier_lbl}]  {side}  ·  {market} @ {book}  ·  "
@@ -4974,8 +5092,26 @@ class UFCDashboardApp(_CTK_BASE):
                 )
 
         for t in items:
-            t.setdefault("bet_tier", "blue")
-            t.setdefault("tier", "blue")
+            from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE, is_sky_blue_ticket
+
+            def _sf(v: Any) -> float | None:
+                try:
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return None
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            if is_sky_blue_ticket(
+                stake_pct=_sf(t.get("stake_pct")),
+                stake_usd=_sf(t.get("suggested_stake")) or _sf(t.get("stake_usd")),
+                uncertainty_reason=str(t.get("uncertainty_reason") or ""),
+            ):
+                t["bet_tier"] = TIER_SKY_BLUE
+                t["tier"] = TIER_SKY_BLUE
+            else:
+                t.setdefault("bet_tier", TIER_BLUE)
+                t.setdefault("tier", t.get("bet_tier") or TIER_BLUE)
             t["fun_bet"] = False
 
         # Fill remaining slots with GREEN/YELLOW fun rankings (HA gates unchanged).
@@ -4983,6 +5119,7 @@ class UFCDashboardApp(_CTK_BASE):
             from src.bet_tiers import (
                 TIER_BLUE,
                 TIER_GREEN,
+                TIER_SKY_BLUE,
                 TIER_YELLOW,
                 collect_props_from_books,
                 merge_bet_tier_dicts,
@@ -5021,6 +5158,9 @@ class UFCDashboardApp(_CTK_BASE):
                     t["fun_bet"] = True
                 elif not t.get("bet_tier"):
                     t["bet_tier"] = TIER_BLUE
+                elif t.get("bet_tier") == TIER_SKY_BLUE:
+                    t["fun_bet"] = False
+                    t["advisory"] = False
         except Exception as exc:
             _debug_log(f"Fun tier fill skipped: {exc}")
 
@@ -5036,6 +5176,7 @@ class UFCDashboardApp(_CTK_BASE):
             _debug_log(
                 f"Overview recommendations shown={len(items)} "
                 f"(blue={sum(1 for t in items if t.get('bet_tier')=='blue')}, "
+                f"sky={sum(1 for t in items if t.get('bet_tier')=='sky_blue')}, "
                 f"fun={sum(1 for t in items if t.get('fun_bet'))})"
             )
         except Exception as exc:

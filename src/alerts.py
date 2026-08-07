@@ -132,7 +132,24 @@ def _suggest_stake(
         market_type="moneyline",
         uncertainty_kelly_mult=float(gate.kelly_mult),
     )
-    return float(min(stake, bankroll * cap_frac)), float(rating_mult), gate_dict
+    stake = float(min(stake, bankroll * cap_frac))
+    # Paper wide override: hard-cap stake (tiny % of bankroll) regardless of Kelly
+    try:
+        from src.uncertainty_gates import PAPER_WIDE_OVERRIDE
+
+        reasons = list(gate.reasons or [])
+        if (
+            PAPER_WIDE_OVERRIDE in reasons
+            or gate.primary_reason == PAPER_WIDE_OVERRIDE
+            or gate_dict.get("primary_reason") == PAPER_WIDE_OVERRIDE
+        ):
+            max_frac = float(
+                getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01
+            )
+            stake = min(stake, float(bankroll) * max(0.0, max_frac))
+    except Exception:
+        pass
+    return stake, float(rating_mult), gate_dict
 
 
 def generate_alerts(
@@ -390,6 +407,65 @@ def generate_alerts(
     # Prefer high prob + low uncertainty + clear edge; hard cap per card (singles first pass)
     from src.strategy import apply_max_bets_per_card, apply_max_tickets_per_card
     from src.high_accuracy_strategy import clamp_max_tickets, log_strategy_block
+    from src.uncertainty_gates import PAPER_WIDE_OVERRIDE
+
+    # Paper-only: keep at most N paper_wide_override singles (highest edge), demote rest
+    try:
+        if config.is_paper_profile() and bool(
+            getattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", False)
+        ):
+            max_ov = int(getattr(config, "PAPER_WIDE_OVERRIDE_MAX_PER_CARD", 2) or 2)
+            overrides = [
+                s
+                for s in singles
+                if str(s.get("uncertainty_reason") or "") == PAPER_WIDE_OVERRIDE
+                or PAPER_WIDE_OVERRIDE
+                in str(s.get("uncertainty_reason") or "")
+            ]
+            if len(overrides) > max_ov:
+                overrides.sort(key=lambda x: float(x.get("edge") or 0), reverse=True)
+                keep_ids = {
+                    str(s.get("fight_id") or s.get("fight") or id(s))
+                    for s in overrides[:max_ov]
+                }
+                kept: list[dict[str, Any]] = []
+                for s in singles:
+                    is_ov = (
+                        str(s.get("uncertainty_reason") or "") == PAPER_WIDE_OVERRIDE
+                        or PAPER_WIDE_OVERRIDE
+                        in str(s.get("uncertainty_reason") or "")
+                    )
+                    key = str(s.get("fight_id") or s.get("fight") or id(s))
+                    if is_ov and key not in keep_ids:
+                        fparts = str(s.get("fight") or "").split(" vs ", 1)
+                        log_strategy_block(
+                            "paper_wide_override_cap",
+                            context="single",
+                            fight=str(s.get("fight") or ""),
+                        )
+                        _append_skip(
+                            row=pd.Series(
+                                {
+                                    config.FIGHT_ID_COLUMN: s.get("fight_id"),
+                                    "fighter_1": fparts[0] if fparts else "",
+                                    "fighter_2": fparts[1] if len(fparts) > 1 else "",
+                                    "predicted_winner": s.get("pick"),
+                                }
+                            ),
+                            f1=fparts[0] if fparts else "",
+                            f2=fparts[1] if len(fparts) > 1 else "",
+                            pick=str(s.get("pick") or ""),
+                            reason="paper_wide_override_cap",
+                            edge=s.get("edge"),
+                            disagreement=s.get("ensemble_disagreement"),
+                            interval_width=s.get("interval_width"),
+                            uncertainty_action="cap",
+                        )
+                        continue
+                    kept.append(s)
+                singles = kept
+    except Exception as exc:
+        logger.debug("paper wide override card cap skipped: %s", exc)
 
     max_bets = clamp_max_tickets(
         int(getattr(strategy, "max_bets_per_card", 0) or config.profile_value("max_bets_per_card") or 3)
@@ -516,6 +592,24 @@ def generate_alerts(
             allocated = allocate_card_budget_pct(tickets, pool_est, inplace=True)
             singles = [t for t in allocated if not t.get("is_parlay")]
             parlays = [t for t in allocated if t.get("is_parlay")]
+            # Re-clamp Paper wide-override stakes after % allocation (allocation can inflate)
+            try:
+                from src.uncertainty_gates import PAPER_WIDE_OVERRIDE
+
+                if config.is_paper_profile():
+                    max_frac = float(
+                        getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01
+                    )
+                    max_usd = float(bankroll) * max(0.0, max_frac)
+                    for s in singles:
+                        if str(s.get("uncertainty_reason") or "") == PAPER_WIDE_OVERRIDE:
+                            stake = float(s.get("suggested_stake") or 0.0)
+                            if stake > max_usd:
+                                s["suggested_stake"] = round(max_usd, 2)
+                                if float(bankroll) > 0:
+                                    s["stake_pct"] = round(100.0 * max_usd / float(bankroll), 4)
+            except Exception as clamp_exc:
+                logger.debug("paper wide override stake re-clamp skipped: %s", clamp_exc)
     except Exception as exc:
         logger.debug("alert % stake allocation skipped: %s", exc)
 

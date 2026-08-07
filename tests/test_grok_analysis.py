@@ -80,6 +80,8 @@ def test_build_grok_prompt_includes_constraints():
         "card_budget": 55.0,
         "total_stake_pct": 38.0,
         "total_stake_usd": 20.9,
+        "n_actionable": 1,
+        "n_advisory": 0,
         "tickets": [
             {
                 "id": "f1",
@@ -96,15 +98,32 @@ def test_build_grok_prompt_includes_constraints():
                 "uncertainty_action": "allow",
             }
         ],
+        "recommended_parlays": [
+            {
+                "id": "parlay-2",
+                "n_legs": 2,
+                "picks": "A + C",
+                "combined_prob": 0.45,
+                "ha_qualified": False,
+            },
+            {
+                "id": "parlay-3",
+                "n_legs": 3,
+                "picks": "A + C + D",
+                "combined_prob": 0.28,
+                "ha_qualified": False,
+            },
+        ],
         "skipped": [],
     }
     prompt = build_grok_prompt(inputs)
     assert "UFC Test" in prompt
     assert "A over B" in prompt
-    assert "stake_pct=38.0%" in prompt
-    assert "Do NOT invent" in prompt or "Do NOT invent, flip" in prompt
-    assert "MODEL-FIRST" in prompt
-    assert "conf/odds" in prompt.lower() or "FINAL from conf/odds" in prompt
+    assert "stake=38" in prompt
+    assert "never invent" in prompt.lower()
+    assert "Auto parlays" in prompt
+    assert "2-leg" in prompt and "3-leg" in prompt
+    assert "parlays" in prompt
 
 
 def test_merge_ollama_reasons_keeps_ha_stakes():
