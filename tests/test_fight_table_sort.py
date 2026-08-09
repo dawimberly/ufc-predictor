@@ -8,10 +8,11 @@ def test_color_priority_blue_before_green_before_yellow_before_red() -> None:
         {"tier": "red", "sort_edge": 0.20, "sort_prob": 0.90, "sort_fight": "A vs B"},
         {"tier": "yellow", "sort_edge": 0.10, "sort_prob": 0.80, "sort_fight": "C vs D"},
         {"tier": "green", "sort_edge": 0.05, "sort_prob": 0.70, "sort_fight": "E vs F"},
+        {"tier": "sky_blue", "sort_edge": 0.02, "sort_prob": 0.65, "sort_fight": "I vs J"},
         {"tier": "blue", "sort_edge": 0.01, "sort_prob": 0.60, "sort_fight": "G vs H"},
     ]
     ordered = sorted(rows, key=_fight_table_sort_key)
-    assert [r["tier"] for r in ordered] == ["blue", "green", "yellow", "red"]
+    assert [r["tier"] for r in ordered] == ["blue", "sky_blue", "green", "yellow", "red"]
 
 
 def test_within_color_edge_then_prob_then_fight_name() -> None:

@@ -46,7 +46,27 @@ def _clip_prob(p: float, lo: float = 0.03, hi: float = 0.97) -> float:
 def _fighter_rate(row: pd.Series, prefix: str, key: str, default: float) -> float:
     for col in (f"{prefix}_{key}", f"f1_{key}" if prefix == "f1" else f"f2_{key}"):
         if col in row.index and pd.notna(row.get(col)):
-            return float(row[col])
+            try:
+                return float(row[col])
+            except (TypeError, ValueError):
+                continue
+    return default
+
+
+def _fighter_rate_first(
+    row: pd.Series,
+    prefix: str,
+    keys: tuple[str, ...],
+    default: float | None,
+) -> float | None:
+    """First available fighter rate among keys; None if all missing and default is None."""
+    for key in keys:
+        for col in (f"{prefix}_{key}",):
+            if col in row.index and pd.notna(row.get(col)):
+                try:
+                    return float(row[col])
+                except (TypeError, ValueError):
+                    continue
     return default
 
 
@@ -54,15 +74,28 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     """
     Estimate fight-level method probabilities from rolling fighter stats.
 
-    Returns keys: ko, sub, dec, round_1_finish, over_1_5_rounds,
-    fighter_ko, fighter_sub (conditional on model pick).
+    Prefers L5 finish / R1 / decision-profile fields when present (props-only;
+    not LightGBM FEATURE_COLUMNS). Returns keys: ko, sub, dec, round_1_finish,
+    over_1_5_rounds, fighter_ko, fighter_sub (conditional on model pick).
     """
     f1_ko = _clip_prob(_fighter_rate(row, "f1", "ko_rate", 0.18), 0.05, 0.55)
     f2_ko = _clip_prob(_fighter_rate(row, "f2", "ko_rate", 0.18), 0.05, 0.55)
     f1_sub = _clip_prob(_fighter_rate(row, "f1", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
     f2_sub = _clip_prob(_fighter_rate(row, "f2", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
-    f1_finish = _clip_prob(_fighter_rate(row, "f1", "finish_rate", 0.45), 0.10, 0.80)
-    f2_finish = _clip_prob(_fighter_rate(row, "f2", "finish_rate", 0.45), 0.10, 0.80)
+    f1_finish = _clip_prob(
+        float(
+            _fighter_rate_first(row, "f1", ("finish_rate_l5", "finish_rate"), 0.45) or 0.45
+        ),
+        0.10,
+        0.80,
+    )
+    f2_finish = _clip_prob(
+        float(
+            _fighter_rate_first(row, "f2", ("finish_rate_l5", "finish_rate"), 0.45) or 0.45
+        ),
+        0.10,
+        0.80,
+    )
 
     ko_diff = float(row.get("ko_rate_diff", 0) or 0)
     sub_diff = float(row.get("sub_avg_diff", 0) or 0)
@@ -71,11 +104,63 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     p_ko = _clip_prob(0.5 * (f1_ko + f2_ko) + 0.15 * ko_diff + 0.08 * striker_diff, 0.08, 0.62)
     p_sub = _clip_prob(0.5 * (f1_sub + f2_sub) + 0.12 * sub_diff, 0.05, 0.45)
     p_dec = _clip_prob(1.0 - p_ko - p_sub, 0.12, 0.75)
+
+    # Decision-profile / pathway: tilt toward distance when both fighters finish via decisions
+    f1_share = _fighter_rate_first(
+        row, "f1", ("decision_finish_share_l5", "decision_finish_share_career"), None
+    )
+    f2_share = _fighter_rate_first(
+        row, "f2", ("decision_finish_share_l5", "decision_finish_share_career"), None
+    )
+    f1_dec_w = _fighter_rate_first(row, "f1", ("dec_win_rate_l5", "dec_win_rate_career"), None)
+    f2_dec_w = _fighter_rate_first(row, "f2", ("dec_win_rate_l5", "dec_win_rate_career"), None)
+    f1_dec_l = _fighter_rate_first(row, "f1", ("dec_loss_rate_l5", "dec_loss_rate_career"), None)
+    f2_dec_l = _fighter_rate_first(row, "f2", ("dec_loss_rate_l5", "dec_loss_rate_career"), None)
+
+    dec_tilt = 0.0
+    share_vals = [v for v in (f1_share, f2_share) if v is not None]
+    if share_vals:
+        # share ~ dec_wins/(dec_wins+finish_wins); high → more distance
+        dec_tilt += 0.18 * (float(np.mean(share_vals)) - 0.45)
+    dec_w_vals = [v for v in (f1_dec_w, f2_dec_w) if v is not None]
+    if dec_w_vals:
+        dec_tilt += 0.10 * (float(np.mean(dec_w_vals)) - 0.40)
+    dec_l_vals = [v for v in (f1_dec_l, f2_dec_l) if v is not None]
+    if dec_l_vals:
+        # Fighters who often lose on cards also push fights deep
+        dec_tilt += 0.06 * (float(np.mean(dec_l_vals)) - 0.25)
+    if abs(dec_tilt) > 1e-9:
+        p_dec = _clip_prob(p_dec + dec_tilt, 0.12, 0.78)
+        finish_mass = max(1e-6, p_ko + p_sub)
+        scale = max(0.05, 1.0 - p_dec) / finish_mass
+        p_ko *= scale
+        p_sub *= scale
+
     total = p_ko + p_sub + p_dec
     p_ko, p_sub, p_dec = p_ko / total, p_sub / total, p_dec / total
 
+    f1_r1 = _fighter_rate_first(
+        row, "f1", ("r1_finish_rate_l5", "r1_finish_rate_career"), None
+    )
+    f2_r1 = _fighter_rate_first(
+        row, "f2", ("r1_finish_rate_l5", "r1_finish_rate_career"), None
+    )
     avg_finish = 0.5 * (f1_finish + f2_finish)
-    p_r1 = _clip_prob(avg_finish * 0.58 * (1.0 + 0.25 * abs(ko_diff)), 0.08, 0.55)
+    if f1_r1 is not None or f2_r1 is not None:
+        r1_vals = [
+            float(v if v is not None else avg_finish * 0.55) for v in (f1_r1, f2_r1)
+        ]
+        p_r1 = _clip_prob(
+            0.5 * sum(r1_vals) * (1.0 + 0.20 * abs(ko_diff)) * (1.0 - 0.35 * max(0.0, dec_tilt)),
+            0.08,
+            0.55,
+        )
+    else:
+        p_r1 = _clip_prob(
+            avg_finish * 0.58 * (1.0 + 0.25 * abs(ko_diff)) * (1.0 - 0.35 * max(0.0, dec_tilt)),
+            0.08,
+            0.55,
+        )
     p_over_15 = _clip_prob(1.0 - p_r1, 0.25, 0.92)
     p_finish = _clip_prob(p_ko + p_sub, 0.15, 0.88)
 
@@ -291,9 +376,10 @@ def settle_prop(prop_key: str, row: pd.Series) -> bool | None:
             actual_f1_win = 1
         elif winner == f2:
             actual_f1_win = 0
-    pick_side = "f1" if float(row.get("prob_f1_win", 0.5) or 0.5) >= 0.5 else "f2"
-    if winner:
-        pick_side = "f1" if winner == f1 else "f2" if winner == f2 else pick_side
+    # Model pick only (do not use actual winner — that leaks outcome into fighter props)
+    pick_side = "f1" if float(row.get("prob_f1_win", row.get("predicted_prob", 0.5)) or 0.5) >= 0.5 else "f2"
+    if pd.notna(row.get("prob_f2_win")):
+        pick_side = "f1" if float(row["prob_f1_win"] or 0.5) >= float(row["prob_f2_win"]) else "f2"
 
     if prop_key == "goes_to_decision":
         return bool(dec)
@@ -348,6 +434,32 @@ def extract_prop_candidate(
     f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
     f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
     fight_lbl = f"{f1} vs {f2}"
+
+    try:
+        from src.fighter_flags import should_skip_fight
+
+        skip_flag, flag_detail = should_skip_fight(f1, f2)
+        if skip_flag:
+            # Block betting and ranked prop lists (no stakes on flagged fights)
+            if not for_display:
+                log_strategy_block(
+                    "fighter_integrity_flag",
+                    context="prop",
+                    fight=fight_lbl,
+                    prop_key=prop_key,
+                    detail=flag_detail,
+                )
+            else:
+                log_strategy_block(
+                    "fighter_integrity_flag",
+                    context="prop_display",
+                    fight=fight_lbl,
+                    prop_key=prop_key,
+                    detail=flag_detail,
+                )
+            return None
+    except Exception:
+        pass
 
     # Hard-code: Over 1.5 Rounds is the only bettable prop
     if not prop_allowed(prop_key):
@@ -545,6 +657,11 @@ def _prop_row_dict(
         "ev": cand.expected_value,
         "market_type": "prop",
         "odds_source": odds_source,
+        "source_label": (
+            "live"
+            if is_live_prop_odds_source(odds_source)
+            else "synthetic"
+        ),
         "strict_qualified": strict_qualified,
         "parlay_allowed": config.BOOK_PROP_RULES.get(book, {}).get("allow_prop_parlays", False),
     }
@@ -704,7 +821,14 @@ def correlated_combined_prob(legs: list[BetCandidate], row_lookup: dict[str, pd.
     """
     Adjust combined probability when legs share a fight or mix ML + prop.
 
-    Uses joint estimates for same-fight ML+prop; independence across fights.
+    Policy (unchanged):
+    - Different fights: independence (product of leg probs).
+    - Same-fight ML + fighter_ko / fighter_sub: use joint method_probs
+      (fighter_ko / fighter_sub already = P(pick wins AND method)).
+    - Same-fight ML + goes_to_decision / finish: scale by pick_prob.
+    - Same-fight ML + round/total markets: discount prop.prob * 0.85.
+    - Same-fight multi-prop only: product * (1 - PROP_CORRELATION_DISCOUNT).
+    - Missing row lookup: naive product * (1 - PROP_CORRELATION_DISCOUNT).
     """
     groups = _same_fight_groups(legs)
     joint_parts: list[float] = []
@@ -757,11 +881,17 @@ def build_prop_parlay_candidates(
     strategy: StrategyConfig | None = None,
     include_moneyline: bool = True,
     prop_odds: pd.DataFrame | None = None,
+    allow_despite_ha: bool = False,
 ) -> list[PropParlayCandidate]:
-    """Same-card prop / mixed parlays — disabled under high-accuracy strategy."""
+    """Same-card prop / mixed parlays per BOOK_PROP_RULES.
+
+    Live HA keeps ``PROP_PARLAYS_ENABLED=False`` (no parlays on tickets).
+    Research backtests may pass ``allow_despite_ha=True`` when the book allows
+    prop/mixed parlays (DraftKings / MyBookie). BetNow stays singles-only.
+    """
     from src.high_accuracy_strategy import PROP_PARLAYS_ENABLED, log_strategy_block
 
-    if not PROP_PARLAYS_ENABLED:
+    if not PROP_PARLAYS_ENABLED and not allow_despite_ha:
         log_strategy_block("prop_parlays_disabled", context="prop_parlay", detail=f"book={book}")
         return []
     if not config.ENABLE_PROPS:
@@ -956,6 +1086,7 @@ def simulate_prop_bets(
                     "edge_pct": cand.edge * 100.0,
                     "stake": flat_stake,
                     "odds": cand.decimal_odds,
+                    "odds_source": getattr(cand, "odds_source", "synthetic"),
                     "won": int(won),
                     "pnl": pnl,
                     "equity": bankroll,
@@ -989,8 +1120,14 @@ def simulate_mixed_parlays(
     initial_bankroll: float = 1000.0,
     flat_stake: float = 10.0,
     max_parlays_per_card: int = 3,
+    allow_despite_ha: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Simulate top prop/mixed parlays per event card (DraftKings rules)."""
+    """Simulate top prop/mixed parlays per event card (DK / MyBookie book rules).
+
+    Defaults ``allow_despite_ha=True`` so research/backtest can score parlays
+    even while live HA keeps PROP_PARLAYS_ENABLED=False. Live tickets still use
+    ``build_prop_parlay_candidates`` without the override.
+    """
     if not config.ENABLE_PROPS:
         return pd.DataFrame(), {"trades": 0.0, "roi_pct": 0.0}
 
@@ -1007,7 +1144,9 @@ def simulate_mixed_parlays(
         groups = list(predictions.groupby(event_col, dropna=False))
 
     for event_key, card_df in groups:
-        parlays = build_prop_parlay_candidates(card_df, book=book)[:max_parlays_per_card]
+        parlays = build_prop_parlay_candidates(
+            card_df, book=book, allow_despite_ha=allow_despite_ha
+        )[:max_parlays_per_card]
         for parlay in parlays:
             leg_results: list[bool] = []
             for leg in parlay.legs:

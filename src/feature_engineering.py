@@ -24,6 +24,18 @@ from src.high_value_features import (
     build_hv_matchup_features,
     log_hv_coverage,
 )
+from src.pathway_features import (
+    PATHWAY_DIFF_COLUMNS,
+    PATHWAY_FIGHTER_STAT_FIELDS,
+    apply_pathway_rolling_extras,
+    build_pathway_matchup_features,
+    log_pathway_coverage,
+)
+from src.market_features import (
+    MARKET_FEATURE_COLUMNS,
+    attach_market_features,
+    log_market_coverage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +163,7 @@ FIGHTER_STAT_FIELDS = [
 ]
 
 FIGHTER_STAT_FIELDS = list(FIGHTER_STAT_FIELDS) + list(HV_FIGHTER_STAT_FIELDS)
+FIGHTER_STAT_FIELDS = list(FIGHTER_STAT_FIELDS) + list(PATHWAY_FIGHTER_STAT_FIELDS)
 
 # Differential feature names produced for modeling.
 DIFF_FEATURE_FIELDS = [
@@ -202,6 +215,8 @@ DIFF_FEATURE_FIELDS = [
 ]
 
 DIFF_FEATURE_FIELDS = list(DIFF_FEATURE_FIELDS) + list(HIGH_VALUE_DIFF_COLUMNS)
+DIFF_FEATURE_FIELDS = list(DIFF_FEATURE_FIELDS) + list(PATHWAY_DIFF_COLUMNS)
+DIFF_FEATURE_FIELDS = list(DIFF_FEATURE_FIELDS) + list(MARKET_FEATURE_COLUMNS)
 
 # --- Interaction candidates (products of base diffs; subset selected at train time) ---
 @dataclass(frozen=True)
@@ -753,6 +768,7 @@ def build_matchup_features(
     *,
     impute_values: dict[str, float] | None = None,
     weight_class: str | None = None,
+    scheduled_rounds: Any = None,
 ) -> pd.Series:
     """
     Build a differential feature vector (fighter1 minus fighter2).
@@ -866,6 +882,11 @@ def build_matchup_features(
         "multi_base_flag_diff": f1["multi_base"] - f2["multi_base"],
     }
     features.update(build_hv_matchup_features(f1, f2))
+    features.update(
+        build_pathway_matchup_features(
+            f1, f2, scheduled_rounds=scheduled_rounds
+        )
+    )
     return pd.Series(features, dtype=float)
 
 
@@ -1197,6 +1218,8 @@ def _build_history_long_pipeline(fights: pd.DataFrame) -> pd.DataFrame:
     history = _compute_similar_opponent_win_rates(history)
     elo_df, _ = _compute_elo_state(history)
     history = _attach_sos_features(history, elo_df=elo_df)
+    # Pathway after fills + SOS so pace / last_loss_opp_elo have coverage
+    history = apply_pathway_rolling_extras(history)
     return history
 
 
@@ -1472,6 +1495,7 @@ def _rolling_stats(history: pd.DataFrame) -> pd.DataFrame:
         )
     )
     history = apply_hv_rolling_extras(history, date_col=config.DATE_COLUMN)
+    # Pathway rates finalized after Greco/SOS in _build_history_long_pipeline
     return history
 
 
@@ -1536,6 +1560,33 @@ def _fighter_stat_row(row: pd.Series, *, prefix: str) -> dict[str, float]:
         "division_age_adj": f"{prefix}_division_age_adj",
         "wins_vs_better_record_l5": f"{prefix}_wins_vs_better_record_l5",
         "ko_losses_career_flag": f"{prefix}_ko_losses_career_flag",
+        "ko_win_rate_l5": f"{prefix}_ko_win_rate_l5",
+        "ko_win_rate_career": f"{prefix}_ko_win_rate_career",
+        "sub_win_rate_l5": f"{prefix}_sub_win_rate_l5",
+        "sub_win_rate_career": f"{prefix}_sub_win_rate_career",
+        "dec_win_rate_l5": f"{prefix}_dec_win_rate_l5",
+        "dec_win_rate_career": f"{prefix}_dec_win_rate_career",
+        "ko_loss_rate_l5": f"{prefix}_ko_loss_rate_l5",
+        "ko_loss_rate_career": f"{prefix}_ko_loss_rate_career",
+        "sub_loss_rate_l5": f"{prefix}_sub_loss_rate_l5",
+        "sub_loss_rate_career": f"{prefix}_sub_loss_rate_career",
+        "dec_loss_rate_l5": f"{prefix}_dec_loss_rate_l5",
+        "dec_loss_rate_career": f"{prefix}_dec_loss_rate_career",
+        "r1_finish_rate_l5": f"{prefix}_r1_finish_rate_l5",
+        "r1_finish_rate_career": f"{prefix}_r1_finish_rate_career",
+        "late_finish_rate_l5": f"{prefix}_late_finish_rate_l5",
+        "late_finish_rate_career": f"{prefix}_late_finish_rate_career",
+        "distance_rate_l5": f"{prefix}_distance_rate_l5",
+        "distance_rate_career": f"{prefix}_distance_rate_career",
+        "cardio_decay_proxy": f"{prefix}_cardio_decay_proxy",
+        "finish_timing_skew": f"{prefix}_finish_timing_skew",
+        "last_loss_opp_elo": f"{prefix}_last_loss_opp_elo",
+        "td_att_rate_l5": f"{prefix}_td_att_rate_l5",
+        "td_att_rate_career": f"{prefix}_td_att_rate_career",
+        "sub_att_rate_l5": f"{prefix}_sub_att_rate_l5",
+        "sub_att_rate_career": f"{prefix}_sub_att_rate_career",
+        "pace_l5": f"{prefix}_pace_l5",
+        "pace_career": f"{prefix}_pace_career",
     }
     return {k: _series_get(row, col, np.nan) for k, col in mapping.items()}
 
@@ -1587,6 +1638,33 @@ def _build_impute_values(features: pd.DataFrame) -> dict[str, float]:
     values.setdefault("division_age_adj", 0.0)
     values.setdefault("wins_vs_better_record_l5", 0.0)
     values.setdefault("ko_losses_career_flag", 0.0)
+    values.setdefault("ko_win_rate_l5", 0.15)
+    values.setdefault("ko_win_rate_career", 0.15)
+    values.setdefault("sub_win_rate_l5", 0.10)
+    values.setdefault("sub_win_rate_career", 0.10)
+    values.setdefault("dec_win_rate_l5", 0.40)
+    values.setdefault("dec_win_rate_career", 0.40)
+    values.setdefault("ko_loss_rate_l5", 0.10)
+    values.setdefault("ko_loss_rate_career", 0.10)
+    values.setdefault("sub_loss_rate_l5", 0.08)
+    values.setdefault("sub_loss_rate_career", 0.08)
+    values.setdefault("dec_loss_rate_l5", 0.15)
+    values.setdefault("dec_loss_rate_career", 0.15)
+    values.setdefault("r1_finish_rate_l5", 0.20)
+    values.setdefault("r1_finish_rate_career", 0.20)
+    values.setdefault("late_finish_rate_l5", 0.10)
+    values.setdefault("late_finish_rate_career", 0.10)
+    values.setdefault("distance_rate_l5", 0.40)
+    values.setdefault("distance_rate_career", 0.40)
+    values.setdefault("cardio_decay_proxy", 0.05)
+    values.setdefault("finish_timing_skew", 0.0)
+    values.setdefault("last_loss_opp_elo", ELO_START)
+    values.setdefault("td_att_rate_l5", 2.0)
+    values.setdefault("td_att_rate_career", 2.0)
+    values.setdefault("sub_att_rate_l5", 0.10)
+    values.setdefault("sub_att_rate_career", 0.10)
+    values.setdefault("pace_l5", 3.0)
+    values.setdefault("pace_career", 3.0)
     values.setdefault("kd_rate", 0.2)
     values.setdefault("head_strike_pct", 0.70)
     values.setdefault("body_strike_pct", 0.18)
@@ -1684,6 +1762,33 @@ _FIELD_TO_COL_SUFFIX = {
     "division_age_adj": "division_age_adj",
     "wins_vs_better_record_l5": "wins_vs_better_record_l5",
     "ko_losses_career_flag": "ko_losses_career_flag",
+    "ko_win_rate_l5": "ko_win_rate_l5",
+    "ko_win_rate_career": "ko_win_rate_career",
+    "sub_win_rate_l5": "sub_win_rate_l5",
+    "sub_win_rate_career": "sub_win_rate_career",
+    "dec_win_rate_l5": "dec_win_rate_l5",
+    "dec_win_rate_career": "dec_win_rate_career",
+    "ko_loss_rate_l5": "ko_loss_rate_l5",
+    "ko_loss_rate_career": "ko_loss_rate_career",
+    "sub_loss_rate_l5": "sub_loss_rate_l5",
+    "sub_loss_rate_career": "sub_loss_rate_career",
+    "dec_loss_rate_l5": "dec_loss_rate_l5",
+    "dec_loss_rate_career": "dec_loss_rate_career",
+    "r1_finish_rate_l5": "r1_finish_rate_l5",
+    "r1_finish_rate_career": "r1_finish_rate_career",
+    "late_finish_rate_l5": "late_finish_rate_l5",
+    "late_finish_rate_career": "late_finish_rate_career",
+    "distance_rate_l5": "distance_rate_l5",
+    "distance_rate_career": "distance_rate_career",
+    "cardio_decay_proxy": "cardio_decay_proxy",
+    "finish_timing_skew": "finish_timing_skew",
+    "last_loss_opp_elo": "last_loss_opp_elo",
+    "td_att_rate_l5": "td_att_rate_l5",
+    "td_att_rate_career": "td_att_rate_career",
+    "sub_att_rate_l5": "sub_att_rate_l5",
+    "sub_att_rate_career": "sub_att_rate_career",
+    "pace_l5": "pace_l5",
+    "pace_career": "pace_career",
 }
 
 
@@ -1741,6 +1846,35 @@ def fit_imputer(train_df: pd.DataFrame) -> ImputerStats:
         "hv_control_clash": 0.0,
         "wins_vs_better_record_l5_diff": 0.0,
         "ko_losses_career_flag_diff": 0.0,
+        "ko_win_rate_l5_diff": 0.0,
+        "ko_win_rate_career_diff": 0.0,
+        "sub_win_rate_l5_diff": 0.0,
+        "sub_win_rate_career_diff": 0.0,
+        "dec_win_rate_l5_diff": 0.0,
+        "dec_win_rate_career_diff": 0.0,
+        "ko_loss_rate_l5_diff": 0.0,
+        "ko_loss_rate_career_diff": 0.0,
+        "sub_loss_rate_l5_diff": 0.0,
+        "sub_loss_rate_career_diff": 0.0,
+        "dec_loss_rate_l5_diff": 0.0,
+        "dec_loss_rate_career_diff": 0.0,
+        "r1_finish_rate_l5_diff": 0.0,
+        "r1_finish_rate_career_diff": 0.0,
+        "late_finish_rate_l5_diff": 0.0,
+        "late_finish_rate_career_diff": 0.0,
+        "distance_rate_l5_diff": 0.0,
+        "distance_rate_career_diff": 0.0,
+        "cardio_decay_proxy_diff": 0.0,
+        "finish_timing_skew_diff": 0.0,
+        "last_loss_opp_elo_diff": 0.0,
+        "path_opp_ko_x_own_ko_loss": 0.0,
+        "path_opp_td_att_x_own_td_def": 0.0,
+        "path_opp_sub_x_own_sub_loss": 0.0,
+        "path_pace_product_diff": 0.0,
+        "path_stance_mismatch": 0.0,
+        "is_five_round": 0.0,
+        "mkt_implied_prob": 0.5,
+        "line_move": 0.0,
     }
     diff_fills: dict[str, float] = {}
     for col in DIFF_FEATURE_FIELDS:
@@ -1932,7 +2066,10 @@ def apply_historical_stat_fallbacks(
             f1_stats["elo"] = row.get("f1_elo", ELO_START)
             f2_stats["elo"] = row.get("f2_elo", ELO_START)
             diffs = build_matchup_features(
-                f1_stats, f2_stats, weight_class=str(row.get("weight_class", ""))
+                f1_stats,
+                f2_stats,
+                weight_class=str(row.get("weight_class", "")),
+                scheduled_rounds=row.get("scheduled_rounds"),
             )
             for col, val in diffs.items():
                 if col in out.columns:
@@ -1973,6 +2110,7 @@ def _apply_greco_to_feature_stats(features: pd.DataFrame) -> pd.DataFrame:
             f1_stats,
             f2_stats,
             weight_class=str(row.get("weight_class", "")),
+            scheduled_rounds=row.get("scheduled_rounds"),
         )
         for col, val in diffs.items():
             if col in out.columns:
@@ -2061,6 +2199,33 @@ def _assemble_wide_feature_matrix(
         "division_age_adj": "f2_division_age_adj",
         "wins_vs_better_record_l5": "f2_wins_vs_better_record_l5",
         "ko_losses_career_flag": "f2_ko_losses_career_flag",
+        "ko_win_rate_l5": "f2_ko_win_rate_l5",
+        "ko_win_rate_career": "f2_ko_win_rate_career",
+        "sub_win_rate_l5": "f2_sub_win_rate_l5",
+        "sub_win_rate_career": "f2_sub_win_rate_career",
+        "dec_win_rate_l5": "f2_dec_win_rate_l5",
+        "dec_win_rate_career": "f2_dec_win_rate_career",
+        "ko_loss_rate_l5": "f2_ko_loss_rate_l5",
+        "ko_loss_rate_career": "f2_ko_loss_rate_career",
+        "sub_loss_rate_l5": "f2_sub_loss_rate_l5",
+        "sub_loss_rate_career": "f2_sub_loss_rate_career",
+        "dec_loss_rate_l5": "f2_dec_loss_rate_l5",
+        "dec_loss_rate_career": "f2_dec_loss_rate_career",
+        "r1_finish_rate_l5": "f2_r1_finish_rate_l5",
+        "r1_finish_rate_career": "f2_r1_finish_rate_career",
+        "late_finish_rate_l5": "f2_late_finish_rate_l5",
+        "late_finish_rate_career": "f2_late_finish_rate_career",
+        "distance_rate_l5": "f2_distance_rate_l5",
+        "distance_rate_career": "f2_distance_rate_career",
+        "cardio_decay_proxy": "f2_cardio_decay_proxy",
+        "finish_timing_skew": "f2_finish_timing_skew",
+        "last_loss_opp_elo": "f2_last_loss_opp_elo",
+        "td_att_rate_l5": "f2_td_att_rate_l5",
+        "td_att_rate_career": "f2_td_att_rate_career",
+        "sub_att_rate_l5": "f2_sub_att_rate_l5",
+        "sub_att_rate_career": "f2_sub_att_rate_career",
+        "pace_l5": "f2_pace_l5",
+        "pace_career": "f2_pace_career",
         config.FIGHT_ID_COLUMN: config.FIGHT_ID_COLUMN,
     }
     f2_subset = f2[[c for c in f2_rename if c in f2.columns]].rename(columns=f2_rename)
@@ -2125,6 +2290,33 @@ def _assemble_wide_feature_matrix(
         "division_age_adj": "f1_division_age_adj",
         "wins_vs_better_record_l5": "f1_wins_vs_better_record_l5",
         "ko_losses_career_flag": "f1_ko_losses_career_flag",
+        "ko_win_rate_l5": "f1_ko_win_rate_l5",
+        "ko_win_rate_career": "f1_ko_win_rate_career",
+        "sub_win_rate_l5": "f1_sub_win_rate_l5",
+        "sub_win_rate_career": "f1_sub_win_rate_career",
+        "dec_win_rate_l5": "f1_dec_win_rate_l5",
+        "dec_win_rate_career": "f1_dec_win_rate_career",
+        "ko_loss_rate_l5": "f1_ko_loss_rate_l5",
+        "ko_loss_rate_career": "f1_ko_loss_rate_career",
+        "sub_loss_rate_l5": "f1_sub_loss_rate_l5",
+        "sub_loss_rate_career": "f1_sub_loss_rate_career",
+        "dec_loss_rate_l5": "f1_dec_loss_rate_l5",
+        "dec_loss_rate_career": "f1_dec_loss_rate_career",
+        "r1_finish_rate_l5": "f1_r1_finish_rate_l5",
+        "r1_finish_rate_career": "f1_r1_finish_rate_career",
+        "late_finish_rate_l5": "f1_late_finish_rate_l5",
+        "late_finish_rate_career": "f1_late_finish_rate_career",
+        "distance_rate_l5": "f1_distance_rate_l5",
+        "distance_rate_career": "f1_distance_rate_career",
+        "cardio_decay_proxy": "f1_cardio_decay_proxy",
+        "finish_timing_skew": "f1_finish_timing_skew",
+        "last_loss_opp_elo": "f1_last_loss_opp_elo",
+        "td_att_rate_l5": "f1_td_att_rate_l5",
+        "td_att_rate_career": "f1_td_att_rate_career",
+        "sub_att_rate_l5": "f1_sub_att_rate_l5",
+        "sub_att_rate_career": "f1_sub_att_rate_career",
+        "pace_l5": "f1_pace_l5",
+        "pace_career": "f1_pace_career",
     }
     features = f1.rename(columns=f1_rename)
     features = features.merge(f2_subset, on=config.FIGHT_ID_COLUMN, how="inner")
@@ -2155,6 +2347,7 @@ def _assemble_wide_feature_matrix(
                 f1_stats,
                 f2_stats,
                 weight_class=str(row.get("weight_class", "")),
+                scheduled_rounds=row.get("scheduled_rounds"),
             ).to_dict()
         )
     diff_df = pd.DataFrame(diff_rows)
@@ -2182,6 +2375,7 @@ def _assemble_wide_feature_matrix(
             features["f1_odds"], features["f2_odds"]
         )
         features["implied_prob_f2"] = 1.0 - features["implied_prob_f1"]
+    features = attach_market_features(features)
 
     min_fights = config.MIN_FIGHTS_PER_FIGHTER
     mask = (features["f1_fight_count"] >= min_fights) & (
@@ -2199,6 +2393,8 @@ def _assemble_wide_feature_matrix(
     )
     log_feature_diff_coverage(features, year=2025, label="after fallback")
     log_hv_coverage(features, year=2025, label="after fallback")
+    log_pathway_coverage(features, year=2025, label="after fallback")
+    log_market_coverage(features, year=2025, label="after fallback")
 
     features = build_interaction_candidates(features)
 
@@ -2244,6 +2440,19 @@ def build_feature_matrix(
         target_fight_ids=target_fight_ids,
     )
     del history, elo
+
+    # Carry event location for gym local-advantage (display + optional research).
+    fid = config.FIGHT_ID_COLUMN
+    if (
+        isinstance(fights, pd.DataFrame)
+        and not fights.empty
+        and fid in fights.columns
+        and "location" in fights.columns
+        and fid in features.columns
+        and "location" not in features.columns
+    ):
+        loc = fights[[fid, "location"]].drop_duplicates(fid, keep="last")
+        features = features.merge(loc, on=fid, how="left")
 
     # Gym metadata + local-advantage flags (display / Ollama; not required model inputs).
     try:

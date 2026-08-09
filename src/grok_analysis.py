@@ -432,19 +432,27 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     warning = str(inputs.get("top5_warning") or TOP5_WARNING)
 
     ticket_lines: list[str] = []
+    try:
+        from src.bet_tiers import action_label_for_bet
+    except Exception:
+        action_label_for_bet = None  # type: ignore[assignment]
     for t in tickets:
-        tier = "ADV" if t.get("advisory") or t.get("fun_bet") else "ACT"
+        is_fun = bool(t.get("advisory") or t.get("fun_bet"))
+        if action_label_for_bet is not None:
+            action = action_label_for_bet(t)
+        else:
+            action = "FUN ONLY ($0)" if is_fun else "BET THIS"
         ticket_lines.append(
-            f"- id={t.get('id')} | {tier} | {t.get('side')} | {t.get('market')} | "
+            f"- id={t.get('id')} | ACTION={action} | {t.get('side')} | {t.get('market')} | "
             f"book={t.get('book') or 'n/a'} | stake={t.get('stake_pct')}%/${t.get('stake_usd')} | "
             f"prob={t.get('prob')} | edge={t.get('edge_pct')}% | conf={t.get('confidence')}"
         )
-    tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET)"
+    tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET / sized $0)"
 
     parlay_lines: list[str] = []
     for p in parlays:
         parlay_lines.append(
-            f"- id={p.get('id')} | {p.get('n_legs')}-leg | {p.get('picks')} | "
+            f"- id={p.get('id')} | FUN ONLY research $0 | {p.get('n_legs')}-leg | {p.get('picks')} | "
             f"combined_prob={float(p.get('combined_prob') or 0):.0%} | "
             f"ha_qualified={bool(p.get('ha_qualified'))}"
         )
@@ -456,21 +464,30 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     total_usd = inputs.get("total_stake_usd")
     n_act = inputs.get("n_actionable")
     n_adv = inputs.get("n_advisory")
+    what_to_do = ""
+    try:
+        from src.bet_tiers import format_what_to_do_header
+
+        what_to_do = format_what_to_do_header(slip=tickets) + "\n"
+    except Exception:
+        what_to_do = ""
 
     return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
-{warning}
+{what_to_do}{warning}
 Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
-ADV stakes stay 0; parlays are research ($0) unless already ACT; one-line reason (<=90 chars); empty list => NO BET.
+In summary + each pick reason, lead with ACTION verbs: BET THIS ($), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
+FUN ONLY / advisory stakes stay 0 — never tell the user to size those as bankroll bets.
+Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars); empty ACT list => say sized NO BET.
 
-Tickets ({n_act} ACT / {n_adv} ADV):
+Tickets ({n_act} BET THIS / {n_adv} FUN ONLY):
 {tickets_block}
-ACT totals: {total_pct}% / ${total_usd}
+BET THIS totals: {total_pct}% / ${total_usd}
 
-Auto parlays (one 2-leg + one 3-leg when card allows - narrate only, do not invent legs):
+Auto parlays (narrate as FUN ONLY research — do not invent legs):
 {parlays_block}
 
 Return JSON:
-{{"event":"{event}","summary":"short line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","n_legs":2,"reason":"...","conviction":"high|medium|low"}}]}}"""
+{{"event":"{event}","summary":"start with WHAT TO BET line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"BET THIS $x or FUN ONLY $0 — ...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","n_legs":2,"reason":"FUN ONLY $0 — ...","conviction":"high|medium|low"}}]}}"""
 
 
 def _ticket_slip_id(ticket: dict[str, Any]) -> str:
@@ -578,31 +595,32 @@ def _ticket_to_slip_row(
 
 
 TOP5_WARNING = (
-    "Top 5 structure: ACTIONABLE = HA-gated + card-sized ($). "
-    "ADVISORY = ranked for research only ($0, not in card budget). "
-    "Do not treat advisory rows as sized bets."
+    "Clarity: BET THIS = HA-sized bankroll ($). "
+    "FUN ONLY = research lean ($0, not in card budget). "
+    "Never treat FUN ONLY / Yellow as sized bets. "
+    "If no BET THIS tickets, say sized NO BET up front."
 )
 
 
 def _candidate_dedupe_key(ticket: dict[str, Any]) -> str:
-    base = str(
-        ticket.get("fight_id")
-        or ticket.get("fight")
-        or ticket.get("pick_line")
-        or ticket.get("picks")
-        or ticket.get("display_label")
-        or ticket.get("id")
-        or ""
-    ).strip().lower()
-    is_prop = (
-        str(ticket.get("market_type") or "").lower() == "prop"
-        or str(ticket.get("prop_key") or "") == "over_1_5_rounds"
-        or "over 1.5" in str(ticket.get("market") or "").lower()
-    )
-    if is_prop:
-        pkey = str(ticket.get("prop_key") or "over_1_5_rounds").strip().lower()
-        return f"{base}|prop|{pkey}"
-    return base
+    """Align with bet_slip.ticket_dedupe_key: fight|market|selection|book."""
+    try:
+        from src.bet_slip import ticket_dedupe_key
+
+        fight, market, selection, book = ticket_dedupe_key(ticket)
+        return f"{fight}|{market}|{selection}|{book}"
+    except Exception:
+        base = str(
+            ticket.get("fight_id")
+            or ticket.get("fight")
+            or ticket.get("pick_line")
+            or ticket.get("display_label")
+            or ""
+        ).strip().lower()
+        market = str(ticket.get("market_type") or ticket.get("prop_key") or "moneyline").lower()
+        selection = str(ticket.get("pick") or ticket.get("side") or "").strip().lower()
+        book = str(ticket.get("book") or "").strip().lower()
+        return f"{base}|{market}|{selection}|{book}"
 
 
 def collect_card_analysis_inputs(
@@ -1666,16 +1684,18 @@ def answer_ollama_chat(
         "You are a concise UFC betting assistant for this dashboard. "
         "Use ONLY the provided ticket/stats context. "
         "Never invent fights, odds, edges, or stakes. "
-        "If nothing cleared gates, say NO BET. "
-        "Prefer actionable HA tickets over advisory. "
+        "Always separate BET THIS (sized $) from FUN ONLY ($0 research) and DO NOT BET. "
+        "If no BET THIS tickets, say sized NO BET first, then optional FUN ONLY leans. "
+        "Never imply FUN ONLY picks should use bankroll sizing. "
         "Keep answers under 180 words with short bullets when listing bets."
     )
     prompt = (
         f"Event: {event or 'current card'}\n\n"
         f"GROUNDED CONTEXT (source of truth):\n{context}\n\n"
         f"USER QUESTION: {q}\n\n"
-        "Answer the question using the context. If they ask for best bets, lead with "
-        "the actionable tickets and stakes from context, then a one-line caution."
+        "Answer using the context. If they ask what to bet, start with "
+        "'WHAT TO BET (sized):' listing only BET THIS tickets + dollar stakes; "
+        "then 'FUN ONLY ($0):' if any; then 'SKIP:' for caution/red."
     )
     try:
         model_used, text = ollama_complete(

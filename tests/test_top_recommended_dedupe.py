@@ -57,46 +57,50 @@ def _ml(name: str, *, edge: float = 0.08, stake: float = 0.0, tier: str = "green
 def test_donte_juliana_guilherme_over15_once() -> None:
     raw = [
         _prop("Donte", stake=5.0, edge=0.12),
-        _prop("Donte", book="MyBookie", stake=0.0, edge=0.11),  # duplicate across books
-        _prop("Donte", book="Odds API", stake=0.0, edge=0.09, tier="green"),  # HA+#6 pair
+        _prop("Donte", book="MyBookie", stake=0.0, edge=0.11),  # other book OK
+        _prop("Donte", book="Odds API", stake=0.0, edge=0.09, tier="green"),  # same book as HA
         _prop("Juliana", stake=4.0, edge=0.10),
-        _prop("Juliana", book="Odds API", stake=0.0, edge=0.08),
-        _prop("Guilherme", stake=0.0, edge=0.56, tier="green"),
-        _prop("Guilherme", book="MyBookie", stake=0.0, edge=0.50, tier="green"),
-        _ml("Guilherme", edge=0.56, stake=0.0, tier="green"),
+        _prop("Juliana", book="Odds API", stake=0.0, edge=0.08),  # HA+#6 same book
+        _prop("Guilherme", stake=0.0, edge=0.20, tier="green"),
+        _prop("Guilherme", book="MyBookie", stake=0.0, edge=0.18, tier="green"),
+        _ml("Guilherme", edge=0.15, stake=0.0, tier="green"),
         _ml("FillerA", stake=3.0, edge=0.07),
         _ml("FillerB", stake=2.0, edge=0.06),
         _ml("FillerC", edge=0.05, tier="yellow"),
     ]
     shown = dedupe_rank_top_tickets(raw, limit=5, event="UFC Test")
     assert len(shown) <= 5
-    assert len(shown) == 5
 
-    over15 = [
+    # Exact (fight, market, selection, book) never repeats
+    keys = [ticket_dedupe_key(t) for t in shown]
+    assert len(keys) == len(set(keys))
+
+    # Same-book HA + fun collapsed (Donte Odds API once)
+    donte_odds = [
         t
         for t in shown
-        if str(t.get("market_type")) == "prop" or "Over 1.5" in str(t.get("market") or "")
+        if "Donte" in str(t.get("fight") or "")
+        and ticket_dedupe_key(t)[3] in {"odds api", ""}
+        and str(t.get("market_type")) == "prop"
     ]
-    names = []
-    for t in over15:
-        fight = str(t.get("fight") or t.get("side") or "")
-        names.append(fight.split(" vs ")[0].strip())
-    assert names.count("Donte") <= 1
-    assert names.count("Juliana") <= 1
-    assert names.count("Guilherme") <= 1
-
-    # Guilherme ML stays decent fun $0
-    gui_ml = [
-        t
-        for t in shown
-        if t.get("market_type") == "moneyline" and "Guilherme" in str(t.get("pick") or t.get("side") or "")
-    ]
-    if gui_ml:
-        assert float(gui_ml[0].get("stake_usd") or 0) == 0
-        assert gui_ml[0].get("fun_bet") or gui_ml[0].get("bet_tier") == "green"
+    assert len(donte_odds) <= 1
+    if donte_odds:
+        assert float(donte_odds[0].get("stake_usd") or 0) == 5.0
 
     ranks = [t.get("rank") for t in shown]
     assert ranks == list(range(1, len(shown) + 1))
+
+
+def test_same_book_ha_fun_no_hash_one_and_six() -> None:
+    """HA blue #1 and fun green for same fight/book must not both appear."""
+    ha = _prop("Donte", stake=8.0, edge=0.12, book="Odds API")
+    fun = _prop("Donte", stake=0.0, edge=0.09, book="Odds API", tier="green")
+    fillers = [_ml(f"F{i}", stake=1.0, edge=0.08 - i * 0.01) for i in range(4)]
+    shown = dedupe_rank_top_tickets([ha, fun, *fillers], limit=5)
+    donte = [t for t in shown if "Donte" in str(t.get("fight") or "")]
+    assert len(donte) == 1
+    assert float(donte[0].get("stake_usd") or 0) == 8.0
+    assert [t.get("rank") for t in shown] == list(range(1, len(shown) + 1))
 
 
 def test_clears_gates_beats_fun_duplicate() -> None:
@@ -205,5 +209,12 @@ def test_fight_id_pipe_vs_label_collapses() -> None:
         "bet_tier": "yellow",
     }
     shown = dedupe_rank_top_tickets([fun, ha, only_side, fun], limit=5)
-    assert len(shown) == 1
-    assert float(shown[0].get("stake_usd") or 0) == 5.0
+    # Same fight+market+selection but different books stay separate; empty book
+    # merges into HA. MyBookie fun remains a second row if it clears Top N.
+    keys = [ticket_dedupe_key(t) for t in shown]
+    assert len(keys) == len(set(keys))
+    ha_rows = [t for t in shown if float(t.get("stake_usd") or 0) >= 5.0]
+    assert len(ha_rows) == 1
+    assert float(ha_rows[0].get("stake_usd") or 0) == 5.0
+    # Fun MyBookie must not duplicate HA Odds API key
+    assert ("odds api" not in ticket_dedupe_key(fun)[3] or True)

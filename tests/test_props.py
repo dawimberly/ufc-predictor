@@ -170,3 +170,64 @@ def test_rank_prop_singles_includes_synthetic_when_no_live(monkeypatch):
     assert all(r["prop_key"] == "over_1_5_rounds" for r in ranked)
     assert ranked[0]["prob"] >= 0.78
     assert ranked[0].get("prop_type")
+    assert ranked[0].get("source_label") == "synthetic"
+
+
+def test_method_probs_uses_decision_finish_share():
+    """Higher decision_finish_share should tilt mass toward decision / Over 1.5."""
+    base = {
+        "fighter_1": "A",
+        "fighter_2": "B",
+        "prob_f1_win": 0.55,
+        "f1_ko_rate": 0.25,
+        "f2_ko_rate": 0.25,
+        "f1_sub_avg": 0.3,
+        "f2_sub_avg": 0.3,
+        "f1_finish_rate": 0.55,
+        "f2_finish_rate": 0.55,
+        "ko_rate_diff": 0.0,
+        "sub_avg_diff": 0.0,
+    }
+    low = method_probs_from_row(
+        pd.Series(
+            {
+                **base,
+                "f1_decision_finish_share_l5": 0.15,
+                "f2_decision_finish_share_l5": 0.15,
+            }
+        )
+    )
+    high = method_probs_from_row(
+        pd.Series(
+            {
+                **base,
+                "f1_decision_finish_share_l5": 0.85,
+                "f2_decision_finish_share_l5": 0.85,
+            }
+        )
+    )
+    assert high["dec"] > low["dec"]
+    assert high["over_1_5_rounds"] >= low["over_1_5_rounds"] - 1e-9
+
+
+def test_settle_fighter_ko_uses_model_pick_not_winner():
+    """fighter_ko must use model pick; actual winner must not rewrite pick_side."""
+    row = pd.Series(
+        {
+            "fighter_1": "Alice",
+            "fighter_2": "Bob",
+            "prob_f1_win": 0.70,
+            "winner": "Bob",
+            "f1_win": 0,
+            "method": "KO/TKO",
+            "round": 1,
+        }
+    )
+    # Model picks Alice; Bob won by KO → fighter_ko (Alice by KO) loses
+    assert settle_prop("fighter_ko", row) is False
+
+
+def test_book_prop_rules_betnow_singles_dk_parlays():
+    assert config.BOOK_PROP_RULES["BetNow.eu"]["allow_prop_parlays"] is False
+    assert config.BOOK_PROP_RULES["DraftKings"]["allow_prop_parlays"] is True
+    assert config.BOOK_PROP_RULES["MyBookie"]["allow_mixed_parlays"] is True

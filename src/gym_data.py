@@ -114,13 +114,67 @@ def lookup_gym(fighter_name: str, profiles: pd.DataFrame | None = None) -> dict[
     }
 
 
-def _location_overlap(gym_location: str, event_location: str) -> bool:
-    """True when gym city/region shares meaningful tokens with event location."""
-    g = _norm_token(gym_location)
-    e = _norm_token(event_location)
-    if not g or not e:
-        return False
-    # Strip generic country/state noise of length < 4 except known short city codes
+# USPS → full state so "Denver, CO" overlaps gym "Englewood Colorado".
+_US_STATE_ABBREV = {
+    "al": "alabama",
+    "ak": "alaska",
+    "az": "arizona",
+    "ar": "arkansas",
+    "ca": "california",
+    "co": "colorado",
+    "ct": "connecticut",
+    "de": "delaware",
+    "fl": "florida",
+    "ga": "georgia",
+    "hi": "hawaii",
+    "id": "idaho",
+    "il": "illinois",
+    "in": "indiana",
+    "ia": "iowa",
+    "ks": "kansas",
+    "ky": "kentucky",
+    "la": "louisiana",
+    "me": "maine",
+    "md": "maryland",
+    "ma": "massachusetts",
+    "mi": "michigan",
+    "mn": "minnesota",
+    "ms": "mississippi",
+    "mo": "missouri",
+    "mt": "montana",
+    "ne": "nebraska",
+    "nv": "nevada",
+    "nh": "new hampshire",
+    "nj": "new jersey",
+    "nm": "new mexico",
+    "ny": "new york",
+    "nc": "north carolina",
+    "nd": "north dakota",
+    "oh": "ohio",
+    "ok": "oklahoma",
+    "or": "oregon",
+    "pa": "pennsylvania",
+    "ri": "rhode island",
+    "sc": "south carolina",
+    "sd": "south dakota",
+    "tn": "tennessee",
+    "tx": "texas",
+    "ut": "utah",
+    "vt": "vermont",
+    "va": "virginia",
+    "wa": "washington",
+    "wv": "west virginia",
+    "wi": "wisconsin",
+    "wy": "wyoming",
+    "dc": "district of columbia",
+}
+
+
+def _location_tokens(text: str) -> set[str]:
+    """Normalize location string into comparable tokens (expand US state abbrevs)."""
+    raw = _norm_token(text)
+    if not raw:
+        return set()
     stop = {
         "usa",
         "uk",
@@ -137,13 +191,28 @@ def _location_overlap(gym_location: str, event_location: str) -> bool:
         "of",
         "america",
     }
-    g_toks = {t for t in g.split() if len(t) >= 4 and t not in stop}
-    e_toks = {t for t in e.split() if len(t) >= 4 and t not in stop}
+    out: set[str] = set()
+    for t in raw.split():
+        if t in stop:
+            continue
+        expanded = _US_STATE_ABBREV.get(t, t)
+        for part in str(expanded).split():
+            if part and part not in stop:
+                out.add(part)
+    return out
+
+
+def _location_overlap(gym_location: str, event_location: str) -> bool:
+    """True when gym city/region shares meaningful tokens with event location."""
+    g_toks = _location_tokens(gym_location)
+    e_toks = _location_tokens(event_location)
     if not g_toks or not e_toks:
-        # Allow exact short city matches like "paris"
-        g_short = {t for t in g.split() if t not in stop}
-        e_short = {t for t in e.split() if t not in stop}
-        return bool(g_short & e_short)
+        return False
+    # Prefer tokens length >= 4 (cities / full states); fall back to short cities.
+    g_long = {t for t in g_toks if len(t) >= 4}
+    e_long = {t for t in e_toks if len(t) >= 4}
+    if g_long and e_long:
+        return bool(g_long & e_long)
     return bool(g_toks & e_toks)
 
 

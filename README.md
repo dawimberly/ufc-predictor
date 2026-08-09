@@ -9,11 +9,14 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 ```
 UFC-Predictor/
 ├── src/                       Python modules + dashboard
-│   ├── bet_tiers.py           Deep Blue / Sky Blue / Green / Yellow / Red
+│   ├── bet_tiers.py           BET THIS / FUN ONLY action verbs + color tiers
 │   ├── bet_slip.py            Top recommended dedupe + ranking
 │   ├── high_value_features.py Phase-1 HV feature block (production default)
 │   ├── strategy.py            HA sizing + auto 2/3-leg parlay recs
 │   ├── uncertainty_gates.py   Conformal CI gates + Paper wide override
+│   ├── fight_context.py       Display-only context strip
+│   ├── weigh_in.py            Weigh-in photos / missed-weight notes
+│   ├── fighter_flags.py       Integrity skip / badge flags
 │   └── ufc_dashboard.py       CustomTkinter GUI
 ├── data/
 │   ├── raw/                   fights.csv
@@ -70,7 +73,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Props - MyBookie** | Optional MyBookie prop lines |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin |
-| **Ollama Analysis** | Local LLM narrative over HA Top 5 (+ fun $0 fillers + auto parlays) |
+| **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
 | **Arb Scanner** | Cross-book arb scan |
 
 BetNow / DraftKings (and their Props tabs) appear only when those scrapers are enabled in `.env` (keep DraftKings off to protect Odds API quota).
@@ -87,19 +90,21 @@ BetNow / DraftKings (and their Props tabs) appear only when those scrapers are e
 | **Full** | Toggle fullscreen |
 | **Bankroll $** | Persisted roll; card budget = bankroll × profile risk % |
 
-### Color legend
+### Color legend + action verbs
 
 Row color = pick-side math + HA decision (not fight-name vibes). Tables sort **Deep Blue → Sky Blue → Green → Yellow → Red**, then edge↓, model prob↓, fight name↑.
 
-| Color | Meaning | Money |
-|-------|---------|-------|
-| **Deep Blue** `#3b82f6` | Clears full HA gates | Real ticket ($) |
-| **Sky Blue** `#57B9FF` | Paper-only `paper_wide_override` tiny stake | Paper $ only (not Live) |
-| **Green** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | Fun `$0` |
-| **Yellow** | Caution — thin edge / borderline | Fun `$0` |
-| **Red** | Don't bet — negative edge, low prob, or `no_odds` | Fun `$0` |
+Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** line so sized vs fun never blur:
 
-Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
+| Color | Action verb | Meaning | Money |
+|-------|-------------|---------|-------|
+| **Deep Blue** `#3b82f6` | **BET THIS** | Clears full HA gates | Real ticket ($) |
+| **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Paper-only `paper_wide_override` | Paper $ only (not Live) |
+| **Green** | **FUN ONLY** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | `$0` research — not bankroll |
+| **Yellow** | **CAUTION — SKIP SIZED** | Thin edge / borderline | `$0` |
+| **Red** | **DO NOT BET** | Negative edge, low prob, or `no_odds` | `$0` |
+
+If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE** and may list FUN ONLY leans separately. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
 
 ### Paper wide override (Sky Blue)
 
@@ -120,7 +125,13 @@ Advisory **2-leg** and **3-leg** research parlays are built from HA singles / hi
 
 **Ollama Analysis** is the default narrative tab (local; default model `qwen2.5-coder:7b`). It never invents bets — HA tickets still show if the LLM times out.
 
+Prompts and the Stats / Best bets briefing use the same action verbs (**BET THIS** / **FUN ONLY** / **DO NOT BET**). Ask “best bets” → sized tickets first with `$`, then optional FUN ONLY leans, never treating Green as bankroll.
+
 Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `XAI_API_KEY` — off by default; **not required**.
+
+### Context strip (display only)
+
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Controversial methods / decision-profile / home-country / pathway A/Bs are **DROP** for production features; leave those flags off unless a keep rule is re-run and passes.
 
 ## Odds sources
 
@@ -205,9 +216,10 @@ data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LG
 | Features | `feature_engineering`, `high_value_features` | Leakage-safe + HV block |
 | Model | `predictor`, `ensemble` | Calibrated LGBM+XGB |
 | Gates | `uncertainty_gates`, `high_accuracy_strategy` | Fail-closed HA sizing |
-| Color | `bet_tiers` | Deep Blue / Sky Blue / Green / Yellow / Red |
+| Color | `bet_tiers` | BET THIS / FUN ONLY action verbs + color tiers |
 | Odds | `odds_providers/*`, `odds_api_client` | Odds API + optional scrapers |
 | Dashboard | `ufc_dashboard`, `dashboard_service`, `bet_slip` | GUI + Top 5 |
+| Context | `fight_context`, `weigh_in`, `fighter_flags` | Display-only strip / skip flags |
 | Narrative | `ollama_client`, `grok_analysis`, `strategy` | Ollama + auto parlays; Grok optional |
 
 ## Background runner
@@ -231,8 +243,9 @@ Prefer `START_DASHBOARD.bat` / Python day-to-day. Frozen builds may hit PyArrow 
 
 - **HA fail-closed** — no sized bets without usable odds + uncertainty clearance
 - **Live wide CI fail-closed** — Paper sky-blue override never applies to Live
-- **Deep Blue / Sky Blue = money tickets** — Green/Yellow/Red never get HA stake
+- **BET THIS (Deep Blue / Sky Blue) = money tickets** — FUN ONLY / Yellow / Red never get HA stake
 - **Sky Blue caps** — 1% bankroll + max 2 override singles/card
+- **Ollama clarity** — sized NO BET vs FUN ONLY leans stated up front
 - **Daily loss circuit breaker** — `src/circuit_breaker.py`
 - **Peak drawdown halt** — `risk_manager.DrawdownHalt`
 - **Alert cooldown + fingerprint dedup**
@@ -278,7 +291,7 @@ Copy `.env.example` → `.env`. Important keys:
 python -m pytest tests/ -q
 ```
 
-Includes color-tier rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, and Ollama props wiring.
+Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, fighter flags, weigh-in context, and Ollama props wiring.
 
 ## Design notes
 

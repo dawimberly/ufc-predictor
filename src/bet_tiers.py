@@ -59,6 +59,15 @@ TIER_LABELS = {
     TIER_RED: "Red",
 }
 
+# Plain-English action verbs for Ollama / Top recommended (what the user should do).
+TIER_ACTIONS = {
+    TIER_BLUE: "BET THIS",
+    TIER_SKY_BLUE: "TINY PAPER BET",
+    TIER_GREEN: "FUN ONLY",
+    TIER_YELLOW: "CAUTION — SKIP SIZED",
+    TIER_RED: "DO NOT BET",
+}
+
 _ACTIONABLE_TIERS = frozenset({TIER_BLUE, TIER_SKY_BLUE})
 _PAPER_WIDE_OVERRIDE_TOKEN = "paper_wide_override"
 
@@ -708,12 +717,99 @@ def rank_card_bet_tiers(
 
 def format_tier_legend() -> str:
     return (
-        "Blue = real HA ticket · "
-        "Sky blue = Paper override (tiny) · "
-        "Green = fun · "
-        "Yellow = caution · "
-        "Red = don't bet"
+        "BET THIS (Blue) = sized bankroll ticket | "
+        "TINY PAPER BET (Sky blue) = paper override only | "
+        "FUN ONLY (Green) = $0 research lean — not sized | "
+        "CAUTION (Yellow) = skip sized bankroll | "
+        "DO NOT BET (Red)"
     )
+
+
+def action_label_for_bet(bet: dict[str, Any] | None) -> str:
+    """Return plain action for UI/prompt: BET THIS / FUN ONLY / DO NOT BET."""
+    b = bet or {}
+    tier = str(b.get("bet_tier") or b.get("tier") or "").strip().lower()
+    if tier == "advisory":
+        tier = TIER_GREEN if b.get("fun_bet") else TIER_YELLOW
+    if tier not in TIER_ACTIONS:
+        stake = _safe_float(b.get("stake_usd"))
+        if stake is None:
+            stake = _safe_float(b.get("suggested_stake"))
+        stake_pct = _safe_float(b.get("stake_pct"))
+        if (stake is not None and stake > 0) or (stake_pct is not None and stake_pct > 0):
+            if is_sky_blue_ticket(
+                stake_pct=stake_pct,
+                uncertainty_reason=b.get("uncertainty_reason") or b.get("tier_reason"),
+            ):
+                tier = TIER_SKY_BLUE
+            else:
+                tier = TIER_BLUE
+        elif b.get("fun_bet") or b.get("advisory"):
+            tier = TIER_GREEN
+        else:
+            tier = TIER_YELLOW
+
+    action = TIER_ACTIONS.get(tier, "CAUTION — SKIP SIZED")
+    if tier in _ACTIONABLE_TIERS:
+        stake = _safe_float(b.get("stake_usd"))
+        if stake is None:
+            stake = _safe_float(b.get("suggested_stake"))
+        if stake is not None and stake > 0:
+            return f"{action} ${stake:.2f}"
+        stake_pct = _safe_float(b.get("stake_pct"))
+        if stake_pct is not None and stake_pct > 0:
+            return f"{action} ({stake_pct:.1f}% card)"
+        return action
+    if tier == TIER_GREEN:
+        return f"{action} ($0 — not a real ticket)"
+    if tier == TIER_YELLOW:
+        return f"{action} ($0)"
+    return action
+
+
+def format_what_to_do_header(
+    tiers: dict[str, list[dict[str, Any]]] | None = None,
+    *,
+    slip: list[dict[str, Any]] | None = None,
+) -> str:
+    """Lead line so next week's card is unambiguous: bet / fun / skip."""
+    blue: list[dict[str, Any]] = []
+    sky: list[dict[str, Any]] = []
+    green: list[dict[str, Any]] = []
+    if isinstance(tiers, dict):
+        blue = list(tiers.get(TIER_BLUE) or [])
+        sky = list(tiers.get(TIER_SKY_BLUE) or [])
+        green = list(tiers.get(TIER_GREEN) or [])
+    elif slip:
+        for b in slip:
+            t = str(b.get("bet_tier") or "").strip().lower()
+            if t == TIER_BLUE or (
+                not t
+                and not b.get("fun_bet")
+                and not b.get("advisory")
+                and float(b.get("stake_usd") or 0) > 0
+            ):
+                blue.append(b)
+            elif t == TIER_SKY_BLUE:
+                sky.append(b)
+            elif t == TIER_GREEN or b.get("fun_bet"):
+                green.append(b)
+
+    sized = blue + sky
+    if sized:
+        names = []
+        for b in sized[:5]:
+            side = str(b.get("pick") or b.get("side") or "—")
+            names.append(f"{side} ({action_label_for_bet(b)})")
+        return "WHAT TO BET (sized): " + " · ".join(names)
+
+    if green:
+        names = [str(b.get("pick") or b.get("side") or "—") for b in green[:3]]
+        return (
+            "WHAT TO BET (sized): NONE — bankroll stays flat. "
+            f"FUN ONLY leans (not sized): {', '.join(names)}."
+        )
+    return "WHAT TO BET (sized): NONE — NO BET this card."
 
 
 def prop_status_for_tier(prop: dict[str, Any]) -> str:
@@ -977,14 +1073,12 @@ def format_tiered_best_bets(
 ) -> str:
     """Text briefing for Ollama chat / Stats — gates stay strict for Blue."""
     lines: list[str] = []
-    title = "Best bets by color"
+    title = "Best bets — read the action verbs"
     if event:
         title += f" — {event}"
     lines.append(title)
+    lines.append(format_what_to_do_header(tiers))
     lines.append(format_tier_legend())
-    lines.append(
-        "Blue / Sky blue are sized. Green/Yellow are fun rankings ($0)."
-    )
     lines.append("Includes moneyline + Over 1.5 props when available.")
 
     blue = list(tiers.get(TIER_BLUE) or [])
@@ -993,26 +1087,26 @@ def format_tiered_best_bets(
     yellow = list(tiers.get(TIER_YELLOW) or [])
 
     if blue:
-        lines.append(f"BLUE (full HA) — {len(blue)}:")
+        lines.append(f"BET THIS (Blue / full HA) — {len(blue)}:")
         for i, b in enumerate(blue[:5], start=1):
             lines.append(_line(b, i))
     else:
-        lines.append("BLUE — none cleared full HA gates (NO BET for sized bankroll).")
+        lines.append("BET THIS (Blue) — none. Sized bankroll = $0 this card.")
 
     if sky:
-        lines.append(f"SKY BLUE (Paper override) — {len(sky)}:")
+        lines.append(f"TINY PAPER BET (Sky blue) — {len(sky)}:")
         for i, b in enumerate(sky[:5], start=1):
             lines.append(_line(b, i))
 
     if green:
-        lines.append(f"GREEN (decent fun) — {len(green)}:")
+        lines.append(f"FUN ONLY (Green, $0 research) — {len(green)}:")
         for i, b in enumerate(green[:5], start=1):
             lines.append(_line(b, i, fun=True))
     else:
-        lines.append("GREEN — no decent fun edges on this card.")
+        lines.append("FUN ONLY — no decent fun edges on this card.")
 
     if yellow:
-        lines.append(f"YELLOW (caution) — top {min(3, len(yellow))}:")
+        lines.append(f"CAUTION — SKIP SIZED (Yellow) — top {min(3, len(yellow))}:")
         for i, b in enumerate(yellow[:3], start=1):
             lines.append(_line(b, i, fun=True))
 
@@ -1036,11 +1130,9 @@ def _line(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
     reason = str(b.get("tier_reason") or b.get("brief") or "").replace("_", " ")
     edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
     prob_s = f"{float(prob):.0%}" if prob is not None else "n/a"
-    money = "fun $0" if fun or b.get("fun_bet") else (
-        f"${float(b.get('stake_usd') or b.get('suggested_stake') or 0):.2f}"
-    )
+    action = action_label_for_bet({**b, "fun_bet": fun or b.get("fun_bet")})
     fight_s = f" | {fight}" if fight and fight not in side else ""
     return (
-        f"{rank}. [{market}] {side}{fight_s} · edge {edge_s} · "
-        f"prob {prob_s} · {money} · {reason}"
+        f"{rank}. {action} · [{market}] {side}{fight_s} · edge {edge_s} · "
+        f"prob {prob_s} · {reason}"
     )

@@ -196,6 +196,49 @@ HIGH_VALUE_FEATURE_COLUMNS = [
     "ko_losses_career_flag_diff",
 ]
 
+# UFC-only pathway + market blocks (A/B research). Default OFF — do not affect production
+# until pathway_market_ab_2025 keep rule passes. Names are UFC-scoped (not shared with trading bot).
+ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
+# Research-only: post-hoc shrink of wide-CI probs toward market (not a train feature).
+ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
+PATHWAY_MARKET_CAL_WIDTH = float(os.getenv("PATHWAY_MARKET_CAL_WIDTH", "0.40"))
+PATHWAY_MARKET_CAL_SHRINK = float(os.getenv("PATHWAY_MARKET_CAL_SHRINK", "0.35"))
+
+PATHWAY_FEATURE_COLUMNS = [
+    "ko_win_rate_l5_diff",
+    "ko_win_rate_career_diff",
+    "sub_win_rate_l5_diff",
+    "sub_win_rate_career_diff",
+    "dec_win_rate_l5_diff",
+    "dec_win_rate_career_diff",
+    "ko_loss_rate_l5_diff",
+    "ko_loss_rate_career_diff",
+    "sub_loss_rate_l5_diff",
+    "sub_loss_rate_career_diff",
+    "dec_loss_rate_l5_diff",
+    "dec_loss_rate_career_diff",
+    "r1_finish_rate_l5_diff",
+    "r1_finish_rate_career_diff",
+    "late_finish_rate_l5_diff",
+    "late_finish_rate_career_diff",
+    "distance_rate_l5_diff",
+    "distance_rate_career_diff",
+    "cardio_decay_proxy_diff",
+    "finish_timing_skew_diff",
+    "last_loss_opp_elo_diff",
+    "path_opp_ko_x_own_ko_loss",
+    "path_opp_td_att_x_own_td_def",
+    "path_opp_sub_x_own_sub_loss",
+    "path_pace_product_diff",
+    "path_stance_mismatch",
+    "is_five_round",
+]
+MARKET_FEATURE_COLUMNS = [
+    "mkt_implied_prob",
+    "line_move",
+]
+
 FEATURE_COLUMNS = [
     # Differential (primary signals — fighter1 minus fighter2)
     "elo_diff",
@@ -255,6 +298,10 @@ FEATURE_COLUMNS = [
 # Append HV block when enabled (A/B via ENABLE_HIGH_VALUE_FEATURES=0)
 if ENABLE_HIGH_VALUE_FEATURES:
     FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(HIGH_VALUE_FEATURE_COLUMNS)
+if ENABLE_PATHWAY_FEATURES:
+    FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(PATHWAY_FEATURE_COLUMNS)
+if ENABLE_MARKET_FEATURES:
+    FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(MARKET_FEATURE_COLUMNS)
 
 # --- Interaction feature discovery (candidates generated in feature_engineering) ---
 INTERACTION_DISCOVERY_ENABLED = os.getenv(
@@ -650,7 +697,9 @@ PROP_MARKETS = [
 ]
 ROUND_ROBINS_ENABLED = False
 BOOK_PROP_RULES: dict[str, dict[str, Any]] = {
-    # Prop/mixed parlays disabled under high-accuracy strategy
+    # Book policy: BetNow + Odds API = prop singles only.
+    # DraftKings + MyBookie allow prop/mixed parlays (research / book rules).
+    # Live HA still gates ticket parlays via PROP_PARLAYS_ENABLED=False.
     "Odds API": {
         "allow_prop_parlays": False,
         "allow_mixed_parlays": False,
@@ -662,14 +711,14 @@ BOOK_PROP_RULES: dict[str, dict[str, Any]] = {
         "max_prop_parlay_legs": 1,
     },
     "DraftKings": {
-        "allow_prop_parlays": False,
-        "allow_mixed_parlays": False,
-        "max_prop_parlay_legs": 1,
+        "allow_prop_parlays": True,
+        "allow_mixed_parlays": True,
+        "max_prop_parlay_legs": int(os.getenv("PROP_PARLAY_MAX_LEGS_DK", "2")),
     },
     "MyBookie": {
-        "allow_prop_parlays": False,
-        "allow_mixed_parlays": False,
-        "max_prop_parlay_legs": 1,
+        "allow_prop_parlays": True,
+        "allow_mixed_parlays": True,
+        "max_prop_parlay_legs": 3,
     },
 }
 
@@ -708,18 +757,31 @@ def refresh_runtime_env() -> None:
     global LIVE_INTERVAL_WIDTH_SKIP, LIVE_INTERVAL_WIDTH_TIGHTEN
     global LIVE_UNCERTAINTY_EDGE_BUMP, LIVE_UNCERTAINTY_KELLY_MULT
     global ENABLE_HIGH_VALUE_FEATURES, FEATURE_COLUMNS, HIGH_VALUE_FEATURE_COLUMNS
+    global ENABLE_PATHWAY_FEATURES, ENABLE_MARKET_FEATURES, ENABLE_PATHWAY_MARKET_CAL
+    global PATHWAY_FEATURE_COLUMNS, MARKET_FEATURE_COLUMNS
+    global PATHWAY_MARKET_CAL_WIDTH, PATHWAY_MARKET_CAL_SHRINK
     global INTERACTION_DISCOVERY_ENABLED
 
     ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
     ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
+    ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+    ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
+    ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
+    PATHWAY_MARKET_CAL_WIDTH = float(os.getenv("PATHWAY_MARKET_CAL_WIDTH", "0.40"))
+    PATHWAY_MARKET_CAL_SHRINK = float(os.getenv("PATHWAY_MARKET_CAL_SHRINK", "0.35"))
     INTERACTION_DISCOVERY_ENABLED = env_bool("INTERACTION_DISCOVERY_ENABLED", "true")
-    # Rebuild model feature list so A/B scripts can flip the flag at runtime.
-    _base_cols = [c for c in FEATURE_COLUMNS if c not in set(HIGH_VALUE_FEATURE_COLUMNS)]
-    FEATURE_COLUMNS = (
-        list(_base_cols) + list(HIGH_VALUE_FEATURE_COLUMNS)
-        if ENABLE_HIGH_VALUE_FEATURES
-        else list(_base_cols)
+    # Rebuild model feature list so A/B scripts can flip flags at runtime.
+    _extra = set(HIGH_VALUE_FEATURE_COLUMNS) | set(PATHWAY_FEATURE_COLUMNS) | set(
+        MARKET_FEATURE_COLUMNS
     )
+    _base_cols = [c for c in FEATURE_COLUMNS if c not in _extra]
+    FEATURE_COLUMNS = list(_base_cols)
+    if ENABLE_HIGH_VALUE_FEATURES:
+        FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(HIGH_VALUE_FEATURE_COLUMNS)
+    if ENABLE_PATHWAY_FEATURES:
+        FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(PATHWAY_FEATURE_COLUMNS)
+    if ENABLE_MARKET_FEATURES:
+        FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(MARKET_FEATURE_COLUMNS)
     MYBOOKIE_ENABLED = env_bool("MYBOOKIE_ENABLED", "false")
     BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
     DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")

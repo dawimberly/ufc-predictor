@@ -425,14 +425,16 @@ def _bet_cluster_key(ticket: dict[str, Any]) -> tuple[str, str]:
 
 
 def _same_bet(a: dict[str, Any], b: dict[str, Any]) -> bool:
-    """True when two tickets are the same bet (fight aliases + market + selection)."""
+    """True when same (fight, market, selection, book) — book empty matches any."""
     if _bet_cluster_key(a) != _bet_cluster_key(b):
+        return False
+    book_a, book_b = ticket_book(a), ticket_book(b)
+    if book_a and book_b and book_a != book_b:
         return False
     aliases_a = ticket_fight_aliases(a)
     aliases_b = ticket_fight_aliases(b)
     if aliases_a and aliases_b:
         return bool(aliases_a & aliases_b)
-    # Fallback: canonical fight_id string equality
     fa, fb = ticket_fight_id(a), ticket_fight_id(b)
     return bool(fa) and fa == fb
 
@@ -447,10 +449,10 @@ def dedupe_rank_top_tickets(
     """
     Merge HA + fun candidates: dedupe → rank → Top N.
 
-    Same bet = overlapping fight aliases + market_type + selection
-    (book ignored so Odds API / MyBookie / Overview do not double-count).
+    Same bet = (fight aliases, market_type, selection, book).
+    Empty book is a wildcard so HA Overview + book-tagged fun still collapse
+    (avoids #1 HA / #6 fun duplicates). Distinct books stay separate.
     Keep better: clears gates > fun; higher edge; higher stake.
-    Rank: clears gates first (stake/edge), then decent fun, then others.
     """
     import logging
 
@@ -458,9 +460,18 @@ def dedupe_rank_top_tickets(
     raw = [dict(t) for t in (tickets or []) if isinstance(t, dict)]
     raw_n = len(raw)
 
-    # Greedy cluster merge — O(n^2) fine for card-sized lists
-    clusters: list[dict[str, Any]] = []
+    # Pass 1: exact ticket_dedupe_key collapse (fight, market, selection, book)
+    by_key: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     for t in raw:
+        key = ticket_dedupe_key(t)
+        prev = by_key.get(key)
+        if prev is None or ticket_is_better(t, prev):
+            by_key[key] = t
+    pass1 = list(by_key.values())
+
+    # Pass 2: merge empty-book / alias overlaps (HA vs fun same fight+market+sel)
+    clusters: list[dict[str, Any]] = []
+    for t in pass1:
         merged = False
         for i, kept in enumerate(clusters):
             if _same_bet(t, kept):

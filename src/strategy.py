@@ -195,6 +195,37 @@ def extract_bet_candidates(
     f2 = str(row.get("fighter_2", row.get("fighter2_name", row.get("fighter2", "")))).strip()
     fight_lbl = f"{f1} vs {f2}" if f1 or f2 else str(row.get("fight_id", ""))
 
+    try:
+        from src.fighter_flags import should_skip_fight
+
+        skip_flag, flag_detail = should_skip_fight(f1, f2)
+        if skip_flag:
+            log_strategy_block(
+                "fighter_integrity_flag",
+                context="single",
+                fight=fight_lbl,
+                detail=flag_detail,
+            )
+            return None
+    except Exception:
+        pass
+
+    try:
+        from src.controversy import should_skip_for_referee
+
+        ref = row.get("referee") or row.get("REFEREE")
+        skip_ref, ref_detail = should_skip_for_referee(ref)
+        if skip_ref:
+            log_strategy_block(
+                "controversial_referee_flag",
+                context="single",
+                fight=fight_lbl,
+                detail=ref_detail,
+            )
+            return None
+    except Exception:
+        pass
+
     if apply_uncertainty_gates:
         try:
             from src.uncertainty_gates import evaluate_uncertainty_gate, effective_min_edge
@@ -1595,7 +1626,8 @@ def format_stake_pct_dollars(ticket: dict[str, Any] | float, stake: float | None
             return "— · $0.00"
         return f"${dol_f:.2f}"
     pct_txt = f"{pct_f:.0f}%" if abs(pct_f - round(pct_f)) < 0.05 else f"{pct_f:.1f}%"
-    return f"{pct_txt} · ${dol_f:.2f}"
+    # ASCII separator (Windows ttk / code-page safe)
+    return f"{pct_txt} | ${dol_f:.2f}"
 
 
 def attach_prop_stakes(
@@ -2218,14 +2250,26 @@ def aggregate_top_recommended_bets(
                 }
             )
 
-    best_by_fight: dict[str, dict[str, Any]] = {}
-    for bet in pool_candidates:
-        fid = bet["fight_id"]
-        prev = best_by_fight.get(fid)
-        if prev is None or float(bet.get("edge") or 0) > float(prev.get("edge") or 0):
-            best_by_fight[fid] = bet
+    # Dedupe on (fight, market, selection, book) — not fight-only (avoids #1/#6 twins)
+    try:
+        from src.bet_slip import dedupe_rank_top_tickets
 
-    ranked = sorted(best_by_fight.values(), key=lambda x: float(x.get("edge") or 0), reverse=True)[:limit]
+        ranked = dedupe_rank_top_tickets(pool_candidates, limit=limit, event="overview_ml")
+    except Exception:
+        best_by_key: dict[tuple, dict[str, Any]] = {}
+        for bet in pool_candidates:
+            key = (
+                str(bet.get("fight_id") or ""),
+                str(bet.get("market_type") or "moneyline"),
+                str(bet.get("pick") or ""),
+                str(bet.get("book") or "").lower(),
+            )
+            prev = best_by_key.get(key)
+            if prev is None or float(bet.get("edge") or 0) > float(prev.get("edge") or 0):
+                best_by_key[key] = bet
+        ranked = sorted(
+            best_by_key.values(), key=lambda x: float(x.get("edge") or 0), reverse=True
+        )[:limit]
     pool = available_card_budget_usd(resolved, profile=profile)
     for i, bet in enumerate(ranked, start=1):
         bet["rank"] = i

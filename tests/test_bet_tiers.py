@@ -157,4 +157,29 @@ def test_sky_blue_requires_stake(monkeypatch) -> None:
 def test_legend_mentions_sky_blue() -> None:
     text = format_tier_legend().lower()
     assert "sky blue" in text
-    assert "paper override" in text
+    assert "paper" in text
+    assert "bet this" in text
+    assert "fun only" in text
+
+
+def test_action_label_fun_vs_bet() -> None:
+    from src.bet_tiers import action_label_for_bet, format_what_to_do_header
+
+    fun = action_label_for_bet(
+        {"bet_tier": "green", "pick": "Diego Ferreira", "fun_bet": True}
+    )
+    assert fun.startswith("FUN ONLY")
+    assert "$0" in fun
+
+    real = action_label_for_bet(
+        {"bet_tier": "blue", "pick": "A", "stake_usd": 12.5, "stake_pct": 5}
+    )
+    assert real.startswith("BET THIS")
+    assert "12.50" in real
+
+    header = format_what_to_do_header(
+        slip=[{"bet_tier": "green", "pick": "Diego Ferreira", "fun_bet": True}]
+    )
+    assert "NONE" in header
+    assert "FUN ONLY" in header
+    assert "Diego Ferreira" in header

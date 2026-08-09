@@ -126,6 +126,10 @@ def _ascii_ui(text: Any) -> str:
         "\u00b1": "+/-",
         "\u2192": "->",
         "\u2190": "<-",
+        "\u25bc": "v",  # black down-pointing triangle
+        "\u25b2": "^",  # black up-pointing triangle
+        "\u25be": "v",
+        "\u25b4": "^",
         "\uff04": "$",  # fullwidth dollar
         "\u20ac": "EUR",
         "\u00a3": "GBP",
@@ -133,6 +137,55 @@ def _ascii_ui(text: Any) -> str:
     for src, dst in replacements.items():
         s = s.replace(src, dst)
     return s.encode("ascii", "replace").decode("ascii")
+
+
+# Display cap for absurd scraper/merge edges (strategy also uses 0.25 actionable).
+_MAX_DISPLAY_EDGE = 0.30
+
+
+def _has_usable_odds(row: pd.Series | dict[str, Any]) -> bool:
+    get = row.get if hasattr(row, "get") else (lambda *_: None)
+    if bool(get("odds_matched")):
+        return True
+    for col in ("f1_odds", "f2_odds"):
+        v = get(col)
+        try:
+            if v is not None and not (isinstance(v, float) and pd.isna(v)) and float(v) > 1.0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def _format_edge_display(edge: float | None) -> str:
+    """Show '—' when missing/suspect; never paint fake -100% edges."""
+    if edge is None:
+        return "—"
+    try:
+        e = float(edge)
+    except (TypeError, ValueError):
+        return "—"
+    if not (e == e):  # NaN
+        return "—"
+    if abs(e) > _MAX_DISPLAY_EDGE:
+        return "—"  # absurd scrape/merge — blank, not a real ticket cue
+    if e <= -0.50:
+        return "—"
+    return f"{e * 100:+.1f}%"
+
+
+def _format_min_bet_plain(stake: Any, *, pct: Any = None) -> str:
+    """Min bet as plain dollars (floor $1 when sized); no unicode dots."""
+    try:
+        amt = float(stake or 0.0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    if amt <= 0:
+        return "$0"
+    shown = max(1.0, amt) if amt >= 0.5 else amt
+    if abs(shown - round(shown)) < 1e-9:
+        return f"${int(round(shown))}"
+    return f"${shown:.2f}"
 
 
 def _ascii_row(values: tuple | list) -> tuple:
@@ -608,13 +661,24 @@ def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
     f1 = str(row.get("fighter_1", ""))
     f2 = str(row.get("fighter_2", ""))
     pick = str(row.get("predicted_winner", ""))
+    if not _has_usable_odds(row):
+        return None, pick or None
+    edge: float | None = None
     if pd.notna(row.get("edge_pct")):
         edge = float(row["edge_pct"]) / 100.0
     elif pd.notna(row.get("best_edge")):
         edge = float(row["best_edge"])
-    elif pd.notna(row.get("edge_f1")):
-        edge = max(float(row.get("edge_f1", 0)), float(row.get("edge_f2", 0)))
-    else:
+        if abs(edge) > 1.5:  # sometimes stored as percent
+            edge = edge / 100.0
+    elif pd.notna(row.get("edge_f1")) or pd.notna(row.get("edge_f2")):
+        e1 = float(row["edge_f1"]) if pd.notna(row.get("edge_f1")) else float("-inf")
+        e2 = float(row["edge_f2"]) if pd.notna(row.get("edge_f2")) else float("-inf")
+        edge = max(e1, e2)
+        if edge == float("-inf"):
+            edge = None
+    if edge is None:
+        return None, pick or None
+    if abs(edge) > _MAX_DISPLAY_EDGE or edge <= -0.50:
         return None, pick or None
     return edge, pick or None
 
@@ -623,14 +687,21 @@ def _site_odds(row: pd.Series, pick: str | None) -> str:
     if not pick:
         pick = str(row.get("predicted_winner", "") or "")
     f1 = str(row.get("fighter_1", ""))
-    has_odds = bool(row.get("odds_matched")) or pd.notna(row.get("f1_odds")) or pd.notna(row.get("f2_odds"))
-    if not pick or not has_odds:
-        return "-"
+    if not pick or not _has_usable_odds(row):
+        return "—"
     if pick == f1 and pd.notna(row.get("f1_odds")):
-        return f"{float(row['f1_odds']):.2f}"
+        try:
+            o = float(row["f1_odds"])
+            return f"{o:.2f}" if o > 1.0 else "—"
+        except (TypeError, ValueError):
+            return "—"
     if pd.notna(row.get("f2_odds")):
-        return f"{float(row['f2_odds']):.2f}"
-    return "-"
+        try:
+            o = float(row["f2_odds"])
+            return f"{o:.2f}" if o > 1.0 else "—"
+        except (TypeError, ValueError):
+            return "—"
+    return "—"
 
 
 def _kelly_pct(row: pd.Series, bankroll: float, strategy) -> str:
@@ -818,19 +889,25 @@ def _rows_for_table(
         prob = row.get("predicted_prob", row.get("prob_f1_win"))
         if pd.notna(prob) and pick == f2 and pd.notna(row.get("prob_f2_win")):
             prob = row["prob_f2_win"]
-        edge_txt = f"{edge * 100:+.1f}%" if edge is not None else "-"
-        prob_txt = f"{float(prob):.0%}" if pd.notna(prob) else "-"
+        edge_txt = _format_edge_display(edge)
+        odds_txt = _site_odds(row, pick)
+        if odds_txt in {"—", "-", ""}:
+            edge_txt = "—"
+            edge = None
+        prob_txt = f"{float(prob):.0%}" if pd.notna(prob) else "—"
         sort_prob = _model_prob_for_row(row)
         clears = row_clears_gates(row, cleared)
         kelly_txt = _kelly_pct(row, bankroll, strategy)
         # Color from pick-side math + Kelly/status — never from opponent/fight string alone.
         # SKIP status forces non-blue even if clears_gates is somehow set.
+        # Cap absurd edges so they do not paint Green/Blue from scrape glitches.
+        edge_for_tier = float(edge) if edge is not None else None
         tier, reason = classify_bet_tier(
             row,
             clears_gates=clears and "SKIP" not in str(kelly_txt).upper(),
             min_model_prob=min_model_prob,
             status=kelly_txt,
-            edge=float(edge) if edge is not None else None,
+            edge=edge_for_tier,
             model_prob=float(prob) if pd.notna(prob) else None,
             pick=str(pick or "") or None,
             debug=True,
@@ -844,16 +921,16 @@ def _rows_for_table(
             row.get("bookmaker")
             or row.get("odds_book")
             or row.get("odds_source")
-            or "-"
-        ).strip() or "-"
+            or "—"
+        ).strip() or "—"
         if book.lower() in {"the_odds_api", "odds_api"}:
             book = "Odds API"
         if compact:
             values: tuple = (
                 fight_name,
-                pick or "-",
+                pick or "—",
                 prob_txt,
-                _site_odds(row, pick),
+                odds_txt,
                 edge_txt,
                 book,
                 kelly_txt,
@@ -862,33 +939,37 @@ def _rows_for_table(
             brief = build_fight_brief(row, edge_pct=edge * 100 if edge else None)[:120]
             values = (
                 fight_name,
-                pick or "-",
+                pick or "—",
                 prob_txt,
-                _site_odds(row, pick),
+                odds_txt,
                 edge_txt,
                 book,
                 kelly_txt,
                 brief,
-                _top_shap(row) or "-",
+                _top_shap(row) or "—",
             )
         rows.append(
             {
                 "values": values,
                 "tier": tier,
-                "pick": str(pick or "") or "-",
+                "pick": str(pick or "") or "—",
                 "sort_prob": sort_prob,
                 "sort_edge": float(edge) if edge is not None else -999.0,
                 "sort_fight": fight_name,
+                "row_meta": row.to_dict() if hasattr(row, "to_dict") else dict(row),
             }
         )
     rows.sort(key=_fight_table_sort_key)
     order_bits = []
     for r in rows:
         edge_v = r.get("sort_edge")
-        edge_s = f"{float(edge_v) * 100:+.1f}%" if edge_v is not None and float(edge_v) > -900 else "-"
+        edge_s = f"{float(edge_v) * 100:+.1f}%" if edge_v is not None and float(edge_v) > -900 else "—"
         order_bits.append(f"{r.get('pick')}|{r.get('tier')}|{edge_s}")
     _debug_log(f"fight_table_sorted order: {' > '.join(order_bits)}")
-    return [{"values": r["values"], "tier": r["tier"]} for r in rows]
+    return [
+        {"values": r["values"], "tier": r["tier"], "row_meta": r.get("row_meta")}
+        for r in rows
+    ]
 
 
 def _norm_event_name(name: str) -> str:
@@ -1033,9 +1114,11 @@ _ODDS_DISPLAY_COLS = (
     "f2_odds",
     "implied_prob_f1",
     "implied_prob_f2",
+    "mkt_implied_prob",
     "edge_f1",
     "edge_f2",
     "edge_pct",
+    "best_edge",
     "best_edge_side",
     "bookmaker_count",
     "bookmaker",
@@ -1076,31 +1159,42 @@ def _merge_fights_with_book_odds(card_df: pd.DataFrame, book_df: pd.DataFrame) -
     if _df_is_empty(card_df):
         return _dedupe_fight_rows(_as_dataframe(book_df))
     if _df_is_empty(book_df):
-        return _dedupe_fight_rows(_as_dataframe(card_df))
+        # Book empty — do not keep consensus odds from the card model frame
+        return _strip_book_odds_columns(_dedupe_fight_rows(_as_dataframe(card_df)))
     odds_cols = [c for c in (*_ODDS_DISPLAY_COLS, "odds_matched") if c in book_df.columns]
     if not odds_cols:
-        return _dedupe_fight_rows(card_df)
+        return _strip_book_odds_columns(_dedupe_fight_rows(card_df))
     key = config.FIGHT_ID_COLUMN
     if key in card_df.columns and key in book_df.columns:
         base = card_df.drop(columns=odds_cols, errors="ignore")
         merged = base.merge(book_df[[key, *odds_cols]], on=key, how="left")
-        if merged["odds_matched"].any() if "odds_matched" in merged.columns else True:
-            return _dedupe_fight_rows(merged)
+        if "odds_matched" in merged.columns:
+            merged["odds_matched"] = merged["odds_matched"].fillna(False)
+        return _dedupe_fight_rows(merged)
     f1 = "fighter_1" if "fighter_1" in card_df.columns else "fighter1"
     f2 = "fighter_2" if "fighter_2" in card_df.columns else "fighter2"
     if f1 in card_df.columns and f2 in card_df.columns and f1 in book_df.columns and f2 in book_df.columns:
         base = card_df.drop(columns=odds_cols, errors="ignore")
         merged = base.merge(book_df[[f1, f2, *odds_cols]], on=[f1, f2], how="left")
+        if "odds_matched" in merged.columns:
+            merged["odds_matched"] = merged["odds_matched"].fillna(False)
         return _dedupe_fight_rows(merged)
-    return _dedupe_fight_rows(card_df)
+    return _strip_book_odds_columns(_dedupe_fight_rows(card_df))
 
 
 def _preds_for_card(
     preds: pd.DataFrame,
     card_preds: pd.DataFrame,
     event_name: str,
+    *,
+    strip_unmatched_odds: bool = False,
 ) -> pd.DataFrame:
-    """Rows for one card using this book's odds merged onto card fights."""
+    """Rows for one card using this book's odds merged onto card fights.
+
+    When ``strip_unmatched_odds`` is True (book tabs), never leave consensus
+    odds on the card if this book has no matched slice for the event.
+    Always prefer non-empty card predictions over an empty header-only section.
+    """
     ev = str(event_name or "").strip()
     norm_ev = _norm_event_name(ev)
     base = (
@@ -1118,6 +1212,15 @@ def _preds_for_card(
         book_slice = preds[col.map(_norm_event_name) == norm_ev]
         if book_slice.empty:
             book_slice = preds[col == ev]
+        if book_slice.empty and norm_ev:
+            # Fuzzy: "UFC 330" vs longer event title
+            try:
+                book_slice = preds[
+                    col.map(_norm_event_name).str.contains(norm_ev, regex=False)
+                    | col.str.contains(ev, case=False, regex=False)
+                ]
+            except Exception:
+                book_slice = pd.DataFrame()
     elif not base.empty:
         return _merge_fights_with_book_odds(base, preds)
 
@@ -1126,6 +1229,9 @@ def _preds_for_card(
             return _merge_fights_with_book_odds(base, book_slice)
         return _dedupe_fight_rows(book_slice)
 
+    # No book match for this event — keep card fights; strip consensus on book tabs
+    if not base.empty:
+        return _strip_book_odds_columns(base) if strip_unmatched_odds else base
     return base
 
 
@@ -1154,6 +1260,7 @@ def _render_grouped_fight_tables(
     compact: bool = True,
     table_height: int = 8,
     payload: "DashboardPayload | None" = None,
+    strip_unmatched_odds: bool = False,
 ) -> None:
     """Render one bordered section per upcoming card, or a single flat table."""
     from src.bet_tiers import format_tier_legend
@@ -1185,13 +1292,100 @@ def _render_grouped_fight_tables(
     )
     legend.pack(fill="x", padx=8, pady=(2, 0))
 
+    context_wrap = ctk.CTkFrame(parent, fg_color="transparent")
+    context_wrap.pack(fill="x", padx=8, pady=(2, 4))
+    photo_row = ctk.CTkFrame(context_wrap, fg_color="transparent")
+    photo_row.pack(fill="x", pady=(0, 2))
+    photo_f1 = ctk.CTkLabel(photo_row, text="", width=72, height=72)
+    photo_f1.pack(side="left", padx=(0, 8))
+    photo_f2 = ctk.CTkLabel(photo_row, text="", width=72, height=72)
+    photo_f2.pack(side="left", padx=(0, 12))
+    photo_row.pack_forget()  # show only when images load
+    _photo_refs: list[Any] = []  # keep CTkImage refs alive
+
+    context_box = ctk.CTkLabel(
+        context_wrap,
+        text="Select a fight row for method / market / weigh-in context.",
+        anchor="w",
+        justify="left",
+        font=ctk.CTkFont(size=11),
+        text_color="#94a3b8",
+        wraplength=1000,
+    )
+    context_box.pack(fill="x")
+
+    def _set_photos(f1: str, f2: str) -> None:
+        photo_row.pack_forget()
+        photo_f1.configure(image=None, text="")
+        photo_f2.configure(image=None, text="")
+        _photo_refs.clear()
+        if not f1 and not f2:
+            return
+        try:
+            from PIL import Image
+            from src.weigh_in import pair_image_paths
+
+            p1, p2 = pair_image_paths(f1, f2, fetch=True)
+            imgs: list[Any] = []
+            for path, label in ((p1, photo_f1), (p2, photo_f2)):
+                if path is None or not path.is_file():
+                    label.configure(image=None, text="")
+                    continue
+                im = Image.open(path).convert("RGB")
+                im.thumbnail((72, 72))
+                cimg = ctk.CTkImage(light_image=im, dark_image=im, size=im.size)
+                _photo_refs.append(cimg)
+                label.configure(image=cimg, text="")
+                imgs.append(cimg)
+            if imgs:
+                photo_row.pack(fill="x", pady=(0, 2), before=context_box)
+        except Exception as exc:
+            _debug_log(f"weigh-in photos skipped: {exc}")
+
+    def _on_row_select(meta: dict[str, Any] | None) -> None:
+        try:
+            from src.fight_context import build_fight_context, format_fight_context_lines
+
+            lines = format_fight_context_lines(build_fight_context(meta))
+            context_box.configure(text=_ascii_ui("\n".join(lines)))
+            if meta:
+                f1 = str(meta.get("fighter_1") or meta.get("fighter1") or "")
+                f2 = str(meta.get("fighter_2") or meta.get("fighter2") or "")
+                _set_photos(f1, f2)
+            else:
+                _set_photos("", "")
+        except Exception as exc:
+            context_box.configure(text=_ascii_ui(f"Context unavailable ({exc})"))
+            _set_photos("", "")
+
     if not multi:
-        tbl = DataTable(parent, height=table_height, compact=compact)
+        tbl = DataTable(
+            parent, height=table_height, compact=compact, on_row_select=_on_row_select
+        )
         tbl.pack(fill="both", expand=True)
         flat = _dedupe_fight_rows(preds)
         if cards:
-            flat = _preds_for_card(preds, cards[0].get("predictions", pd.DataFrame()), cards[0].get("event_name", ""))
-        tbl.load_rows(_rows_for_table(flat, bankroll, strategy, compact=compact, cleared_keys=cleared))
+            flat = _preds_for_card(
+                preds,
+                cards[0].get("predictions", pd.DataFrame()),
+                cards[0].get("event_name", ""),
+                strip_unmatched_odds=strip_unmatched_odds,
+            )
+            if (flat is None or flat.empty) and isinstance(
+                cards[0].get("predictions"), pd.DataFrame
+            ):
+                cp0 = cards[0]["predictions"]
+                if not cp0.empty:
+                    flat = (
+                        _strip_book_odds_columns(cp0)
+                        if strip_unmatched_odds
+                        else _dedupe_fight_rows(cp0)
+                    )
+        tbl.load_rows(
+            _rows_for_table(
+                flat, bankroll, strategy, compact=compact, cleared_keys=cleared
+            )
+        )
         return
 
     border_colors = ("#fbbf24", "#38bdf8", "#a78bfa", "#34d399")
@@ -1199,8 +1393,25 @@ def _render_grouped_fight_tables(
         ev = card.get("event_name") or f"Card {idx + 1}"
         header = _format_card_header(ev)
         cp = card.get("predictions", pd.DataFrame())
-        sub_df = _preds_for_card(preds, cp, ev)
-        matched_n = int(sub_df.get("odds_matched", pd.Series(False)).sum()) if "odds_matched" in sub_df.columns else 0
+        if not isinstance(cp, pd.DataFrame):
+            cp = pd.DataFrame()
+        sub_df = _preds_for_card(
+            preds, cp, ev, strip_unmatched_odds=strip_unmatched_odds
+        )
+        # Never leave a header-only section when the card payload has fights
+        if (sub_df is None or sub_df.empty) and not cp.empty:
+            sub_df = (
+                _strip_book_odds_columns(_dedupe_fight_rows(cp))
+                if strip_unmatched_odds
+                else _dedupe_fight_rows(cp)
+            )
+        matched_n = (
+            int(sub_df.get("odds_matched", pd.Series(False)).sum())
+            if isinstance(sub_df, pd.DataFrame)
+            and "odds_matched" in getattr(sub_df, "columns", [])
+            else 0
+        )
+        n_fights = len(sub_df) if isinstance(sub_df, pd.DataFrame) else 0
         border = border_colors[idx % len(border_colors)]
         section = ctk.CTkFrame(
             parent,
@@ -1210,19 +1421,32 @@ def _render_grouped_fight_tables(
             border_color=border,
         )
         section.pack(fill="x", padx=6, pady=(10 if idx else 4, 6))
+        status = (
+            f"{header}  -  {n_fights} fights  |  {matched_n} with book odds"
+            if n_fights
+            else f"{header}  -  0 fights (card unavailable — Refresh Next Two)"
+        )
         ctk.CTkLabel(
             section,
-            text=f"{header}  -  {len(sub_df)} fights  |  {matched_n} with book odds",
+            text=_ascii_ui(status),
             font=ctk.CTkFont(size=15, weight="bold"),
             anchor="w",
             text_color=border,
         ).pack(fill="x", padx=12, pady=(10, 4))
-        sub = DataTable(section, height=table_height, compact=compact)
+        sub = DataTable(
+            section, height=table_height, compact=compact, on_row_select=_on_row_select
+        )
         sub.pack(fill="x", padx=8, pady=(0, 10))
         sub.load_rows(
-            _rows_for_table(sub_df, bankroll, strategy, compact=compact, cleared_keys=cleared)
+            _rows_for_table(
+                sub_df if isinstance(sub_df, pd.DataFrame) else pd.DataFrame(),
+                bankroll,
+                strategy,
+                compact=compact,
+                cleared_keys=cleared,
+            )
         )
-        _debug_log(f"  Card section {idx}: {ev!r} -> {len(sub_df)} rows")
+        _debug_log(f"  Card section {idx}: {ev!r} -> {n_fights} rows")
 
 
 # --- UI helpers ---------------------------------------------------------------
@@ -1498,12 +1722,22 @@ class DataTable(_CTK_FRAME):
     COMPACT_COLUMNS = ("Fight", "Pick", "Prob", "Odds", "Edge", "Book", "Kelly")
     _NUMERIC_COLS = frozenset({"Prob", "Odds", "Edge", "Kelly"})
 
-    def __init__(self, master, *, height: int = 12, compact: bool = False, **kwargs) -> None:
+    def __init__(
+        self,
+        master,
+        *,
+        height: int = 12,
+        compact: bool = False,
+        on_row_select: Callable[[dict[str, Any] | None], None] | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(master, **kwargs)
         self._compact = compact
+        self._on_row_select = on_row_select
         columns = self.COMPACT_COLUMNS if compact else self.COLUMNS
         self._columns = columns
         self._rows_data: list[tuple[tuple[Any, ...], tuple[str, ...]]] = []
+        self._row_meta: list[dict[str, Any] | None] = []
         self._sort_col: str | None = None
         self._sort_desc = True
         style = ttk.Style()
@@ -1587,6 +1821,24 @@ class DataTable(_CTK_FRAME):
         self.tree.tag_configure("even", background="#1a1f2e")
         self.tree.tag_configure("odd", background="#1e1e1e")
         self._bind_mousewheel()
+        self.tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+    def _on_tree_select(self, _event=None) -> None:
+        if self._on_row_select is None:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            self._on_row_select(None)
+            return
+        try:
+            idx = self.tree.index(sel[0])
+        except Exception:
+            self._on_row_select(None)
+            return
+        meta = None
+        if 0 <= idx < len(self._row_meta):
+            meta = self._row_meta[idx]
+        self._on_row_select(meta)
 
     def _bind_mousewheel(self) -> None:
         def _on_wheel(event) -> None:
@@ -1594,7 +1846,12 @@ class DataTable(_CTK_FRAME):
                 self.tree.yview_scroll(int(-1 * (event.delta / 120)), "units")
 
         self.tree.bind("<MouseWheel>", _on_wheel)
+        # Focus tree for wheel while hovered; restore parent scroll on leave
         self.tree.bind("<Enter>", lambda _e: self.tree.focus_set())
+        self.tree.bind(
+            "<Leave>",
+            lambda _e: self.master.focus_set() if hasattr(self.master, "focus_set") else None,
+        )
 
     @staticmethod
     def _cell_sort_key(value: Any, *, numeric: bool) -> tuple[int, Any]:
@@ -1626,10 +1883,10 @@ class DataTable(_CTK_FRAME):
         for c in self._columns:
             label = str(c)
             if c == self._sort_col:
-                label = f"{c} {'▼' if self._sort_desc else '▲'}"
+                label = f"{c} {'v' if self._sort_desc else '^'}"
             self.tree.heading(
                 c,
-                text=label,
+                text=_ascii_ui(label),
                 anchor="w",
                 command=lambda col=c: self._on_heading_click(col),
             )
@@ -1641,27 +1898,32 @@ class DataTable(_CTK_FRAME):
         except Exception:
             pass
         rows = list(self._rows_data)
-        if self._sort_col and rows:
+        metas = list(self._row_meta) if self._row_meta else [None] * len(rows)
+        # Keep meta aligned with rows when sorting
+        paired = list(zip(rows, metas))
+        if self._sort_col and paired:
             try:
                 idx = list(self._columns).index(self._sort_col)
             except ValueError:
                 idx = -1
             if idx >= 0:
                 numeric = self._sort_col in self._NUMERIC_COLS
-                rows.sort(
+                paired.sort(
                     key=lambda item: self._cell_sort_key(
-                        item[0][idx] if idx < len(item[0]) else "",
+                        item[0][0][idx] if idx < len(item[0][0]) else "",
                         numeric=numeric,
                     ),
                     reverse=self._sort_desc,
                 )
-        for i, (values, tags) in enumerate(rows):
+        self._row_meta = [m for _, m in paired]
+        for i, ((values, tags), _meta) in enumerate(paired):
             raw = str(tags[0] if tags else "neutral").strip().lower()
             tier_tag = raw if raw.startswith("tier_") else (
-                f"tier_{raw}" if raw in {"blue", "green", "yellow", "red"} else raw
+                f"tier_{raw}"
+                if raw in {"blue", "sky_blue", "green", "yellow", "red"}
+                else raw
             )
             zebra = "even" if i % 2 == 0 else "odd"
-            # Zebra first, tier last — last tag wins overlapping options on Windows ttk.
             self.tree.insert(
                 "", "end", values=_ascii_row(values), tags=(zebra, tier_tag)
             )
@@ -1672,6 +1934,7 @@ class DataTable(_CTK_FRAME):
         except Exception:
             pass
         self._rows_data = []
+        self._row_meta = []
         empty_cols = 7 if self._compact else 9
         if not rows:
             self._sort_col = None
@@ -1686,19 +1949,22 @@ class DataTable(_CTK_FRAME):
             return
         for row in rows:
             tier = "neutral"
+            meta = None
             if isinstance(row, dict):
                 values = tuple(row.get("values") or ())
                 tier = str(row.get("tier") or "neutral")
+                meta = row.get("row_meta")
             else:
                 values = tuple(row)
                 edge_txt = values[4] if len(values) > 4 else ""
-                if edge_txt not in ("-", ""):
+                if edge_txt not in ("-", "—", ""):
                     try:
                         edge_v = float(str(edge_txt).replace("%", "").replace("+", ""))
                         tier = "green" if edge_v > 0 else "red"
                     except ValueError:
                         pass
             self._rows_data.append((values, (tier,)))
+            self._row_meta.append(meta if isinstance(meta, dict) else None)
         # Preserve caller order (color → edge → prob → fight). Only re-sort after
         # the user clicks a column header (_sort_col set).
         self._redraw_sorted()
@@ -1740,8 +2006,8 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         ctk.CTkLabel(
             title_block,
             text=(
-                "Blue = clears HA gates · Green = decent fun · "
-                "Yellow = caution · Red = don't bet"
+                "BET THIS (Blue) = sized $ · FUN ONLY (Green) = $0 lean · "
+                "CAUTION (Yellow) / DO NOT BET (Red)"
             ),
             font=ctk.CTkFont(size=11),
             text_color="#64748b",
@@ -1783,7 +2049,7 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
 
     def _pick_line_text(self, bet: dict[str, Any], rank: int) -> tuple[str, str]:
         """Return (display line, tier color) for one pick inside the shared bubble."""
-        from src.bet_tiers import TIER_COLORS, TIER_LABELS
+        from src.bet_tiers import TIER_COLORS, action_label_for_bet
 
         # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
         tier = str(bet.get("bet_tier") or "").strip().lower()
@@ -1801,19 +2067,14 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
             bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
         )
         edge_pct = float(bet.get("edge_pct") or 0)
-        tier_lbl = TIER_LABELS.get(tier, tier).upper()
-        if bet.get("fun_bet") or tier in {"green", "yellow", "red"}:
-            money = "fun $0"
-        else:
-            money = _format_ticket_stake(bet)
-        line = (
-            f"#{rank}  [{tier_lbl}]  {label}  ·  {edge_pct:+.1f}%  ·  {money}"
-        )
+        action = action_label_for_bet({**bet, "bet_tier": tier})
+        line = f"#{rank}  {action}  ·  {label}  ·  {edge_pct:+.1f}%"
         return _ascii_ui(line), color
 
     def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
         """All top picks in a single bubble (colored lines, not separate cards)."""
         from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
+        from src.bet_tiers import format_tier_legend, format_what_to_do_header
 
         bets = dedupe_rank_top_tickets(list(bets or []), limit=5)
         bubble = ctk.CTkFrame(
@@ -1831,6 +2092,15 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
             text_color="#f8fafc",
             anchor="w",
         ).pack(fill="x", padx=14, pady=(12, 4))
+        ctk.CTkLabel(
+            bubble,
+            text=_ascii_ui(format_what_to_do_header(slip=bets)),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#fde68a",
+            anchor="w",
+            justify="left",
+            wraplength=900,
+        ).pack(fill="x", padx=14, pady=(0, 6))
 
         for bet in bets:
             rank = int(bet.get("rank") or 0) or (bets.index(bet) + 1)
@@ -1847,10 +2117,12 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
 
         ctk.CTkLabel(
             bubble,
-            text="Blue sized · Green/Yellow fun $0 · Red don't bet",
+            text=format_tier_legend(),
             font=ctk.CTkFont(size=10),
             text_color="#64748b",
             anchor="w",
+            justify="left",
+            wraplength=900,
         ).pack(fill="x", padx=14, pady=(6, 12))
 
     def render(
@@ -2428,8 +2700,8 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 )
             if result.get("no_bet") and not actionable:
                 self._pack_message(
-                    "NO BET (sized)",
-                    "No HA-sized tickets this card — colored fun picks above are $0 research only.",
+                    "Sized bankroll",
+                    "WHAT TO BET (sized): NONE. Any Green lines above are FUN ONLY ($0) — not bankroll tickets.",
                     color="#fbbf24",
                     title_size=12,
                 )
@@ -2561,7 +2833,13 @@ class GrokAnalysisPanel(_CTK_FRAME):
     def _render_bet_slip_bubble(self, slip: list[dict[str, Any]]) -> None:
         """All recommended picks in one bubble (tier-colored lines)."""
         from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
-        from src.bet_tiers import TIER_COLORS, TIER_LABELS, format_tier_legend
+        from src.bet_tiers import (
+            TIER_COLORS,
+            TIER_LABELS,
+            action_label_for_bet,
+            format_tier_legend,
+            format_what_to_do_header,
+        )
 
         # Fail-safe: never show duplicates / >5 even if upstream missed a merge
         slip = dedupe_rank_top_tickets(list(slip or []), limit=5)
@@ -2583,10 +2861,21 @@ class GrokAnalysisPanel(_CTK_FRAME):
         ).pack(fill="x", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             bubble,
+            text=_ascii_ui(format_what_to_do_header(slip=slip)),
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#fde68a",
+            anchor="w",
+            justify="left",
+            wraplength=980,
+        ).pack(fill="x", padx=12, pady=(0, 4))
+        ctk.CTkLabel(
+            bubble,
             text=format_tier_legend(),
             font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
             anchor="w",
+            justify="left",
+            wraplength=980,
         ).pack(fill="x", padx=12, pady=(0, 8))
 
         for i, bet in enumerate(slip, start=1):
@@ -2594,8 +2883,6 @@ class GrokAnalysisPanel(_CTK_FRAME):
             side = str(bet.get("side") or bet.get("pick_line") or bet.get("pick") or "—")
             market = str(bet.get("market") or "moneyline")
             book = str(bet.get("book") or "n/a")
-            pct = float(bet.get("stake_pct") or 0)
-            dollars = float(bet.get("stake_usd") or 0)
             edge = bet.get("edge_pct")
             if edge is None and bet.get("edge") is not None:
                 try:
@@ -2603,6 +2890,7 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 except (TypeError, ValueError):
                     edge = None
             bet_tier = str(bet.get("bet_tier") or "").strip().lower()
+            dollars = float(bet.get("stake_usd") or 0)
             if bet_tier not in TIER_COLORS:
                 if bet.get("fun_bet") or bet.get("advisory"):
                     bet_tier = "green"
@@ -2611,19 +2899,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 else:
                     bet_tier = "yellow"
             color = TIER_COLORS.get(bet_tier, "#e2e8f0")
-            tier_lbl = TIER_LABELS.get(bet_tier, bet_tier).upper()
-            if bet.get("fun_bet") or bet_tier in {"green", "yellow"}:
-                money = "fun $0"
-            elif bet.get("advisory"):
-                money = "research $0"
-            else:
-                money = f"{pct:.1f}% · ${dollars:.2f}"
-                if bet_tier == "sky_blue" or str(bet.get("uncertainty_reason") or "") == "paper_wide_override":
-                    money = f"{money} · paper_wide_override"
+            action = action_label_for_bet({**bet, "bet_tier": bet_tier})
             edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
             line = (
-                f"#{rank}  [{tier_lbl}]  {side}  ·  {market} @ {book}  ·  "
-                f"edge {edge_s}  ·  {money}"
+                f"#{rank}  {action}  ·  {side}  ·  {market} @ {book}  ·  edge {edge_s}"
             )
             ctk.CTkLabel(
                 bubble,
@@ -2704,17 +2983,14 @@ class BookTab(_CTK_FRAME):
             text_color="#93c5fd",
         )
         self.stake_box.pack_forget()
-        self.fights_area = ctk.CTkScrollableFrame(
+        self.fights_area = ctk.CTkFrame(
             self.page,
-            label_text="Fights",
             fg_color="transparent",
-            height=320,
         )
         self.fights_area.pack(fill="x", expand=False, padx=10, pady=2)
-        self.bets_frame = ctk.CTkScrollableFrame(
+        self.bets_frame = ctk.CTkFrame(
             self.page,
-            height=200,
-            label_text="Singles & parlays",
+            fg_color="transparent",
         )
         self.bets_frame.pack(fill="x", expand=False, padx=10, pady=(2, 8))
 
@@ -2925,6 +3201,7 @@ class BookTab(_CTK_FRAME):
             compact=True,
             table_height=11,
             payload=payload_stub,
+            strip_unmatched_odds=True,
         )
 
         for w in list(self.bets_frame.winfo_children()):
@@ -2963,9 +3240,9 @@ class BookTab(_CTK_FRAME):
 
 
 class PropsTable(_CTK_FRAME):
-    """Prop singles table: type+fight, fighter, book odds, edge, budget-scaled stake."""
+    """Prop singles table: type+fight, fighter, odds, source, edge, min bet $."""
 
-    COLUMNS = ("Prop Type", "Fighter", "Odds", "Edge", "Min Bet")
+    COLUMNS = ("Prop Type", "Fighter", "Odds", "Source", "Edge", "Min Bet")
     _NUMERIC_COLS = frozenset({"Odds", "Edge", "Min Bet"})
 
     def __init__(self, master, *, height: int = 14, book_name: str = "", **kwargs) -> None:
@@ -2998,7 +3275,7 @@ class PropsTable(_CTK_FRAME):
             height=height,
             style="Props.Treeview",
         )
-        widths = (280, 130, 120, 88, 108)
+        widths = (260, 120, 110, 88, 88, 100)
         for col, w in zip(self.COLUMNS, widths):
             self.tree.heading(
                 col,
@@ -3007,7 +3284,7 @@ class PropsTable(_CTK_FRAME):
                 command=lambda c=col: self._on_heading_click(c),
             )
             stretch = col == "Prop Type"
-            self.tree.column(col, width=w, minwidth=56, anchor="w", stretch=stretch)
+            self.tree.column(col, width=w, minwidth=52, anchor="w", stretch=stretch)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.grid(row=0, column=0, sticky="nsew")
@@ -3017,13 +3294,16 @@ class PropsTable(_CTK_FRAME):
         self.tree.tag_configure("pos", foreground="#34d399")
         self.tree.tag_configure("neg", foreground="#f87171")
         self.tree.tag_configure("neutral", foreground="#b0b0b0")
-        # Synthetic / relaxed = slate (not amber/orange — that looked like a 5th bet tier)
         self.tree.tag_configure("synth", foreground="#94a3b8")
         self.tree.tag_configure("relaxed", foreground="#94a3b8")
         self.tree.tag_configure("even", background="#1a1f2e")
         self.tree.tag_configure("odd", background="#1e1e1e")
         self.tree.bind("<MouseWheel>", self._on_wheel)
         self.tree.bind("<Enter>", lambda _e: self.tree.focus_set())
+        self.tree.bind(
+            "<Leave>",
+            lambda _e: self.master.focus_set() if hasattr(self.master, "focus_set") else None,
+        )
 
     def _on_wheel(self, event) -> None:
         if event.delta:
@@ -3041,10 +3321,10 @@ class PropsTable(_CTK_FRAME):
         for c in self.COLUMNS:
             label = str(c)
             if c == self._sort_col:
-                label = f"{c} {'▼' if self._sort_desc else '▲'}"
+                label = f"{c} {'v' if self._sort_desc else '^'}"
             self.tree.heading(
                 c,
-                text=label,
+                text=_ascii_ui(label),
                 anchor="w",
                 command=lambda col=c: self._on_heading_click(col),
             )
@@ -3078,14 +3358,18 @@ class PropsTable(_CTK_FRAME):
 
         dec = float(s.get("odds", 0) or 0)
         if dec <= 1:
-            return "-"
-        source = str(s.get("odds_source", "synthetic")).lower()
+            return "—"
         am = decimal_to_american(dec)
+        return f"{am} ({dec:.2f})"
+
+    @staticmethod
+    def _format_source(s: dict[str, Any]) -> str:
+        source = str(
+            s.get("source_label") or s.get("odds_source") or "synthetic"
+        ).strip().lower()
         if source in {"live", "the_odds_api"}:
-            tag = "Odds API" if source == "the_odds_api" else "Live"
-            return f"{am} ({dec:.2f}) {tag}"
-        model_p = float(s.get("prob", 0) or 0)
-        return f"{am} ({dec:.2f}) {model_p:.0%} model"
+            return "Odds API" if source == "the_odds_api" else "Live"
+        return "Synthetic"
 
     def load_singles(self, singles: list[dict[str, Any]]) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -3096,7 +3380,7 @@ class PropsTable(_CTK_FRAME):
             self.tree.insert(
                 "",
                 "end",
-                values=_ascii_row(("No props match current filters", "-", "-", "-", "-")),
+                values=_ascii_row(("No props match current filters", "-", "—", "—", "—", "—")),
                 tags=("neutral", "even"),
             )
             return
@@ -3115,26 +3399,42 @@ class PropsTable(_CTK_FRAME):
                 fighter = "-"
 
             source = str(s.get("odds_source", "synthetic")).lower()
+            source_txt = self._format_source(s)
             edge_pct = s.get("edge_pct")
-            if edge_pct is not None:
-                edge_txt = f"{float(edge_pct):+.1f}% live"
-                edge_tag = "pos" if float(edge_pct) > 0 else "neg" if float(edge_pct) < 0 else "neutral"
-            elif source == "synthetic":
+            edge_txt = "—"
+            edge_tag = "neutral"
+            # Live edge only when live odds exist — never invent edge on synthetic
+            if source in {"live", "the_odds_api"} and edge_pct is not None:
+                try:
+                    ep = float(edge_pct)
+                    if abs(ep) <= 1.0:
+                        ep = ep * 100.0
+                    if abs(ep) > _MAX_DISPLAY_EDGE * 100.0:
+                        edge_txt = "—"
+                        edge_tag = "neutral"
+                    else:
+                        edge_txt = f"{ep:+.1f}%"
+                        edge_tag = (
+                            "pos" if ep > 0 else "neg" if ep < 0 else "neutral"
+                        )
+                except (TypeError, ValueError):
+                    edge_txt = "—"
+            elif source not in {"live", "the_odds_api"}:
                 edge_txt = f"{float(s.get('prob', 0)):.0%} model"
                 edge_tag = "synth"
-            else:
-                edge_txt = "-"
-                edge_tag = "neutral"
 
             if s.get("book_disabled"):
                 stake_txt = "Book off"
             else:
-                stake_txt = _format_ticket_stake(s)
+                stake_txt = _format_min_bet_plain(
+                    s.get("suggested_stake") or s.get("stake_usd") or 0
+                )
 
             row = (
                 prop_cell,
                 fighter,
                 self._format_odds(s, self.book_name),
+                source_txt,
                 edge_txt,
                 stake_txt,
             )
@@ -5422,16 +5722,15 @@ class UFCDashboardApp(_CTK_BASE):
         self.overview_risk_box.pack_forget()
         ctk.CTkLabel(
             self.overview_page,
-            text="All Fights - scroll the page or each card table",
+            text="All Fights - scroll this page (header stays put)",
             font=ctk.CTkFont(size=13, weight="bold"),
             anchor="w",
             text_color="#cbd5e1",
         ).pack(fill="x", padx=12, pady=(2, 2))
-        self.overview_fights_scroll = ctk.CTkScrollableFrame(
+        # Single page scroll — pack card sections directly (no nested scroll frame).
+        self.overview_fights_scroll = ctk.CTkFrame(
             self.overview_page,
-            label_text="Upcoming cards (closest first)",
             fg_color="#0f172a",
-            height=360,
         )
         self.overview_fights_scroll.pack(fill="x", padx=10, pady=(0, 6))
         self.top_bets_panel = TopRecommendedBetsPanel(self.overview_page)

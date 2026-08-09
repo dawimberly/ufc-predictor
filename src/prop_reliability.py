@@ -73,7 +73,7 @@ def _prop_keys() -> list[str]:
 
 
 def _vectorized_method_probs(features: pd.DataFrame) -> pd.DataFrame:
-    """Fast vectorized mirror of method_probs_from_row."""
+    """Fast vectorized mirror of method_probs_from_row (L5 + decision_finish_share)."""
     f1_ko = _clip_arr(_col(features, "f1_ko_rate", default=0.18).fillna(0.18).to_numpy(), 0.05, 0.55)
     f2_ko = _clip_arr(_col(features, "f2_ko_rate", default=0.18).fillna(0.18).to_numpy(), 0.05, 0.55)
     f1_sub = _clip_arr(
@@ -86,16 +86,10 @@ def _vectorized_method_probs(features: pd.DataFrame) -> pd.DataFrame:
         0.03,
         0.40,
     )
-    f1_finish = _clip_arr(
-        _col(features, "f1_finish_rate", default=0.45).fillna(0.45).to_numpy(),
-        0.10,
-        0.80,
-    )
-    f2_finish = _clip_arr(
-        _col(features, "f2_finish_rate", default=0.45).fillna(0.45).to_numpy(),
-        0.10,
-        0.80,
-    )
+    f1_finish_raw = _col(features, "f1_finish_rate_l5", "f1_finish_rate", default=0.45).fillna(0.45)
+    f2_finish_raw = _col(features, "f2_finish_rate_l5", "f2_finish_rate", default=0.45).fillna(0.45)
+    f1_finish = _clip_arr(f1_finish_raw.to_numpy(), 0.10, 0.80)
+    f2_finish = _clip_arr(f2_finish_raw.to_numpy(), 0.10, 0.80)
 
     ko_diff = _col(features, "ko_rate_diff", default=0.0).fillna(0.0).to_numpy()
     sub_diff = _col(features, "sub_avg_diff", default=0.0).fillna(0.0).to_numpy()
@@ -104,11 +98,52 @@ def _vectorized_method_probs(features: pd.DataFrame) -> pd.DataFrame:
     p_ko = _clip_arr(0.5 * (f1_ko + f2_ko) + 0.15 * ko_diff + 0.08 * striker_diff, 0.08, 0.62)
     p_sub = _clip_arr(0.5 * (f1_sub + f2_sub) + 0.12 * sub_diff, 0.05, 0.45)
     p_dec = _clip_arr(1.0 - p_ko - p_sub, 0.12, 0.75)
+
+    f1_share = _col(features, "f1_decision_finish_share_l5", "f1_decision_finish_share_career")
+    f2_share = _col(features, "f2_decision_finish_share_l5", "f2_decision_finish_share_career")
+    f1_dec_w = _col(features, "f1_dec_win_rate_l5", "f1_dec_win_rate_career")
+    f2_dec_w = _col(features, "f2_dec_win_rate_l5", "f2_dec_win_rate_career")
+    f1_dec_l = _col(features, "f1_dec_loss_rate_l5", "f1_dec_loss_rate_career")
+    f2_dec_l = _col(features, "f2_dec_loss_rate_l5", "f2_dec_loss_rate_career")
+
+    dec_tilt = np.zeros(len(features), dtype=float)
+    share_mean = np.nanmean(np.vstack([f1_share.to_numpy(), f2_share.to_numpy()]), axis=0)
+    dec_w_mean = np.nanmean(np.vstack([f1_dec_w.to_numpy(), f2_dec_w.to_numpy()]), axis=0)
+    dec_l_mean = np.nanmean(np.vstack([f1_dec_l.to_numpy(), f2_dec_l.to_numpy()]), axis=0)
+    share_ok = np.isfinite(share_mean)
+    dec_w_ok = np.isfinite(dec_w_mean)
+    dec_l_ok = np.isfinite(dec_l_mean)
+    dec_tilt = np.where(share_ok, dec_tilt + 0.18 * (share_mean - 0.45), dec_tilt)
+    dec_tilt = np.where(dec_w_ok, dec_tilt + 0.10 * (dec_w_mean - 0.40), dec_tilt)
+    dec_tilt = np.where(dec_l_ok, dec_tilt + 0.06 * (dec_l_mean - 0.25), dec_tilt)
+
+    p_dec = _clip_arr(p_dec + dec_tilt, 0.12, 0.78)
+    finish_mass = np.maximum(1e-6, p_ko + p_sub)
+    scale = np.maximum(0.05, 1.0 - p_dec) / finish_mass
+    p_ko = p_ko * scale
+    p_sub = p_sub * scale
     total = p_ko + p_sub + p_dec
     p_ko, p_sub, p_dec = p_ko / total, p_sub / total, p_dec / total
 
+    f1_r1 = _col(features, "f1_r1_finish_rate_l5", "f1_r1_finish_rate_career")
+    f2_r1 = _col(features, "f2_r1_finish_rate_l5", "f2_r1_finish_rate_career")
     avg_finish = 0.5 * (f1_finish + f2_finish)
-    p_r1 = _clip_arr(avg_finish * 0.58 * (1.0 + 0.25 * np.abs(ko_diff)), 0.08, 0.55)
+    r1_fallback = avg_finish * 0.55
+    r1_f1 = np.where(f1_r1.notna().to_numpy(), f1_r1.fillna(0).to_numpy(), r1_fallback)
+    r1_f2 = np.where(f2_r1.notna().to_numpy(), f2_r1.fillna(0).to_numpy(), r1_fallback)
+    has_r1 = f1_r1.notna().to_numpy() | f2_r1.notna().to_numpy()
+    tilt_shrink = 1.0 - 0.35 * np.maximum(0.0, dec_tilt)
+    p_r1_from_rates = _clip_arr(
+        0.5 * (r1_f1 + r1_f2) * (1.0 + 0.20 * np.abs(ko_diff)) * tilt_shrink,
+        0.08,
+        0.55,
+    )
+    p_r1_legacy = _clip_arr(
+        avg_finish * 0.58 * (1.0 + 0.25 * np.abs(ko_diff)) * tilt_shrink,
+        0.08,
+        0.55,
+    )
+    p_r1 = np.where(has_r1, p_r1_from_rates, p_r1_legacy)
     p_over_15 = _clip_arr(1.0 - p_r1, 0.25, 0.92)
     p_under_15 = _clip_arr(1.0 - p_over_15, 0.08, 0.75)
     p_finish = _clip_arr(p_ko + p_sub, 0.15, 0.88)
@@ -169,10 +204,10 @@ def _vectorized_actuals(features: pd.DataFrame) -> pd.DataFrame:
         actual_f1 = actual_f1.where(~miss, np.where(winner.eq(f1), 1.0, np.where(winner.eq(f2), 0.0, np.nan)))
 
     p1 = _col(features, "prob_f1_win", "predicted_prob", default=0.5).fillna(0.5)
-    pick_f1 = p1 >= 0.5
-    # Prefer actual winner for pick_side when known (settle_prop behavior)
-    has_w = winner.ne("")
-    pick_f1 = np.where(has_w & winner.eq(f1), True, np.where(has_w & winner.eq(f2), False, pick_f1))
+    p2_raw = _col(features, "prob_f2_win")
+    p2 = np.where(p2_raw.notna().to_numpy(), p2_raw.fillna(0).to_numpy(), 1.0 - p1.to_numpy())
+    # Model pick only (matches settle_prop — no actual-winner leak)
+    pick_f1 = p1.to_numpy() >= p2
 
     pick_won = np.where(
         pick_f1,
