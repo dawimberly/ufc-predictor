@@ -9,6 +9,8 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 - **2026-08-11** — Empty-book odds: fixed `UnboundLocalError` in book odds merge that blanked all books; Soft Update / Quick Odds restore matched lines. See `data/reports/odds_empty_incident.md`.
 - **2026-08-11** — Sky Blue on Odds API / MyBookie fight tables now matches Ollama (Kelly `paper_wide_override` status is parsed for color).
 
+Every **Commit** (UI or CLI) auto-appends a **Recent changes** bullet from the commit subject and **pushes `origin`** (personal + Infinite Robots push URLs). Skip with `[skip-readme]` / `[no-push]` in the message, or `SKIP_README_HOOK=1` / `SKIP_AUTO_PUSH=1`.
+
 ## Project layout
 
 ```
@@ -270,10 +272,6 @@ Prefer `START_DASHBOARD.bat` / Python day-to-day. Frozen builds may hit PyArrow 
 - **BET THIS (Deep Blue / Sky Blue) = money tickets** — FUN ONLY / Yellow / Red never get HA stake
 - **Sky Blue caps** — 1% bankroll + max 2 override singles/card
 - **Ollama clarity** — sized NO BET vs FUN ONLY leans stated up front
-- **Daily loss circuit breaker** — `src/circuit_breaker.py`
-- **Peak drawdown halt** — `risk_manager.DrawdownHalt`
-- **Alert cooldown + fingerprint dedup**
-- **Dry-run** — `ALERT_DRY_RUN=true` or `--dry-run`
 
 ## Configuration
 
@@ -319,7 +317,3 @@ Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top 
 
 ## Design notes
 
-- **Leakage-safe features**: rolling stats use only prior fights.
-- **No paid odds required**: Odds API free tier + optional scrapers.
-- **Credit-safe by default**: `ODDS_FETCH_ONCE` + fail-closed without usable lines.
-- **Separate from PythonTrading**: no merge with the Alpaca stock bot.

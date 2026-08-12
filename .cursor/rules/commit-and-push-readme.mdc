@@ -1,20 +1,15 @@
 ---
-description: On commit and push, update README and push to both remotes
+description: Commit button auto-updates README and pushes both remotes via git hooks
 alwaysApply: true
 ---
 
-# Commit + push includes README (both remotes)
+# Commit = README + both remotes (git hooks)
 
-When the user asks to **commit**, **commit and push**, or **push** changes from agent work:
+This repo uses `.githooks` (`core.hooksPath=.githooks`):
 
-1. **Update `README.md` first** with a short, accurate note on what changed (user-facing behavior, ops, or config — not a dump of every file). Prefer editing the **Recent changes** section (newest first, keep ≤8 bullets). Touch other README sections only if the change makes existing docs wrong.
-2. **Stage README with the code** and create **one** commit that includes both (unless the user asked for separate commits).
-3. **Push to both remotes** when they asked to push:
-   - `origin` → https://github.com/dawimberly/ufc-predictor.git (personal)
-   - `infinite-robots` → https://github.com/infinite-robots/ufc-predictor.git
-   - Push the current branch to `origin`, then the same branch (or the ref they named) to `infinite-robots`.
-   - Follow usual git safety rules (no force to main/master unless explicitly requested).
+1. **prepare-commit-msg** — prepends a **Recent changes** bullet from the commit subject into `README.md` and stages it.
+2. **post-commit** — `git push -u origin HEAD` (origin has two push URLs: personal + Infinite Robots).
 
-Skip the README bump only when the user says so, or when the change is docs-only trivial / no user-visible or ops impact.
+Agent commits should still write a clear subject (that becomes the README bullet). Prefer editing README body yourself for big doc changes; the hook only adds the dated bullet.
 
-Do not invent features in the README. Do not retrain, change `FEATURE_COLUMNS`, or touch trading-bot from this rule.
+Escape hatches: `[skip-readme]`, `[no-push]`, `SKIP_README_HOOK=1`, `SKIP_AUTO_PUSH=1`.
