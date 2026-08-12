@@ -4,6 +4,11 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 **Repos:** [dawimberly/ufc-predictor](https://github.com/dawimberly/ufc-predictor) · [infinite-robots/ufc-predictor](https://github.com/infinite-robots/ufc-predictor) (private)
 
+## Recent changes
+
+- **2026-08-11** — Empty-book odds: fixed `UnboundLocalError` in book odds merge that blanked all books; Soft Update / Quick Odds restore matched lines. See `data/reports/odds_empty_incident.md`.
+- **2026-08-11** — Sky Blue on Odds API / MyBookie fight tables now matches Ollama (Kelly `paper_wide_override` status is parsed for color).
+
 ## Project layout
 
 ```
@@ -131,7 +136,7 @@ Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `X
 
 ### Context strip (display only)
 
-Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Controversial methods / decision-profile / home-country / pathway A/Bs are **DROP** for production features; leave those flags off unless a keep rule is re-run and passes.
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Always-on strip lines: market implied + Disagree; decision profile / judges when known. DROP research blocks (pathway, market, home, local, judge-geo, decision-profile, overseas, controversy) stay out of production features — see `data/reports/research_keep_drop.md`.
 
 ## Odds sources
 
@@ -174,19 +179,38 @@ Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Bl
 | `no_odds` | No matched / usable price |
 | `min_edge` | Edge below profile floor |
 
+## Production features & Soft Update
+
+**Production model** = **HV features** (`ENABLE_HIGH_VALUE_FEATURES=true`) + **HA uncertainty gates**. Sized tickets only clear those gates (Deep Blue / Paper Sky Blue). Ledger: `data/reports/research_keep_drop.md`. Freeze snapshot: `data/reports/PRODUCTION_FREEZE.md`.
+
+**KEEP:** HV (+ gates). **DROP (flags default false):** pathway, market, home-country, local advantage, judge-geo (model), decision-profile, overseas travel, controversy. Do not flip `ADD_*` / `ENABLE_PATHWAY_*` / `ENABLE_MARKET_*` unless you re-run the A/B and the keep rule passes. Preflight warns (Live fails) if DROP flags are on.
+
+**Display-only extras** (not model features): fight context strip (market implied, Disagree, decision profile / judges when known), weigh-in photos, integrity badges, overseas notes, Ollama/Grok narrative, FUN ONLY greens.
+
+### Soft Update (canonical odds path)
+
+1. **Refresh Next Two** — load UFC.com cards + model predictions; with `ODDS_FETCH_ONCE=true`, first Odds API download is cached.
+2. **Soft Update** — reload `.env` + re-attach book moneylines/props from **cache** (no live Odds API burn while cache files exist). Soft-fail per book: missing lines stay blank (no fake −100% edges).
+3. Fresh live pull only when needed: **Quick Odds + Props**, or delete `data/cache/ufc_odds_api.csv` (+ prop once markers).
+4. After **code** changes: **Restart** (Soft Update does not reload Python modules).
+
+Evaluate-only 2025 check (no retrain):
+
+```bash
+python scripts/run_production_backtest_2025.py
+```
+
+Trading-bot Task Scheduler jobs are out of scope for this UFC repo — do not edit them here.
+
 ## Model features (HV)
 
-Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV.
-
-Helpers:
+Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV. Research A/B helpers stay available but are **not** part of the freeze path:
 
 ```bash
 python scripts/ab_high_value_features.py
 python scripts/productionize_hv_features.py
-python scripts/rescore_2025_upset.py
-python scripts/upset_autopsy_backtest.py
+python scripts/run_production_backtest_2025.py
 ```
-
 ## CLI
 
 ```bash

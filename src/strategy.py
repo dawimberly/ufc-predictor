@@ -2118,6 +2118,7 @@ def sanitize_decimal_odds(val: Any) -> float | None:
 
 
 MAX_ACTIONABLE_EDGE = 0.25  # 25% — filters bogus scraper edges (e.g. MyBookie glitches)
+SUSPECT_EDGE_FLAG = 0.25
 
 
 def edge_is_actionable(
@@ -2125,8 +2126,11 @@ def edge_is_actionable(
     *,
     decimal_odds: float | None = None,
     model_prob: float | None = None,
+    edge_suspect: bool = False,
 ) -> bool:
     """Drop absurd edges that usually mean bad odds merges, not real value."""
+    if edge_suspect:
+        return False
     if edge <= 0 or edge > MAX_ACTIONABLE_EDGE:
         return False
     if decimal_odds is not None and decimal_odds > 1.0 and model_prob is not None:
@@ -2184,7 +2188,12 @@ def aggregate_top_recommended_bets(
             dec = decimal_odds_for_pick(row, pick) if row is not None else None
             prob_val = single.get("prob")
             prob_f = float(prob_val) if prob_val is not None else None
-            if not edge_is_actionable(edge, decimal_odds=dec, model_prob=prob_f):
+            if not edge_is_actionable(
+                edge,
+                decimal_odds=dec,
+                model_prob=prob_f,
+                edge_suspect=bool(row.get("edge_suspect")) if row is not None else False,
+            ):
                 continue
             confidence = str(single.get("confidence") or "").strip()
             if not confidence and row is not None:

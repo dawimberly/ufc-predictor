@@ -42,6 +42,24 @@ def _reload_config_flags() -> None:
     except Exception as exc:
         logger.warning("Odds API key reload failed: %s", exc)
     logger.info("ENABLE_PROPS loaded as: %s", config.ENABLE_PROPS)
+    _bn_sess = bool(str(getattr(config, "BETNOW_SESSION_TOKEN", "") or "").strip())
+    _bn_cookie_raw = str(getattr(config, "BETNOW_COOKIE", "") or "").strip()
+    try:
+        from src.odds_providers.odds_reliability import is_placeholder_auth
+
+        _bn_cookie_ok = bool(_bn_cookie_raw) and not is_placeholder_auth(_bn_cookie_raw)
+    except Exception:
+        _bn_cookie_ok = bool(_bn_cookie_raw) and "your_" not in _bn_cookie_raw.lower()
+    logger.info(
+        "odds_env books BETNOW_ENABLED=%s DRAFTKINGS_ENABLED=%s MYBOOKIE_ENABLED=%s "
+        "BETNOW_SESSION=%s BETNOW_COOKIE=%s ODDS_FETCH_ONCE=%s",
+        bool(getattr(config, "BETNOW_ENABLED", False)),
+        bool(getattr(config, "DRAFTKINGS_ENABLED", False)),
+        bool(getattr(config, "MYBOOKIE_ENABLED", False)),
+        "set" if _bn_sess else "empty",
+        "set" if _bn_cookie_ok else ("placeholder" if _bn_cookie_raw else "empty"),
+        bool(getattr(config, "ODDS_FETCH_ONCE", True)),
+    )
 
 
 ProgressFn = Callable[[str, float | None], None]
@@ -346,7 +364,30 @@ def _load_book_odds(
                     )
                     matched = int(merged.get("odds_matched", pd.Series(False)).sum())
         if book_name == "BetNow.eu" and matched == 0:
-            raise ValueError("BetNow scraper returned no matched fights")
+            auth_mode = str(getattr(mod, "LAST_AUTH_MODE", "") or "empty")
+            warn = (
+                f"BetNow unavailable — no matched lines "
+                f"(auth_mode={auth_mode}; session/public empty or name mismatch)."
+            )
+            from src.odds_providers.odds_reliability import log_book_status
+
+            log_book_status(
+                "BetNow.eu",
+                mode=auth_mode,
+                matched=0,
+                total=len(combined),
+                warning=warn,
+            )
+            return {
+                "predictions": merged,
+                "alerts": {},
+                "odds_matched": 0,
+                "odds_total": len(combined),
+                "error": "",
+                "warning": warn,
+                "source": "BetNow.eu",
+                "props": props_payload,
+            }
         if book_name == "DraftKings":
             dk_warn = str(getattr(mod, "LAST_WARNING", "") or "").strip()
             if dk_warn:
@@ -354,9 +395,81 @@ def _load_book_odds(
                 if "consensus" in dk_warn.lower():
                     source = "Consensus (DraftKings fallback)"
                 elif "betnow" in dk_warn.lower() or "mybookie" in dk_warn.lower():
-                    source = dk_warn.split("Using ")[-1].split(" odds")[0] if "Using " in dk_warn else "Book fallback"
+                    source = (
+                        dk_warn.split("Using ")[-1].split(" odds")[0]
+                        if "Using " in dk_warn
+                        else "Book fallback"
+                    )
                 elif "cached" in dk_warn.lower():
                     source = "DraftKings (cached)"
+            if matched == 0:
+                warn = warning or "DraftKings unavailable - check THE_ODDS_API_KEY"
+                from src.odds_providers.odds_reliability import log_book_status
+
+                log_book_status(
+                    "DraftKings",
+                    mode=str(getattr(mod, "LAST_SOURCE_MODE", "") or "empty"),
+                    matched=0,
+                    total=len(combined),
+                    warning=warn,
+                )
+                return {
+                    "predictions": merged,
+                    "alerts": {},
+                    "odds_matched": 0,
+                    "odds_total": len(combined),
+                    "error": "",
+                    "warning": warn,
+                    "source": source,
+                    "props": props_payload,
+                }
+        if book_name == "MyBookie":
+            mb_warn = str(getattr(mod, "LAST_WARNING", "") or "").strip()
+            mb_mode = str(getattr(mod, "LAST_SOURCE_MODE", "") or "")
+            cache_meta = getattr(mod, "LAST_CACHE_META", {}) or {}
+            if mb_warn:
+                warning = mb_warn
+            if mb_mode == "odds_api":
+                source = "MyBookie (Odds API fallback)"
+            elif mb_mode == "cache":
+                source = "MyBookie (cached)"
+                age = cache_meta.get("age_min")
+                if age is not None and not warning:
+                    warning = f"MyBookie cache age {float(age):.0f} min"
+            if matched == 0:
+                mb_rows = 0 if odds_df is None else len(odds_df)
+                if mb_rows > 0:
+                    warn = (
+                        warning
+                        or (
+                            f"MyBookie: {mb_rows} lines, 0 matched to loaded card "
+                            "(name_mismatch). Refresh Next Two if the card is stale."
+                        )
+                    )
+                else:
+                    warn = warning or (
+                        "MyBookie unavailable — no lines "
+                        "(scraper/API fail or empty cache)."
+                    )
+                from src.odds_providers.odds_reliability import log_book_status
+
+                log_book_status(
+                    "MyBookie",
+                    mode=mb_mode or "empty",
+                    matched=0,
+                    total=len(combined),
+                    warning=warn,
+                )
+                return {
+                    "predictions": merged,
+                    "alerts": {},
+                    "odds_matched": 0,
+                    "odds_total": len(combined),
+                    "error": "",
+                    "warning": warn,
+                    "source": source,
+                    "props": props_payload,
+                }
         if book_name == "Odds API":
             from src.predictor import LAST_ODDS_MATCH_META
             import src.odds_providers.odds_api_client as _odds_client
@@ -447,7 +560,7 @@ def _load_book_odds(
                     "status_line": status_line,
                 },
             }
-        if matched == 0 and book_name in ("DraftKings", "Consensus", "MyBookie"):
+        if matched == 0 and book_name in ("Consensus",):
             # Primary returned empty/unmatched — try full chain
             return _fallback_chain(ValueError(f"{book_name} matched 0 fights"))
     except Exception as exc:
@@ -466,8 +579,46 @@ def _load_book_odds(
                 "source": "the_odds_api",
                 "props": props_payload,
             }
+        # Soft-fail scrapers: keep card fights with blank odds (do not blank whole UI)
+        if book_name in ("BetNow.eu", "DraftKings", "MyBookie"):
+            from src.odds_providers.odds_reliability import harden_merged_odds_frame, log_book_status
+
+            # Use module-level merge_predictions_with_odds — a local import here
+            # makes Python treat the name as local for the whole function and
+            # raises UnboundLocalError on the happy path (all books 0 matched).
+            blank = merge_predictions_with_odds(
+                combined.copy(), pd.DataFrame(), fetch_if_missing=False
+            )
+            blank = harden_merged_odds_frame(blank)
+            warn = f"{book_name} unavailable ({exc}). Odds blank for this book — card kept."
+            log_book_status(
+                book_name,
+                mode="empty",
+                matched=0,
+                total=len(combined),
+                warning=warn,
+            )
+            return {
+                "predictions": blank,
+                "alerts": {},
+                "odds_matched": 0,
+                "odds_total": len(combined),
+                "error": "",
+                "warning": warn,
+                "source": book_name,
+                "props": props_payload,
+            }
         return _fallback_chain(exc)
 
+    from src.odds_providers.odds_reliability import log_book_status
+
+    log_book_status(
+        book_name,
+        mode=str(source or "live"),
+        matched=matched,
+        total=len(combined),
+        warning=warning,
+    )
     return {
         "predictions": merged,
         "alerts": _alerts_for(merged),
@@ -765,6 +916,29 @@ def run_quick_odds_refresh(
         books_filter=quick_filter,
         budget_state=budget_state,
     )
+    any_matched = False
+    for book_name, entry in books.items():
+        if book_name == "Overview":
+            continue
+        m = int(entry.get("odds_matched") or 0)
+        t = int(entry.get("odds_total") or 0)
+        warn = str(entry.get("warning") or entry.get("error") or "")
+        if m > 0:
+            any_matched = True
+        logger.info(
+            "odds_status book=%s | mode=%s | matched=%s/%s | warn=%s",
+            book_name,
+            entry.get("source") or mode,
+            m,
+            t,
+            (warn[:160] if warn else ""),
+        )
+    if not any_matched and len(base_preds) > 0:
+        logger.warning(
+            "Quick Odds: all active books matched 0/%s — check auth/key, "
+            "Refresh Next Two if card slate != odds cache, or book ENABLED flags",
+            len(base_preds),
+        )
     merged_by_book = {k: v["predictions"] for k, v in books.items() if k != "Overview" and "predictions" in v}
     overview = _pick_best_odds_overview(base_preds, merged_by_book)
     bankroll = bankroll_from_budget(budget_state)

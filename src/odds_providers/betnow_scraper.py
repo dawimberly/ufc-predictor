@@ -20,6 +20,12 @@ from src.odds_providers.prop_odds_common import (
     parse_american_odds,
     prop_row,
 )
+from src.odds_providers.odds_reliability import (
+    cache_freshness_meta,
+    log_book_status,
+    usable_cookie,
+    usable_session_token,
+)
 from src.predictor import OddsAPIError, _implied_probs, _names_match
 
 logger = logging.getLogger(__name__)
@@ -57,7 +63,8 @@ _PROP_LABEL_MAP: list[tuple[re.Pattern[str], str, str]] = [
 
 # Resolved once per scrape pass (env → page extract).
 _ACTIVE_SESSION_TOKEN: str | None = None
-_COOKIE_PLACEHOLDERS = frozenset({"", "your_cookie", "cookie", "changeme", "none", "null"})
+# Last scrape auth mode for dashboard / logs: cookie | session | public | cache | empty
+LAST_AUTH_MODE: str = ""
 
 
 def _cache_fresh(path: Any = None) -> bool:
@@ -71,19 +78,17 @@ def _cache_fresh(path: Any = None) -> bool:
 
 
 def _env_session_token() -> str:
-    """Prefer BETNOW_SESSION; also accept BETNOW_SESSION_TOKEN / SESSION_TOKEN."""
-    return (
+    """Prefer BETNOW_SESSION; never treat placeholders as real auth."""
+    raw = (
         (getattr(config, "BETNOW_SESSION_TOKEN", "") or "").strip()
         or (getattr(config, "SESSION_TOKEN", "") or "").strip()
     )
+    return usable_session_token(raw)
 
 
 def _env_cookie() -> str:
     """Return BETNOW_COOKIE when set to a real value (not a placeholder)."""
-    cookie = (getattr(config, "BETNOW_COOKIE", "") or "").strip()
-    if not cookie or cookie.lower() in _COOKIE_PLACEHOLDERS:
-        return ""
-    return cookie
+    return usable_cookie(getattr(config, "BETNOW_COOKIE", "") or "")
 
 
 def _mask_token(token: str) -> str:
@@ -195,14 +200,28 @@ def resolve_betnow_session_token(*, force_discover: bool = False) -> str:
     return token
 
 
+def _auth_mode(session_token: str, cookie: str, *, public: bool = False) -> str:
+    if public:
+        return "public"
+    if cookie:
+        return "cookie"
+    if session_token:
+        return "session"
+    return "public"
+
+
 def _log_auth_materials(
     session_token: str,
     cookie: str,
     *,
     url: str | None = None,
     cookie_header: str | None = None,
+    public: bool = False,
 ) -> None:
     """INFO log of exactly what auth material will be sent on the next request."""
+    global LAST_AUTH_MODE
+    mode = _auth_mode(session_token, cookie, public=public)
+    LAST_AUTH_MODE = mode
     sent_cookie = cookie_header if cookie_header is not None else cookie
     if not sent_cookie:
         cookie_desc = "(none — session query only)" if session_token else "(empty / not set)"
@@ -211,8 +230,9 @@ def _log_auth_materials(
     else:
         cookie_desc = f"Cookie: {_mask_cookie(sent_cookie)}"
     logger.info(
-        "BetNow auth -> session_token=%s | %s%s",
-        session_token if session_token else "(empty)",
+        "BetNow auth_mode=%s -> session_token=%s | %s%s",
+        mode,
+        _mask_token(session_token) if session_token else "(empty)",
         cookie_desc,
         f" | url={url}" if url else "",
     )
@@ -605,6 +625,7 @@ def _scrape_sportsbook_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]
       1. Session URLs (?session=BETNOW_SESSION) — cookie optional / empty OK
       2. Public URLs without session if auth returns nothing / login wall
     """
+    global LAST_AUTH_MODE
     session_token = resolve_betnow_session_token()
     cookie = _env_cookie()
     headers = _request_headers(log_auth=False, session_token=session_token)
@@ -621,11 +642,12 @@ def _scrape_sportsbook_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]
             )
             rows, props, last_url = _fetch_and_parse(url, headers, label="session")
             if rows or props:
+                LAST_AUTH_MODE = "cookie" if cookie else "session"
                 return rows, props, last_url
         logger.info(
             "BetNow session auth returned no odds - falling back to public pages "
             "(session=%s)",
-            session_token,
+            _mask_token(session_token),
         )
     else:
         logger.info("BetNow: no BETNOW_SESSION set — trying public pages only")
@@ -641,11 +663,14 @@ def _scrape_sportsbook_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]
             cookie,
             url=url,
             cookie_header=public_headers.get("Cookie", ""),
+            public=True,
         )
         rows, props, last_url = _fetch_and_parse(url, public_headers, label="public")
         if rows or props:
+            LAST_AUTH_MODE = "public"
             return rows, props, last_url
 
+    LAST_AUTH_MODE = "empty"
     return [], [], last_url
 
 
@@ -693,10 +718,19 @@ def _scrape_with_selenium() -> list[dict[str, Any]]:
 
 def fetch_betnow_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     """Scrape BetNow.eu UFC moneyline lines; cache to data/cache/betnow_odds.csv."""
+    global LAST_AUTH_MODE
     ensure_data_dirs()
     if not force_refresh and _cache_fresh(BETNOW_CACHE_PATH):
         cached = pd.read_csv(BETNOW_CACHE_PATH)
         if not cached.empty:
+            LAST_AUTH_MODE = "cache"
+            meta = cache_freshness_meta(BETNOW_CACHE_PATH)
+            log_book_status(
+                "BetNow.eu",
+                mode="cache",
+                matched=len(cached),
+                detail=f"age_min={meta.get('age_min'):.1f}" if meta.get("age_min") is not None else "",
+            )
             logger.info("Using cached BetNow odds (%s rows)", len(cached))
             return cached
 
@@ -708,6 +742,13 @@ def fetch_betnow_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         rows = _scrape_with_selenium()
 
     if not rows:
+        LAST_AUTH_MODE = "empty"
+        log_book_status(
+            "BetNow.eu",
+            mode="empty",
+            matched=0,
+            warning="session + public pages empty",
+        )
         raise OddsAPIError(
             "Could not scrape BetNow.eu UFC odds (session + public pages empty). "
             "Set BETNOW_SESSION in .env (cookie optional). Dashboard will fall back "
@@ -718,7 +759,18 @@ def fetch_betnow_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if "source_url" not in df.columns:
         df["source_url"] = source_url
     df.to_csv(BETNOW_CACHE_PATH, index=False)
-    logger.info("Scraped %s BetNow moneyline rows (source=%s)", len(df), source_url)
+    log_book_status(
+        "BetNow.eu",
+        mode=LAST_AUTH_MODE or "live",
+        matched=len(df),
+        detail=f"source={source_url}",
+    )
+    logger.info(
+        "Scraped %s BetNow moneyline rows (auth_mode=%s source=%s)",
+        len(df),
+        LAST_AUTH_MODE,
+        source_url,
+    )
     return df
 
 

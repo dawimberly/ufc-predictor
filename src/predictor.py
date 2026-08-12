@@ -129,7 +129,13 @@ def apply_style_calibration(
 
 
 def attach_edge_columns(preds: pd.DataFrame) -> pd.DataFrame:
-    """Compute model vs implied edge for both sides."""
+    """Compute model vs implied edge for both sides.
+
+    Skips unmatched / invalid odds so missing lines never become fake edges.
+    """
+    from src.odds_providers.odds_reliability import harden_merged_odds_frame
+    from src.strategy import sanitize_decimal_odds
+
     out = preds.copy()
     for col in ("edge_f1", "edge_f2", "edge_pct", "best_edge"):
         if col not in out.columns:
@@ -137,7 +143,10 @@ def attach_edge_columns(preds: pd.DataFrame) -> pd.DataFrame:
     if "best_edge_side" not in out.columns:
         out["best_edge_side"] = ""
 
+    has_matched = "odds_matched" in out.columns
     for idx, row in out.iterrows():
+        if has_matched and not bool(row.get("odds_matched")):
+            continue
         p1 = float(row.get("prob_f1_win", 0.5))
         p2 = float(row.get("prob_f2_win", 1.0 - p1))
         imp1 = imp2 = np.nan
@@ -147,14 +156,16 @@ def attach_edge_columns(preds: pd.DataFrame) -> pd.DataFrame:
         elif pd.notna(row.get("f1_odds")) and pd.notna(row.get("f2_odds")):
             from src.feature_engineering import decimal_odds_to_implied
 
+            f1o = sanitize_decimal_odds(row["f1_odds"])
+            f2o = sanitize_decimal_odds(row["f2_odds"])
+            if f1o is None or f2o is None:
+                continue
             imp1 = float(
-                decimal_odds_to_implied(
-                    pd.Series([row["f1_odds"]]), pd.Series([row["f2_odds"]])
-                ).iloc[0]
+                decimal_odds_to_implied(pd.Series([f1o]), pd.Series([f2o])).iloc[0]
             )
             imp2 = 1.0 - imp1
 
-        if np.isfinite(imp1):
+        if np.isfinite(imp1) and 0.0 < imp1 < 1.0:
             e1, e2 = p1 - imp1, p2 - imp2
             out.at[idx, "edge_f1"] = e1
             out.at[idx, "edge_f2"] = e2
@@ -165,7 +176,7 @@ def attach_edge_columns(preds: pd.DataFrame) -> pd.DataFrame:
             pick_f1 = p1 >= 0.5
             out.at[idx, "edge_pct"] = (e1 if pick_f1 else e2) * 100.0
 
-    return out
+    return harden_merged_odds_frame(out)
 
 
 def resolve_edge_thresholds(
@@ -236,9 +247,16 @@ def rank_predictions_by_edge(
     min_edge: float | None = None,
     ascending: bool = False,
 ) -> pd.DataFrame:
-    """Sort fights by best available edge (model_prob - implied_prob)."""
+    """Sort fights by best available edge (model_prob - implied_prob).
+
+    Unmatched / suspect edges are excluded from ranked tickets.
+    """
     work = attach_edge_columns(preds)
     edge_floor = config.EDGE_RANK_MIN if min_edge is None else min_edge
+    if "odds_matched" in work.columns:
+        work = work[work["odds_matched"].fillna(False).astype(bool)].copy()
+    if "edge_suspect" in work.columns:
+        work = work[~work["edge_suspect"].fillna(False).astype(bool)].copy()
     if "best_edge" in work.columns:
         work["rank_edge"] = work["best_edge"]
     else:
@@ -1035,6 +1053,20 @@ def merge_predictions_with_odds(
             out = predictions.copy()
             out["odds_matched"] = False
             out["odds_source"] = ""
+            out["odds_book"] = ""
+            for col in (
+                "f1_odds",
+                "f2_odds",
+                "implied_prob_f1",
+                "implied_prob_f2",
+                "edge_f1",
+                "edge_f2",
+                "edge_pct",
+                "best_edge",
+            ):
+                if col not in out.columns:
+                    out[col] = np.nan
+            out["edge_suspect"] = False
             LAST_ODDS_MATCH_META.clear()
             LAST_ODDS_MATCH_META.update(
                 {
@@ -1046,7 +1078,9 @@ def merge_predictions_with_odds(
                     "reason": "no_events",
                 }
             )
-            return out
+            from src.odds_providers.odds_reliability import harden_merged_odds_frame
+
+            return harden_merged_odds_frame(out)
         try:
             from src.odds_providers.odds_fallback import fetch_best_available_odds
 
@@ -1063,6 +1097,19 @@ def merge_predictions_with_odds(
             out["odds_source"] = ""
             out["odds_book"] = ""
             out["no_usable_odds"] = True
+            for col in (
+                "f1_odds",
+                "f2_odds",
+                "implied_prob_f1",
+                "implied_prob_f2",
+                "edge_f1",
+                "edge_f2",
+                "edge_pct",
+                "best_edge",
+            ):
+                if col not in out.columns:
+                    out[col] = np.nan
+            out["edge_suspect"] = False
             LAST_ODDS_MATCH_META.clear()
             LAST_ODDS_MATCH_META.update(
                 {
@@ -1074,7 +1121,9 @@ def merge_predictions_with_odds(
                     "reason": "no_events",
                 }
             )
-            return out
+            from src.odds_providers.odds_reliability import harden_merged_odds_frame
+
+            return harden_merged_odds_frame(out)
 
     out = predictions.copy()
     from src.strategy import sanitize_decimal_odds
@@ -1087,14 +1136,18 @@ def merge_predictions_with_odds(
         "edge_f1",
         "edge_f2",
         "edge_pct",
+        "best_edge",
         "best_edge_side",
         "bookmaker_count",
         "odds_matched",
         "odds_source",
         "odds_book",
+        "edge_suspect",
     ]
     for col in extra_cols:
         if col == "odds_matched":
+            out[col] = False
+        elif col == "edge_suspect":
             out[col] = False
         elif col in ("best_edge_side", "odds_source", "odds_book"):
             out[col] = pd.Series([None] * len(out), dtype=object, index=out.index)
@@ -1131,6 +1184,7 @@ def merge_predictions_with_odds(
         winner_is_f1 = model_p1 >= 0.5
         edge_pct = (edge_f1 if winner_is_f1 else edge_f2) * 100.0
         best_side = "f1" if edge_f1 >= edge_f2 else "f2"
+        best_edge = edge_f1 if best_side == "f1" else edge_f2
         src = str(
             match.get("odds_source")
             or match.get("bookmaker")
@@ -1145,6 +1199,7 @@ def merge_predictions_with_odds(
         out.at[idx, "edge_f1"] = edge_f1
         out.at[idx, "edge_f2"] = edge_f2
         out.at[idx, "edge_pct"] = edge_pct
+        out.at[idx, "best_edge"] = best_edge
         out.at[idx, "best_edge_side"] = best_side
         out.at[idx, "bookmaker_count"] = match.get("bookmaker_count", np.nan)
         out.at[idx, "odds_matched"] = True
@@ -1208,7 +1263,9 @@ def merge_predictions_with_odds(
             matched_n,
             len(out),
         )
-    return out
+    from src.odds_providers.odds_reliability import harden_merged_odds_frame
+
+    return harden_merged_odds_frame(out)
 
 
 def load_features(path: Path | str | None = None) -> pd.DataFrame:

@@ -1,0 +1,20 @@
+---
+description: On commit and push, update README and push to both remotes
+alwaysApply: true
+---
+
+# Commit + push includes README (both remotes)
+
+When the user asks to **commit**, **commit and push**, or **push** changes from agent work:
+
+1. **Update `README.md` first** with a short, accurate note on what changed (user-facing behavior, ops, or config — not a dump of every file). Prefer editing the **Recent changes** section (newest first, keep ≤8 bullets). Touch other README sections only if the change makes existing docs wrong.
+2. **Stage README with the code** and create **one** commit that includes both (unless the user asked for separate commits).
+3. **Push to both remotes** when they asked to push:
+   - `origin` → https://github.com/dawimberly/ufc-predictor.git (personal)
+   - `infinite-robots` → https://github.com/infinite-robots/ufc-predictor.git
+   - Push the current branch to `origin`, then the same branch (or the ref they named) to `infinite-robots`.
+   - Follow usual git safety rules (no force to main/master unless explicitly requested).
+
+Skip the README bump only when the user says so, or when the change is docs-only trivial / no user-visible or ops impact.
+
+Do not invent features in the README. Do not retrain, change `FEATURE_COLUMNS`, or touch trading-bot from this rule.

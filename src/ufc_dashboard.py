@@ -663,6 +663,8 @@ def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
     pick = str(row.get("predicted_winner", ""))
     if not _has_usable_odds(row):
         return None, pick or None
+    if bool(row.get("edge_suspect")):
+        return None, pick or None
     edge: float | None = None
     if pd.notna(row.get("edge_pct")):
         edge = float(row["edge_pct"]) / 100.0
@@ -901,6 +903,8 @@ def _rows_for_table(
         # Color from pick-side math + Kelly/status — never from opponent/fight string alone.
         # SKIP status forces non-blue even if clears_gates is somehow set.
         # Cap absurd edges so they do not paint Green/Blue from scrape glitches.
+        # classify_bet_tier parses stake % from Kelly text (e.g. paper_wide_override)
+        # so book tables match Ollama sky-blue tickets.
         edge_for_tier = float(edge) if edge is not None else None
         tier, reason = classify_bet_tier(
             row,
@@ -1018,7 +1022,26 @@ def _display_cards(
     payload: "DashboardPayload",
     preds: pd.DataFrame | None = None,
 ) -> list[dict[str, Any]]:
-    """Cards for grouped UI - payload.cards, else split preds/combined by event_name."""
+    """Cards for grouped UI - payload.cards, else split preds/combined by event_name.
+
+    Backfills empty card ``predictions`` from combined/preds so both upcoming
+    cards populate whenever the payload has rows for that event.
+    """
+    frame = preds if isinstance(preds, pd.DataFrame) and not preds.empty else payload.combined
+    if not isinstance(frame, pd.DataFrame):
+        frame = pd.DataFrame()
+
+    def _slice_event(ev: str) -> pd.DataFrame:
+        if frame.empty or not ev or "event_name" not in frame.columns:
+            return pd.DataFrame()
+        col = frame["event_name"].astype(str).str.strip()
+        exact = frame[col == ev]
+        if not exact.empty:
+            return exact
+        norm = _norm_event_name(ev)
+        fuzzy = frame[col.map(_norm_event_name) == norm]
+        return fuzzy if not fuzzy.empty else pd.DataFrame()
+
     seen: set[str] = set()
     cleaned: list[dict[str, Any]] = []
     for card in payload.cards or []:
@@ -1029,6 +1052,10 @@ def _display_cards(
         cp = card.get("predictions", pd.DataFrame())
         if not isinstance(cp, pd.DataFrame):
             cp = pd.DataFrame()
+        if cp.empty:
+            filled = _slice_event(ev)
+            if not filled.empty:
+                cp = filled
         cleaned.append(
             {
                 "event_name": ev,
@@ -1040,7 +1067,6 @@ def _display_cards(
     if len(cleaned) >= 2:
         return cleaned
 
-    frame = preds if isinstance(preds, pd.DataFrame) and not preds.empty else payload.combined
     if isinstance(frame, pd.DataFrame) and not frame.empty and "event_name" in frame.columns:
         order: list[str] = []
         for raw in frame["event_name"].dropna().astype(str):
@@ -1061,6 +1087,12 @@ def _display_cards(
     if len(cleaned) == 1 and isinstance(frame, pd.DataFrame) and not frame.empty:
         only = cleaned[0]
         ev = only.get("event_name", "")
+        if only.get("predictions") is None or (
+            isinstance(only.get("predictions"), pd.DataFrame) and only["predictions"].empty
+        ):
+            filled = _slice_event(str(ev))
+            if not filled.empty:
+                only = {**only, "predictions": filled}
         if "event_name" in frame.columns:
             groups = frame["event_name"].astype(str).str.strip().unique().tolist()
             groups = [g for g in groups if g and g != ev]
@@ -1079,19 +1111,33 @@ def _display_cards(
         if len(names) >= 2 and isinstance(frame, pd.DataFrame) and not frame.empty:
             out: list[dict[str, Any]] = []
             for name in names:
-                chunk = frame
-                if "event_name" in frame.columns:
+                chunk = _slice_event(name)
+                if chunk.empty and "event_name" in frame.columns:
                     exact = frame[frame["event_name"].astype(str).str.strip() == name]
                     if not exact.empty:
                         chunk = exact
                     else:
-                        key = _norm_event_name(name)
-                        chunk = frame[
-                            frame["event_name"].astype(str).map(_norm_event_name) == key
-                        ]
-                out.append({"event_name": name, "predictions": chunk})
-            if len(out) >= 2 and all(not c["predictions"].empty for c in out):
+                        chunk = frame
+                if not chunk.empty:
+                    out.append(
+                        {
+                            "event_name": name,
+                            "predictions": chunk if isinstance(chunk, pd.DataFrame) else pd.DataFrame(),
+                        }
+                    )
+            nonempty = [
+                c
+                for c in out
+                if isinstance(c.get("predictions"), pd.DataFrame) and not c["predictions"].empty
+            ]
+            if len(nonempty) >= 2:
+                return nonempty
+            if len(out) >= 2 and any(
+                isinstance(c.get("predictions"), pd.DataFrame) and not c["predictions"].empty
+                for c in out
+            ):
                 return out
+
     return cleaned if cleaned else list(payload.cards or [])
 
 
@@ -3157,11 +3203,18 @@ class BookTab(_CTK_FRAME):
             if rem is not None and str(rem) != "":
                 summary_line += f"  |  credits remaining={rem}"
         else:
-            summary_line = (
-                f"{source}  |  Odds {matched}/{total}  |  "
-                f"{len(alerts.get('singles') or [])} singles  |  "
-                f"{len(alerts.get('parlays') or [])} parlays"
-            )
+            if int(matched or 0) == 0:
+                summary_line = (
+                    f"{source}  |  no lines ({matched}/{total})  |  "
+                    f"{len(alerts.get('singles') or [])} singles  |  "
+                    f"{len(alerts.get('parlays') or [])} parlays"
+                )
+            else:
+                summary_line = (
+                    f"{source}  |  Odds {matched}/{total}  |  "
+                    f"{len(alerts.get('singles') or [])} singles  |  "
+                    f"{len(alerts.get('parlays') or [])} parlays"
+                )
 
         skipped_n = int(alerts.get("skipped_count") or len(alerts.get("skipped") or []))
         if skipped_n:
@@ -3363,13 +3416,20 @@ class PropsTable(_CTK_FRAME):
         return f"{am} ({dec:.2f})"
 
     @staticmethod
-    def _format_source(s: dict[str, Any]) -> str:
+    def _format_source(s: dict[str, Any], book_name: str = "") -> str:
         source = str(
             s.get("source_label") or s.get("odds_source") or "synthetic"
         ).strip().lower()
+        if source in {"synthetic", "", "model"}:
+            return "Synthetic"
+        # Props tab is book-scoped — never label another book's lines as this tab.
+        if book_name:
+            return str(book_name).replace(".eu", "")
         if source in {"live", "the_odds_api"}:
             return "Odds API" if source == "the_odds_api" else "Live"
-        return "Synthetic"
+        if source in {"mybookie", "draftkings", "betnow", "betnow.eu"}:
+            return source.replace("betnow.eu", "BetNow").title()
+        return source.title() if source else "Synthetic"
 
     def load_singles(self, singles: list[dict[str, Any]]) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -3399,7 +3459,7 @@ class PropsTable(_CTK_FRAME):
                 fighter = "-"
 
             source = str(s.get("odds_source", "synthetic")).lower()
-            source_txt = self._format_source(s)
+            source_txt = self._format_source(s, self.book_name)
             edge_pct = s.get("edge_pct")
             edge_txt = "—"
             edge_tag = "neutral"
@@ -4350,6 +4410,16 @@ class BookPropsTab(_CTK_FRAME):
                 ctk.CTkLabel(self.scroll, text=hdr, anchor="w", text_color="#60a5fa").pack(fill="x", padx=8)
                 for line in p.get("_leg_rows") or []:
                     ctk.CTkLabel(self.scroll, text=line, anchor="w").pack(fill="x", padx=16)
+        elif self.show_parlays and not config.BOOK_PROP_RULES.get(self.book_name, {}).get(
+            "allow_prop_parlays", False
+        ):
+            ctk.CTkLabel(
+                self.scroll,
+                text=f"{self.book_name}: prop singles only (parlays disabled by BOOK_PROP_RULES).",
+                anchor="w",
+                text_color="#94a3b8",
+                font=ctk.CTkFont(size=12),
+            ).pack(fill="x", padx=8, pady=(6, 0))
 
 
 def _apply_risk_warning_label(
@@ -7185,6 +7255,20 @@ class UFCDashboardApp(_CTK_BASE):
             data["odds_total"] = data.get("odds_total") or len(preds)
             return data
 
+        disabled_hint = ""
+        if book_key == "BetNow.eu" and not getattr(config, "BETNOW_ENABLED", False):
+            disabled_hint = (
+                "BetNow disabled — set BETNOW_ENABLED=true and BETNOW_SESSION "
+                "(or a real BETNOW_COOKIE) in .env"
+            )
+        elif book_key == "DraftKings" and not getattr(config, "DRAFTKINGS_ENABLED", False):
+            disabled_hint = (
+                "DraftKings disabled — set DRAFTKINGS_ENABLED=true "
+                "(uses THE_ODDS_API_KEY)"
+            )
+        elif book_key == "MyBookie" and not getattr(config, "MYBOOKIE_ENABLED", False):
+            disabled_hint = "MyBookie disabled — set MYBOOKIE_ENABLED=true in .env"
+
         model_only = _model_fights_from_payload(payload)
         if not model_only.empty:
             data = {
@@ -7194,8 +7278,13 @@ class UFCDashboardApp(_CTK_BASE):
                 "odds_matched": 0,
                 "warning": data.get("warning")
                 or data.get("error")
+                or disabled_hint
                 or f"No {book_key} odds loaded - click Quick Odds + Props or Refresh Props.",
             }
+        elif disabled_hint and not data.get("warning"):
+            data["warning"] = disabled_hint
+            data["odds_matched"] = 0
+            data["odds_total"] = 0
         return data
 
     def _render_books_section(self, payload: DashboardPayload) -> None:
@@ -7233,12 +7322,28 @@ class UFCDashboardApp(_CTK_BASE):
             return
         odds_api = payload.books.get("Odds API", {}).get("predictions", pd.DataFrame())
         dk = payload.books.get("DraftKings", {}).get("predictions", pd.DataFrame())
-        if isinstance(odds_api, pd.DataFrame) and not odds_api.empty:
+        # Prefer combined model card so both upcoming events populate when present;
+        # book frames still supply odds via _preds_for_card merge.
+        combined = _as_dataframe(payload.combined)
+        if not combined.empty:
+            book_preds = combined
+        elif isinstance(odds_api, pd.DataFrame) and not odds_api.empty:
             book_preds = odds_api
         elif isinstance(dk, pd.DataFrame) and not dk.empty:
             book_preds = dk
         else:
-            book_preds = _as_dataframe(payload.combined)
+            book_preds = combined
+        # Overlay Odds API odds onto combined rows when available (display only).
+        if (
+            isinstance(odds_api, pd.DataFrame)
+            and not odds_api.empty
+            and not combined.empty
+            and book_preds is combined
+        ):
+            try:
+                book_preds = _merge_fights_with_book_odds(combined, odds_api)
+            except Exception:
+                book_preds = combined
         display_cards = _display_cards(payload, book_preds)
         if len(display_cards) < 2:
             _debug_log(f"Next Two tab: only {len(display_cards)} card group(s) - run Refresh Next Two")

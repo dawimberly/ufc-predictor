@@ -12,6 +12,11 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
+from src.odds_providers.odds_reliability import (
+    cache_freshness_meta,
+    log_book_status,
+    usable_cookie,
+)
 from src.odds_providers.prop_odds_common import (
     american_to_decimal,
     empty_prop_odds_df,
@@ -28,6 +33,11 @@ MYBOOKIE_UFC_URL = config.MYBOOKIE_UFC_URL
 MYBOOKIE_PROPS_URL = config.MYBOOKIE_PROPS_URL
 MYBOOKIE_URLS = [MYBOOKIE_UFC_URL, "https://www.mybookie.ag/sportsbook/mma/"]
 _ODDS_API_BOOK_KEY = "mybookieag"
+
+# Soft-fail status for UI / logs (scraper | odds_api | cache | empty)
+LAST_SOURCE_MODE: str = ""
+LAST_CACHE_META: dict[str, Any] = {}
+LAST_WARNING: str = ""
 
 _METHOD_PROP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(.+?)\s+by\s+ko(?:/tko)?$", re.I), "fighter_ko"),
@@ -67,8 +77,13 @@ def _request_headers() -> dict[str, str]:
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-    if config.MYBOOKIE_COOKIE:
-        headers["Cookie"] = config.MYBOOKIE_COOKIE.strip()
+    cookie = usable_cookie(getattr(config, "MYBOOKIE_COOKIE", "") or "")
+    if cookie:
+        headers["Cookie"] = cookie
+    elif str(getattr(config, "MYBOOKIE_COOKIE", "") or "").strip():
+        logger.info(
+            "MyBookie: ignoring placeholder/short MYBOOKIE_COOKIE — scraping as guest"
+        )
     return headers
 
 
@@ -534,14 +549,30 @@ def _fetch_odds_api_fallback() -> pd.DataFrame:
 
 def fetch_mybookie_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     """Scrape MyBookie.ag UFC moneyline lines; cache to data/cache/mybookie_odds.csv."""
+    global LAST_SOURCE_MODE, LAST_CACHE_META, LAST_WARNING
+    LAST_WARNING = ""
     if not config.MYBOOKIE_ENABLED:
         raise OddsAPIError("MyBookie is disabled (MYBOOKIE_ENABLED=false).")
 
     ensure_data_dirs()
+    LAST_CACHE_META = cache_freshness_meta(MYBOOKIE_CACHE_PATH)
     if not force_refresh and _cache_fresh(MYBOOKIE_CACHE_PATH):
         cached = pd.read_csv(MYBOOKIE_CACHE_PATH)
         if not cached.empty:
-            logger.info("Using cached MyBookie odds (%s rows)", len(cached))
+            LAST_SOURCE_MODE = "cache"
+            age = LAST_CACHE_META.get("age_min")
+            age_txt = f"age_min={age:.1f}" if age is not None else "age_min=?"
+            log_book_status(
+                "MyBookie",
+                mode="cache",
+                matched=len(cached),
+                detail=age_txt,
+            )
+            logger.info(
+                "Using cached MyBookie odds (%s rows, %s, mtime freshness logged)",
+                len(cached),
+                age_txt,
+            )
             return cached
 
     rows, _, source_url = _scrape_pages()
@@ -549,9 +580,24 @@ def fetch_mybookie_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         try:
             df = _fetch_odds_api_fallback()
             df.to_csv(MYBOOKIE_CACHE_PATH, index=False)
+            LAST_SOURCE_MODE = "odds_api"
+            LAST_CACHE_META = cache_freshness_meta(MYBOOKIE_CACHE_PATH)
+            LAST_WARNING = (
+                "MyBookie scraper empty — using Odds API mybookieag fallback "
+                f"({len(df)} rows)."
+            )
+            log_book_status(
+                "MyBookie",
+                mode="odds_api",
+                matched=len(df),
+                warning=LAST_WARNING,
+            )
             logger.info("MyBookie Odds API fallback returned %s rows", len(df))
             return df
         except OddsAPIError:
+            LAST_SOURCE_MODE = "empty"
+            LAST_WARNING = "MyBookie unavailable — scrape empty and Odds API fallback failed."
+            log_book_status("MyBookie", mode="empty", matched=0, warning=LAST_WARNING)
             raise OddsAPIError(
                 "Could not scrape MyBookie UFC odds and Odds API fallback unavailable."
             ) from None
@@ -560,6 +606,9 @@ def fetch_mybookie_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if "source_url" not in df.columns:
         df["source_url"] = source_url
     df.to_csv(MYBOOKIE_CACHE_PATH, index=False)
+    LAST_SOURCE_MODE = "scraper"
+    LAST_CACHE_META = cache_freshness_meta(MYBOOKIE_CACHE_PATH)
+    log_book_status("MyBookie", mode="scraper", matched=len(df), detail=f"url={source_url}")
     logger.info("Scraped %s MyBookie moneyline rows", len(df))
     return df
 

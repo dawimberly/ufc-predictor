@@ -397,6 +397,12 @@ def classify_bet_tier(
     5. GREEN if edge >= 0.05 and model_prob >= 0.60 and decision is SKIP
     6. YELLOW otherwise
     """
+    # Kelly / status column often carries "1.00% paper_wide_override" while the
+    # prediction row has no stake_* fields. Parse before resolve so book tables
+    # match Ollama (which paints sky from ticket stake + reason).
+    if stake_pct is None and status:
+        stake_pct = _parse_stake_pct_from_status(status)
+
     if row is not None:
         info = resolve_row_decision(
             row,
@@ -445,11 +451,14 @@ def classify_bet_tier(
         stake_pct_f = _parse_stake_pct_from_status(status_s)
 
     # --- Rule 1: SKY BLUE — Paper wide override tiny stake only ---
-    is_skip = "SKIP" in status_u or decision == "SKIP"
+    # SKIP in the Kelly/status text is authoritative. Do not let resolve_row_decision
+    # "SKIP" override a positive stake % status (book tables pass Kelly text only).
     has_stake = (stake_pct_f is not None and stake_pct_f > 0) or (
         stake_usd_f is not None and stake_usd_f > 0
     )
     is_bet_word = status_u in {"BET", "TAKE", "PLAY"} or status_u.startswith("BET")
+    status_has_skip = "SKIP" in status_u
+    is_skip = status_has_skip or (decision == "SKIP" and not has_stake and not is_bet_word)
     actionable = not is_skip and (
         has_stake or is_bet_word or (clears_gates and decision == "BET")
     )

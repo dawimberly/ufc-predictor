@@ -127,6 +127,35 @@ def test_paper_wide_override_is_sky_blue(monkeypatch) -> None:
     assert reason == "paper_wide_override"
 
 
+def test_book_table_kelly_status_sky_blue_without_row_stake(monkeypatch) -> None:
+    """Book tabs pass Kelly text only; row has no stake_* — must still be sky blue."""
+    monkeypatch.setattr(config, "UFC_PROFILE", "paper")
+    row = {
+        "fighter_1": "Diego Ferreira",
+        "fighter_2": "Billy Quarantillo",
+        "predicted_winner": "Diego Ferreira",
+        "prob_f1_win": 0.833,
+        "prob_f2_win": 0.167,
+        "edge_f1": 0.189,
+        "edge_f2": -0.10,
+        "best_edge": 0.189,
+        "f1_odds": 1.40,
+        "f2_odds": 3.10,
+        "odds_matched": True,
+    }
+    tier, reason = classify_bet_tier(
+        row,
+        clears_gates=False,
+        status="1.00% paper_wide_override",
+        edge=0.189,
+        model_prob=0.833,
+        pick="Diego Ferreira",
+        debug=False,
+    )
+    assert tier == TIER_SKY_BLUE, (tier, reason)
+    assert reason == "paper_wide_override"
+
+
 def test_live_never_sky_blue(monkeypatch) -> None:
     monkeypatch.setattr(config, "UFC_PROFILE", "live")
     assert not is_sky_blue_ticket(
