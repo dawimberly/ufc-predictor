@@ -6,6 +6,7 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 ## Recent changes
 
+- **2026-08-12** — Fix Odds API fetch-once slate locks and make Ollama fight stats instant.
 - **2026-08-11** — Empty-book odds: fixed `UnboundLocalError` in book odds merge that blanked all books; Soft Update / Quick Odds restore matched lines. See `data/reports/odds_empty_incident.md`.
 - **2026-08-11** — Sky Blue on Odds API / MyBookie fight tables now matches Ollama (Kelly `paper_wide_override` status is parsed for color).
 
