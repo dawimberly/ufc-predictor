@@ -40,11 +40,14 @@ Not the model and not suspect-edge blanking of good lines.
 - `pytest tests/test_odds_reliability.py` passes.
 - Reliability guards unchanged (still blank unmatched / |edge| > 30% only).
 
-## Operator notes
+## Hardening (2026-08-12)
 
-| Check | Action |
-|--------|--------|
-| `THE_ODDS_API_KEY` in `dist\.env` / project `.env` | Real key (EXE loads `dist\.env`) |
-| BetNow / DK tabs | `BETNOW_ENABLED=true` / `DRAFTKINGS_ENABLED=true` + real session |
-| Wrong card | Refresh Next Two, then Soft Update |
-| `--debug` | Look for `odds_status book=` / `401` / `auth_mode=` |
+| Guard | What it does |
+|--------|----------------|
+| **Slate fingerprint** | `data/cache/odds_slate_fingerprint.txt` — on **Refresh Next Two**, if fight roster changed, auto-delete Odds API + MyBookie caches before next merge |
+| **Low-match retry** | Quick Odds / book load: if matched &lt; half the card, clear once-cache and **one** live retry (Odds API + MyBookie) |
+| **Per-book soft-fail** | One dead book does not blank others; honest `odds_status` + tab warning |
+| **Event dates** | UFC.com main-card dates parsed so Next Two = chronological (330 + Aug 22), not scrape order |
+| **No shadow import** | `merge_predictions_with_odds` stays module-level (fixed UnboundLocalError) |
+
+Operator: after code update, **Restart** dashboard once. Then Refresh → Quick Odds. Skip auto-push with `[no-push]` in commit message if needed.

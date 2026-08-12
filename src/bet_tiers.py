@@ -1079,8 +1079,36 @@ def format_tiered_best_bets(
     tiers: dict[str, list[dict[str, Any]]],
     *,
     event: str = "",
+    compact: bool = False,
 ) -> str:
     """Text briefing for Ollama chat / Stats — gates stay strict for Blue."""
+    blue = list(tiers.get(TIER_BLUE) or [])
+    sky = list(tiers.get(TIER_SKY_BLUE) or [])
+    green = list(tiers.get(TIER_GREEN) or [])
+    yellow = list(tiers.get(TIER_YELLOW) or [])
+
+    if compact:
+        lines: list[str] = []
+        if event:
+            lines.append(str(event).strip())
+        lines.append(format_what_to_do_header(tiers=tiers))
+        if blue or sky:
+            lines.append("")
+            lines.append("Sized:")
+            for i, b in enumerate((blue + sky)[:5], start=1):
+                lines.append(_line_compact(b, i))
+        if green:
+            lines.append("")
+            lines.append("Fun only ($0):")
+            for i, b in enumerate(green[:4], start=1):
+                lines.append(_line_compact(b, i, fun=True))
+        if yellow:
+            lines.append("")
+            lines.append("Skip sized:")
+            for i, b in enumerate(yellow[:3], start=1):
+                lines.append(_line_compact(b, i, fun=True))
+        return "\n".join(lines).strip()
+
     lines: list[str] = []
     title = "Best bets — read the action verbs"
     if event:
@@ -1089,11 +1117,6 @@ def format_tiered_best_bets(
     lines.append(format_what_to_do_header(tiers))
     lines.append(format_tier_legend())
     lines.append("Includes moneyline + Over 1.5 props when available.")
-
-    blue = list(tiers.get(TIER_BLUE) or [])
-    sky = list(tiers.get(TIER_SKY_BLUE) or [])
-    green = list(tiers.get(TIER_GREEN) or [])
-    yellow = list(tiers.get(TIER_YELLOW) or [])
 
     if blue:
         lines.append(f"BET THIS (Blue / full HA) — {len(blue)}:")
@@ -1145,3 +1168,26 @@ def _line(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
         f"{rank}. {action} · [{market}] {side}{fight_s} · edge {edge_s} · "
         f"prob {prob_s} · {reason}"
     )
+
+
+def _line_compact(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
+    """Short single-line pick for chat / compact briefing."""
+    is_prop = (
+        str(b.get("market_type") or "").lower() == "prop"
+        or str(b.get("prop_key") or "") == "over_1_5_rounds"
+    )
+    side = str(b.get("pick") or b.get("side") or "—")
+    fight = str(b.get("fight") or "").strip()
+    if is_prop and fight:
+        label = f"{fight} — {side}"
+    elif fight and fight not in side:
+        label = f"{side} ({fight})"
+    else:
+        label = side
+    market = "O1.5" if is_prop else "ML"
+    edge = b.get("edge_pct")
+    if edge is None and b.get("edge") is not None:
+        edge = float(b["edge"]) * 100.0
+    edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
+    action = action_label_for_bet({**b, "fun_bet": fun or b.get("fun_bet")})
+    return f"  {rank}. {action} | {label} | {market} | edge {edge_s}"

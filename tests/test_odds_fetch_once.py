@@ -49,6 +49,38 @@ def test_prop_fetch_once_marker_counts_as_fresh(tmp_path: Path, monkeypatch):
     assert toa._cache_fresh(cache) is True
 
 
+def test_prop_cache_does_not_block_moneyline_fetch(tmp_path: Path, monkeypatch):
+    """Prop once-marker must not forbid the first moneyline download."""
+    from src.odds_providers.odds_api_client import odds_fetch_once_blocks_live
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    prop_csv = cache / "the_odds_api_prop_odds.csv"
+    prop_csv.write_text("fighter,market,line\nA,ko,1.5\n", encoding="utf-8")
+    (cache / "the_odds_api_prop_odds.once").write_text("rows=1\n", encoding="utf-8")
+    monkeypatch.setattr(config, "CACHE_DIR", cache)
+    monkeypatch.setattr(config, "ODDS_CACHE_PATH", cache / "ufc_odds_api.csv")
+    monkeypatch.setattr(config, "ODDS_FETCH_ONCE", True)
+
+    assert odds_fetch_once_blocks_live(context="/sports/mma_mixed_martial_arts/odds") is False
+    assert odds_fetch_once_blocks_live(context="/sports/mma_mixed_martial_arts/events") is True
+
+
+def test_moneyline_cache_blocks_moneyline_not_props(tmp_path: Path, monkeypatch):
+    from src.odds_providers.odds_api_client import odds_fetch_once_blocks_live
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    ml = cache / "ufc_odds_api.csv"
+    ml.write_text("event_id,fighter_1,fighter_2\nx,a,b\n", encoding="utf-8")
+    monkeypatch.setattr(config, "CACHE_DIR", cache)
+    monkeypatch.setattr(config, "ODDS_CACHE_PATH", cache / "ufc_odds_api.csv")
+    monkeypatch.setattr(config, "ODDS_FETCH_ONCE", True)
+
+    assert odds_fetch_once_blocks_live(context="/sports/mma_mixed_martial_arts/odds") is True
+    assert odds_fetch_once_blocks_live(context="/sports/mma_mixed_martial_arts/events") is False
+
+
 def test_prop_empty_cache_write_sets_marker(tmp_path: Path, monkeypatch):
     import pandas as pd
     import src.odds_providers.the_odds_api as toa

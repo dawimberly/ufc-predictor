@@ -128,3 +128,31 @@ def test_edge_is_actionable_caps_and_suspect():
     assert not edge_is_actionable(0.30)
     assert not edge_is_actionable(0.10, edge_suspect=True)
     assert not edge_is_actionable(-0.05)
+
+
+def test_odds_slate_change_clears_caches(tmp_path, monkeypatch):
+    from src.odds_providers import odds_slate_guard as sg
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    api_cache = cache / "ufc_odds_api.csv"
+    api_cache.write_text("fighter_1,fighter_2\nA,B\n", encoding="utf-8")
+    mb_cache = cache / "mybookie_odds.csv"
+    mb_cache.write_text("fighter_1,fighter_2\nC,D\n", encoding="utf-8")
+    marker = cache / "odds_slate_fingerprint.txt"
+    marker.write_text("oldslate12345678\n", encoding="utf-8")
+
+    monkeypatch.setattr(sg.config, "CACHE_DIR", cache)
+
+    card_a = pd.DataFrame(
+        {"fighter_1": ["Anthony Hernandez"], "fighter_2": ["Gregory Rodrigues"]}
+    )
+    card_b = pd.DataFrame({"fighter_1": ["Islam Makhachev"], "fighter_2": ["Ian Garry"]})
+    fp_a = sg.combined_slate_fingerprint(card_a)
+    fp_b = sg.combined_slate_fingerprint(card_b)
+    assert fp_a and fp_b and fp_a != fp_b
+
+    cleared = sg.invalidate_odds_caches_for_slate_change(card_b, reason="test")
+    assert cleared
+    assert not api_cache.is_file()
+    assert not mb_cache.is_file()

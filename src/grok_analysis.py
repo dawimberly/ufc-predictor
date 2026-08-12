@@ -10,7 +10,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+ProgressFn = Callable[[str, float | None], None]
 
 import config
 import pandas as pd
@@ -1255,6 +1257,7 @@ def analyze_card_with_grok(
     use_cache: bool = True,
     profile: str | None = None,
     allowed_fights: set[str] | None = None,
+    progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """
     Run local Ollama narration on HA-sized tickets (primary bet slip).
@@ -1276,6 +1279,11 @@ def analyze_card_with_grok(
     def _latency_ms() -> int:
         return int((time.perf_counter() - t0) * 1000)
 
+    def _prog(msg: str, pct: float | None = None) -> None:
+        if progress:
+            progress(msg, pct)
+
+    _prog("Collecting HA tickets...", 0.08)
     inputs = collect_card_analysis_inputs(
         books,
         budget_state,
@@ -1328,7 +1336,9 @@ def analyze_card_with_grok(
         out.update(extra)
         return out
 
+    _prog("Checking Ollama...", 0.18)
     if not bool(getattr(config, "OLLAMA_ENABLED", True)):
+        _prog("Ollama disabled", 1.0)
         logger.warning(
             "Ollama health error_class=disabled latency_ms=%s — showing model tickets only",
             _latency_ms(),
@@ -1348,6 +1358,7 @@ def analyze_card_with_grok(
     health = check_ollama_health(force=True)
     health_class = str(health.get("error_class") or "other")
     if health_class in {"offline", "model_missing"} or not health.get("reachable"):
+        _prog("Ollama offline — HA tickets only", 1.0)
         banner = "Ollama offline — showing HA tickets"
         if health_class == "model_missing":
             banner = "Ollama model missing — showing HA tickets"
@@ -1373,6 +1384,7 @@ def analyze_card_with_grok(
 
     # Explicit NO BET when no odds or nothing at all to show
     if no_odds or not tickets:
+        _prog("No sized tickets for this card", 1.0)
         return {
             "ok": True,
             "no_bet": True,
@@ -1405,8 +1417,10 @@ def analyze_card_with_grok(
 
     cache_key = _cache_key(inputs)
     if use_cache:
+        _prog("Checking narrative cache...", 0.28)
         cached = _load_cache(cache_key)
         if cached:
+            _prog("Loaded cached narrative", 1.0)
             out = dict(cached)
             out["from_cache"] = True
             out["ok"] = True
@@ -1433,9 +1447,12 @@ def analyze_card_with_grok(
             out["n_advisory"] = inputs.get("n_advisory")
             return out
 
+    _prog("Building prompt...", 0.35)
     prompt = build_grok_prompt(inputs)
     try:
+        _prog("Ollama is thinking...", 0.45)
         model_used, raw_text = query_ollama(prompt)
+        _prog("Parsing response...", 0.88)
         try:
             parsed = _extract_json_blob(raw_text)
         except ValueError as parse_exc:
@@ -1500,8 +1517,10 @@ def analyze_card_with_grok(
             )
         except Exception:
             pass
+        _prog("Analysis complete", 1.0)
         return result
     except Exception as exc:
+        _prog("Narrative unavailable — HA tickets only", 1.0)
         err_class = classify_ollama_error(exc)
         latency = _latency_ms()
         logger.warning(
@@ -1548,6 +1567,7 @@ def build_best_bets_briefing(
     *,
     predictions: Any = None,
     cleared_singles: list[dict[str, Any]] | None = None,
+    compact: bool = False,
 ) -> str:
     """Best-bet briefing with Blue/Green/Yellow/Red — HA gates unchanged for Blue."""
     from src.bet_tiers import (
@@ -1562,7 +1582,9 @@ def build_best_bets_briefing(
         event = str(result.get("event") or "").strip()
         slip = list(result.get("bet_slip") or [])
         if result.get("fun_tiers"):
-            return format_tiered_best_bets(result["fun_tiers"], event=event)
+            return format_tiered_best_bets(
+                result["fun_tiers"], event=event, compact=compact
+            )
 
     singles = list(cleared_singles or [])
     if not singles:
@@ -1596,7 +1618,7 @@ def build_best_bets_briefing(
             "(or ask again after the slip appears)."
         )
 
-    return format_tiered_best_bets(tiers, event=event or "Current card")
+    return format_tiered_best_bets(tiers, event=event or "Current card", compact=compact)
 
 
 def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
@@ -1616,23 +1638,336 @@ def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
     return briefing
 
 
+_STOP_CHAT_TOKENS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "vs",
+        "versus",
+        "fight",
+        "fights",
+        "fighter",
+        "stats",
+        "stat",
+        "tell",
+        "me",
+        "about",
+        "on",
+        "for",
+        "what",
+        "are",
+        "is",
+        "how",
+        "much",
+        "edge",
+        "odds",
+        "prob",
+        "probability",
+        "model",
+        "card",
+        "bet",
+        "bets",
+        "please",
+        "show",
+        "give",
+        "info",
+        "information",
+        "breakdown",
+        "analysis",
+        "ollama",
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "over",
+        "under",
+        "round",
+        "rounds",
+    }
+)
+
+
+def _chat_query_tokens(question: str) -> list[str]:
+    raw = re.sub(r"[^a-z0-9\s]", " ", str(question or "").lower())
+    return [t for t in raw.split() if len(t) >= 3 and t not in _STOP_CHAT_TOKENS]
+
+
+def _token_hits_name(token: str, name: str) -> bool:
+    from src.predictor import _fighter_name_key, _names_match
+
+    if not token or not name:
+        return False
+    if _names_match(token, name):
+        return True
+    key = _fighter_name_key(name)
+    parts = [p for p in key.split() if p and p not in {"jr", "sr", "ii", "iii", "iv"}]
+    if token in parts:
+        return True
+    # Last-name / partial (e.g. "mcconico" in "eric mcconico")
+    return any(token in p or p in token for p in parts if len(token) >= 4 and len(p) >= 4)
+
+
+def _fight_label_from_row(row: dict[str, Any] | pd.Series) -> str:
+    fight = str(row.get("fight") or row.get("pick_line") or "").strip()
+    if fight:
+        return fight
+    f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+    f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+    if f1 and f2:
+        return f"{f1} vs {f2}"
+    return f1 or f2 or "Unknown fight"
+
+
+def _iter_card_fight_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Collect unique fight rows from predictions, slip, tiers, and skips."""
+    if not isinstance(result, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(raw: dict[str, Any]) -> None:
+        label = _fight_label_from_row(raw).lower()
+        if not label or label in seen:
+            return
+        seen.add(label)
+        rows.append(dict(raw))
+
+    preds = result.get("predictions")
+    if isinstance(preds, pd.DataFrame) and not preds.empty:
+        for _, r in preds.iterrows():
+            _add(r.to_dict())
+
+    for b in list(result.get("bet_slip") or []):
+        if isinstance(b, dict):
+            _add(b)
+
+    fun_tiers = result.get("fun_tiers") or {}
+    if isinstance(fun_tiers, dict):
+        for bucket in fun_tiers.values():
+            for b in list(bucket or []):
+                if isinstance(b, dict):
+                    _add(b)
+
+    for s in list(result.get("skipped") or []):
+        if isinstance(s, dict):
+            _add(s)
+
+    for p in list(result.get("props") or []):
+        if isinstance(p, dict):
+            _add(p)
+
+    return rows
+
+
+def _match_fights_for_question(
+    question: str,
+    result: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    tokens = _chat_query_tokens(question)
+    if not tokens:
+        return []
+    hits: list[tuple[int, dict[str, Any]]] = []
+    for row in _iter_card_fight_rows(result):
+        f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+        f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+        fight = _fight_label_from_row(row)
+        pick = str(row.get("pick") or row.get("side") or row.get("predicted_winner") or "")
+        blob = " ".join([f1, f2, fight, pick])
+        score = sum(1 for t in tokens if _token_hits_name(t, blob) or t in fight.lower())
+        if score:
+            hits.append((score, row))
+    hits.sort(key=lambda x: (-x[0], _fight_label_from_row(x[1])))
+    return [r for _, r in hits[:3]]
+
+
+def _fmt_pct(value: Any, *, already_pct: bool = False) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        v = float(value)
+        if not already_pct and abs(v) <= 1.5:
+            v *= 100.0
+        return f"{v:.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_prob(value: Any) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        v = float(value)
+        if v > 1.5:
+            v /= 100.0
+        return f"{v:.0%}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_odds(value: Any) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _lookup_tier_for_fight(
+    result: dict[str, Any] | None,
+    fight: str,
+) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    from src.predictor import _names_match
+
+    fun_tiers = result.get("fun_tiers") or {}
+    if isinstance(fun_tiers, dict):
+        for tier_name, bucket in fun_tiers.items():
+            for b in list(bucket or []):
+                if not isinstance(b, dict):
+                    continue
+                label = _fight_label_from_row(b)
+                if _names_match(fight, label) or fight.lower() in label.lower():
+                    out = dict(b)
+                    out.setdefault("bet_tier", tier_name)
+                    return out
+    for b in list(result.get("bet_slip") or []):
+        if not isinstance(b, dict):
+            continue
+        label = _fight_label_from_row(b)
+        if _names_match(fight, label) or fight.lower() in label.lower():
+            return dict(b)
+    for s in list(result.get("skipped") or []):
+        if not isinstance(s, dict):
+            continue
+        label = _fight_label_from_row(s)
+        if _names_match(fight, label) or fight.lower() in label.lower():
+            out = dict(s)
+            out.setdefault("bet_tier", "red")
+            return out
+    return None
+
+
+def build_fight_stats_answer(
+    question: str,
+    result: dict[str, Any] | None,
+    *,
+    event_label: str = "",
+) -> str | None:
+    """Instant grounded answer for fight/stats questions — no Ollama call."""
+    matches = _match_fights_for_question(question, result)
+    if not matches:
+        return None
+
+    from src.bet_tiers import action_label_for_bet
+
+    event = event_label or (
+        str((result or {}).get("event") or "").strip() if isinstance(result, dict) else ""
+    )
+    blocks: list[str] = []
+    if event:
+        blocks.append(event)
+
+    for row in matches:
+        fight = _fight_label_from_row(row)
+        f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+        f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+        if (not f1 or not f2) and " vs " in fight.lower():
+            parts = re.split(r"\s+vs\.?\s+", fight, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                f1, f2 = parts[0].strip(), parts[1].strip()
+
+        p1 = row.get("p_f1", row.get("prob_f1_win", row.get("prob_f1")))
+        p2 = row.get("p_f2", row.get("prob_f2_win", row.get("prob_f2")))
+        edge_pct = row.get("edge_pct")
+        if edge_pct is None and row.get("best_edge") is not None:
+            edge_pct = float(row["best_edge"]) * 100.0
+        e1 = row.get("edge_f1")
+        e2 = row.get("edge_f2")
+        o1 = row.get("f1_odds")
+        o2 = row.get("f2_odds")
+        matched = row.get("odds_matched")
+        source = str(row.get("odds_source") or row.get("book") or "").strip() or "n/a"
+        width = row.get("interval_width")
+        disagree = row.get("disagreement")
+        pick = str(
+            row.get("predicted_winner")
+            or row.get("pick")
+            or row.get("side")
+            or ""
+        ).strip()
+
+        tier_row = _lookup_tier_for_fight(result, fight) or row
+        action = action_label_for_bet(tier_row)
+        skip_reason = str(
+            tier_row.get("skip_reason")
+            or tier_row.get("tier_reason")
+            or row.get("skip_reason")
+            or ""
+        ).replace("_", " ").strip()
+
+        lines = [fight]
+        if f1 and f2:
+            lines.append(
+                f"  Model: {f1} {_fmt_prob(p1)} / {f2} {_fmt_prob(p2)}"
+                + (f"  -> pick {pick}" if pick else "")
+            )
+            lines.append(
+                f"  Odds: {f1} {_fmt_odds(o1)} / {f2} {_fmt_odds(o2)}"
+                f"  · matched={bool(matched) if matched is not None else 'n/a'}"
+                f"  · source={source}"
+            )
+            if e1 is not None or e2 is not None:
+                lines.append(
+                    f"  Edge: {f1} {_fmt_pct(e1)} / {f2} {_fmt_pct(e2)}"
+                    + (f"  · best {_fmt_pct(edge_pct, already_pct=True)}" if edge_pct is not None else "")
+                )
+            elif edge_pct is not None:
+                lines.append(f"  Best edge: {_fmt_pct(edge_pct, already_pct=True)}")
+        else:
+            lines.append(
+                f"  Pick {pick or 'n/a'} · edge {_fmt_pct(edge_pct, already_pct=True)}"
+                f" · prob {_fmt_prob(tier_row.get('prob') or p1)}"
+            )
+        if width is not None or disagree is not None:
+            lines.append(
+                f"  Uncertainty: width={_fmt_pct(width)} · disagreement={_fmt_pct(disagree)}"
+            )
+        lines.append(f"  Action: {action}" + (f" ({skip_reason})" if skip_reason else ""))
+        blocks.append("\n".join(lines))
+
+    blocks.append("(Live card stats — no Ollama wait)")
+    return "\n\n".join(blocks)
+
+
 def answer_ollama_chat(
     question: str,
     *,
     analysis_result: dict[str, Any] | None = None,
     event_label: str = "",
+    progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """Answer a user question about the current card using grounded HA slip context.
 
-    Best-bet style questions get the deterministic briefing first; Ollama may add
-    a short commentary but must not invent new tickets.
+    Best-bet and fight-stats questions are answered instantly from card data.
+    Open-ended chat may call Ollama, but never invents tickets.
     """
     from src.ollama_client import check_ollama_health, ollama_complete, ollama_status_message
+
+    def _prog(msg: str, pct: float | None = None) -> None:
+        if progress:
+            progress(msg, pct)
 
     q = " ".join(str(question or "").split()).strip()
     if not q:
         return {"ok": False, "error": "Empty question.", "answer": "", "briefing": ""}
 
+    _prog("Preparing context...", 0.15)
     briefing = build_best_bets_briefing(analysis_result)
     q_low = q.lower()
     best_intent = any(
@@ -1654,16 +1989,60 @@ def answer_ollama_chat(
 
     # Best-bet / stats questions: instant HA briefing (never invent tickets, never wait on LLM).
     if best_intent:
+        _prog("Stats briefing ready", 1.0)
         return {
             "ok": True,
-            "answer": briefing,
+            "answer": build_best_bets_briefing(analysis_result, compact=True),
             "briefing": briefing,
             "source": "ha_briefing",
             "model": "stats",
         }
 
+    # Fight-specific stats ("mcconico fight", "edge on Alvarez") — card data only.
+    fight_answer = build_fight_stats_answer(
+        q, analysis_result, event_label=event_label
+    )
+    if fight_answer:
+        _prog("Fight stats ready", 1.0)
+        return {
+            "ok": True,
+            "answer": fight_answer,
+            "briefing": briefing,
+            "source": "ha_fight_stats",
+            "model": "stats",
+        }
+
+    stats_intent = any(
+        k in q_low
+        for k in (
+            "stats",
+            "stat",
+            "edge",
+            "odds",
+            "probability",
+            "prob",
+            "interval",
+            "uncertainty",
+            "breakdown",
+        )
+    )
+    if stats_intent:
+        _prog("No matching fight — card briefing", 1.0)
+        return {
+            "ok": True,
+            "answer": (
+                "No matching fight found on the loaded card for that name.\n\n"
+                + build_best_bets_briefing(analysis_result, compact=True)
+            ),
+            "briefing": briefing,
+            "source": "ha_briefing",
+            "model": "stats",
+        }
+
+    _prog("Checking Ollama...", 0.25)
     health = check_ollama_health(force=False)
     if not health.get("reachable") or not bool(getattr(config, "OLLAMA_ENABLED", True)):
+        _prog("Ollama offline — stats only", 1.0)
         return {
             "ok": True,
             "answer": briefing
@@ -1698,19 +2077,21 @@ def answer_ollama_chat(
         "then 'FUN ONLY ($0):' if any; then 'SKIP:' for caution/red."
     )
     try:
+        _prog("Ollama is answering...", 0.45)
+        # Chat replies should stay short — soft-cap timeout so CPU hosts don't hang.
+        chat_timeout = min(45, int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60))
         model_used, text = ollama_complete(
             prompt,
             system=system,
-            timeout_sec=min(120, int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)),
+            timeout_sec=max(20, chat_timeout),
             json_mode=False,
             temperature=0.2,
         )
+        _prog("Formatting reply...", 0.9)
         answer = " ".join(str(text or "").split())
         if not answer:
             answer = briefing
-        elif best_intent and briefing not in answer:
-            # Keep stats visible even when the model paraphrases.
-            answer = f"{briefing}\n\n---\n{answer}"
+        _prog("Done", 1.0)
         return {
             "ok": True,
             "answer": answer,
@@ -1719,10 +2100,14 @@ def answer_ollama_chat(
             "model": model_used,
         }
     except Exception as exc:
+        _prog("Chat failed — stats only", 1.0)
         logger.warning("Ollama chat failed: %s", exc)
+        fallback = build_fight_stats_answer(
+            q, analysis_result, event_label=event_label
+        ) or build_best_bets_briefing(analysis_result, compact=True)
         return {
             "ok": True,
-            "answer": f"{briefing}\n\n(Ollama chat failed: {exc})",
+            "answer": f"{fallback}\n\n(Ollama chat timed out / failed — card stats above)",
             "briefing": briefing,
             "source": "ha_briefing",
             "model": "stats",

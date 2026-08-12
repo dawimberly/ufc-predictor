@@ -343,26 +343,45 @@ def _load_book_odds(
         matched = int(merged.get("odds_matched", pd.Series(False)).sum())
         # ODDS_FETCH_ONCE can lock a prior-card cache (e.g. Belgrade vs next week's slate).
         # If match rate is poor, clear once-caches and pull live odds one time.
-        if book_name == "Odds API" and len(combined) > 0:
-            min_ok = max(3, (len(combined) + 1) // 2)
-            if matched < min_ok:
-                from src.odds_providers.odds_api_client import clear_odds_api_fetch_once_caches
+        from src.odds_providers.odds_slate_guard import min_match_for_card
 
-                cleared = clear_odds_api_fetch_once_caches()
-                if cleared or matched == 0:
-                    logger.warning(
-                        "Odds API matched only %s/%s (need >=%s) — cleared fetch-once cache "
-                        "(%s files) and retrying live pull once",
-                        matched,
-                        len(combined),
-                        min_ok,
-                        len(cleared),
-                    )
-                    odds_df = getattr(mod, fn_name)(force_refresh=True)
-                    merged = merge_predictions_with_odds(
-                        combined.copy(), odds_df, fetch_if_missing=False
-                    )
-                    matched = int(merged.get("odds_matched", pd.Series(False)).sum())
+        min_ok = min_match_for_card(len(combined))
+        if book_name == "Odds API" and len(combined) > 0 and matched < min_ok:
+            from src.odds_providers.odds_api_client import clear_odds_api_fetch_once_caches
+
+            cleared = clear_odds_api_fetch_once_caches()
+            if cleared or matched == 0:
+                logger.warning(
+                    "Odds API matched only %s/%s (need >=%s) — cleared fetch-once cache "
+                    "(%s files) and retrying live pull once",
+                    matched,
+                    len(combined),
+                    min_ok,
+                    len(cleared),
+                )
+                odds_df = getattr(mod, fn_name)(force_refresh=True)
+                merged = merge_predictions_with_odds(
+                    combined.copy(), odds_df, fetch_if_missing=False
+                )
+                matched = int(merged.get("odds_matched", pd.Series(False)).sum())
+        if book_name == "MyBookie" and len(combined) > 0 and matched < min_ok:
+            from src.odds_providers.odds_slate_guard import clear_mybookie_odds_caches
+
+            cleared_mb = clear_mybookie_odds_caches()
+            if cleared_mb or matched == 0:
+                logger.warning(
+                    "MyBookie matched only %s/%s (need >=%s) — cleared cache "
+                    "(%s files) and retrying live scrape once",
+                    matched,
+                    len(combined),
+                    min_ok,
+                    len(cleared_mb),
+                )
+                odds_df = getattr(mod, fn_name)(force_refresh=True)
+                merged = merge_predictions_with_odds(
+                    combined.copy(), odds_df, fetch_if_missing=False
+                )
+                matched = int(merged.get("odds_matched", pd.Series(False)).sum())
         if book_name == "BetNow.eu" and matched == 0:
             auth_mode = str(getattr(mod, "LAST_AUTH_MODE", "") or "empty")
             warn = (
@@ -757,6 +776,13 @@ def apply_books_to_predictions(
     from src.strategy import bankroll_from_budget, budget_aware_alerts
 
     if combined is not None and isinstance(combined, pd.DataFrame) and not combined.empty:
+        try:
+            from src.odds_providers.odds_slate_guard import invalidate_odds_caches_for_slate_change
+
+            if invalidate_odds_caches_for_slate_change(combined, reason="before_book_merge"):
+                force_refresh_odds = True
+        except Exception as exc:
+            logger.debug("Odds slate guard skipped: %s", exc)
         try:
             from src.gym_data import attach_gym_features
 
@@ -1357,6 +1383,14 @@ def load_next_two_cards(
         cards.append({"event_index": event_index, "event_name": event_name, "predictions": preds})
 
     combined = _combine_card_predictions(cards)
+    try:
+        from src.odds_providers.odds_slate_guard import save_odds_slate_fingerprint
+
+        fp = save_odds_slate_fingerprint(combined)
+        if fp:
+            logger.info("Odds slate fingerprint saved: %s (%d fights)", fp, len(combined))
+    except Exception as exc:
+        logger.debug("Odds slate fingerprint save skipped: %s", exc)
     logger.info(
         "load_next_two_cards: done — %d total predictions across %d card(s)",
         len(combined),
