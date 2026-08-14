@@ -2098,23 +2098,24 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         from src.bet_tiers import TIER_COLORS, action_label_for_bet
 
         # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
+        # Fail closed: never invent Blue from leftover stake fields.
         tier = str(bet.get("bet_tier") or "").strip().lower()
         if tier not in TIER_COLORS:
             if bet.get("fun_bet") or bet.get("advisory"):
                 tier = "green"
             else:
-                tier = (
-                    "blue"
-                    if float(bet.get("suggested_stake") or bet.get("stake_usd") or 0) > 0
-                    else "yellow"
-                )
+                tier = "yellow"
         color = TIER_COLORS.get(tier, "#e2e8f0")
         label = str(
             bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
         )
         edge_pct = float(bet.get("edge_pct") or 0)
         action = action_label_for_bet({**bet, "bet_tier": tier})
-        line = f"#{rank}  {action}  ·  {label}  ·  {edge_pct:+.1f}%"
+        from src.props import event_from_record
+
+        ev = event_from_record(bet)
+        ev_bit = f"{ev}  ·  " if ev else ""
+        line = f"#{rank}  {action}  ·  {ev_bit}{label}  ·  {edge_pct:+.1f}%"
         return _ascii_ui(line), color
 
     def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
@@ -2937,19 +2938,21 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 except (TypeError, ValueError):
                     edge = None
             bet_tier = str(bet.get("bet_tier") or "").strip().lower()
-            dollars = float(bet.get("stake_usd") or 0)
             if bet_tier not in TIER_COLORS:
+                # Fail closed: never invent Blue from leftover stake fields.
                 if bet.get("fun_bet") or bet.get("advisory"):
                     bet_tier = "green"
-                elif dollars > 0:
-                    bet_tier = "blue"
                 else:
                     bet_tier = "yellow"
             color = TIER_COLORS.get(bet_tier, "#e2e8f0")
             action = action_label_for_bet({**bet, "bet_tier": bet_tier})
             edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
+            from src.props import event_from_record
+
+            ev = event_from_record(bet)
+            ev_bit = f"{ev}  ·  " if ev else ""
             line = (
-                f"#{rank}  {action}  ·  {side}  ·  {market} @ {book}  ·  edge {edge_s}"
+                f"#{rank}  {action}  ·  {ev_bit}{side}  ·  {market} @ {book}  ·  edge {edge_s}"
             )
             ctk.CTkLabel(
                 bubble,
@@ -3018,10 +3021,23 @@ class GrokAnalysisPanel(_CTK_FRAME):
             action = action_label_for_bet({**bet, "bet_tier": tier, "fun_bet": tier == TIER_GREEN})
             color = TIER_COLORS.get(tier, "#e2e8f0")
             is_prop = str(bet.get("market_type") or "").lower() == "prop"
-            market = "O1.5" if is_prop else "ML"
+            from src.props import PROP_MARKET_LABELS, event_from_record
+
+            if is_prop:
+                market = str(
+                    bet.get("prop_short")
+                    or bet.get("market")
+                    or PROP_MARKET_LABELS.get(str(bet.get("prop_key") or ""), "Prop")
+                )
+            else:
+                market = "ML"
+            ev = event_from_record(bet)
+            ev_bit = f"{ev}  ·  " if ev else ""
             ctk.CTkLabel(
                 bubble,
-                text=_ascii_ui(f"{action}  ·  {label}  ·  {market}  ·  edge {edge_s}"),
+                text=_ascii_ui(
+                    f"{action}  ·  {ev_bit}{label}  ·  {market}  ·  edge {edge_s}"
+                ),
                 font=ctk.CTkFont(size=12),
                 text_color=color,
                 anchor="w",
@@ -3367,9 +3383,9 @@ class BookTab(_CTK_FRAME):
 
 
 class PropsTable(_CTK_FRAME):
-    """Prop singles table: type+fight, fighter, odds, source, edge, min bet $."""
+    """Prop singles table: event, type+fight, fighter, odds, source, edge, min bet $."""
 
-    COLUMNS = ("Prop Type", "Fighter", "Odds", "Source", "Edge", "Min Bet")
+    COLUMNS = ("Event", "Prop Type", "Fighter", "Odds", "Source", "Edge", "Min Bet")
     _NUMERIC_COLS = frozenset({"Odds", "Edge", "Min Bet"})
 
     def __init__(self, master, *, height: int = 14, book_name: str = "", **kwargs) -> None:
@@ -3402,7 +3418,7 @@ class PropsTable(_CTK_FRAME):
             height=height,
             style="Props.Treeview",
         )
-        widths = (260, 120, 110, 88, 88, 100)
+        widths = (200, 240, 110, 100, 88, 80, 90)
         for col, w in zip(self.COLUMNS, widths):
             self.tree.heading(
                 col,
@@ -3410,7 +3426,7 @@ class PropsTable(_CTK_FRAME):
                 anchor="w",
                 command=lambda c=col: self._on_heading_click(c),
             )
-            stretch = col == "Prop Type"
+            stretch = col in {"Event", "Prop Type"}
             self.tree.column(col, width=w, minwidth=52, anchor="w", stretch=stretch)
         vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -3506,6 +3522,8 @@ class PropsTable(_CTK_FRAME):
         return source.title() if source else "Synthetic"
 
     def load_singles(self, singles: list[dict[str, Any]]) -> None:
+        from src.props import event_from_record
+
         self.tree.delete(*self.tree.get_children())
         self._rows_data = []
         if not singles:
@@ -3514,11 +3532,14 @@ class PropsTable(_CTK_FRAME):
             self.tree.insert(
                 "",
                 "end",
-                values=_ascii_row(("No props match current filters", "-", "—", "—", "—", "—")),
+                values=_ascii_row(
+                    ("No props match current filters", "-", "-", "—", "—", "—", "—")
+                ),
                 tags=("neutral", "even"),
             )
             return
         for s in singles:
+            event = event_from_record(s) or "-"
             fight = str(s.get("fight", ""))
             prop_title = str(
                 s.get("prop_short") or s.get("prop_type") or s.get("prop_key", "")
@@ -3565,6 +3586,7 @@ class PropsTable(_CTK_FRAME):
                 )
 
             row = (
+                event,
                 prop_cell,
                 fighter,
                 self._format_odds(s, self.book_name),
@@ -5536,7 +5558,7 @@ class UFCDashboardApp(_CTK_BASE):
                 )
 
         for t in items:
-            from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE, is_sky_blue_ticket
+            from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE, TIER_YELLOW, is_sky_blue_ticket
 
             def _sf(v: Any) -> float | None:
                 try:
@@ -5546,17 +5568,42 @@ class UFCDashboardApp(_CTK_BASE):
                 except (TypeError, ValueError):
                     return None
 
+            existing = str(t.get("bet_tier") or "").strip().lower()
+            if existing in {"green", "yellow", "red"}:
+                t["fun_bet"] = True
+                t["advisory"] = True
+                t["suggested_stake"] = 0.0
+                t["stake_usd"] = 0.0
+                t["stake_pct"] = 0.0
+                continue
             if is_sky_blue_ticket(
                 stake_pct=_sf(t.get("stake_pct")),
                 stake_usd=_sf(t.get("suggested_stake")) or _sf(t.get("stake_usd")),
                 uncertainty_reason=str(t.get("uncertainty_reason") or ""),
-            ):
+            ) and existing in {"", TIER_BLUE, TIER_SKY_BLUE}:
                 t["bet_tier"] = TIER_SKY_BLUE
                 t["tier"] = TIER_SKY_BLUE
+                t["fun_bet"] = False
+            elif existing in {TIER_BLUE, TIER_SKY_BLUE}:
+                t["fun_bet"] = False
+            elif _sf(t.get("suggested_stake")) or _sf(t.get("stake_usd")) or _sf(t.get("stake_pct")):
+                # Sized HA single with no tier yet — Blue only for moneyline clears
+                if str(t.get("market_type") or "").lower() == "prop" or t.get("prop_key"):
+                    t["bet_tier"] = TIER_YELLOW
+                    t["fun_bet"] = True
+                    t["advisory"] = True
+                    t["suggested_stake"] = 0.0
+                    t["stake_usd"] = 0.0
+                    t["stake_pct"] = 0.0
+                else:
+                    t["bet_tier"] = TIER_BLUE
+                    t["tier"] = TIER_BLUE
+                    t["fun_bet"] = False
             else:
-                t.setdefault("bet_tier", TIER_BLUE)
-                t.setdefault("tier", t.get("bet_tier") or TIER_BLUE)
-            t["fun_bet"] = False
+                # Fail closed: never invent Blue
+                t.setdefault("bet_tier", TIER_YELLOW)
+                t["fun_bet"] = True
+                t["advisory"] = True
 
         # Fill remaining slots with GREEN/YELLOW fun rankings (HA gates unchanged).
         try:
@@ -5600,12 +5647,21 @@ class UFCDashboardApp(_CTK_BASE):
                     t["stake_usd"] = 0.0
                     t["stake_pct"] = 0.0
                     t["fun_bet"] = True
-                elif not t.get("bet_tier"):
-                    t["bet_tier"] = TIER_BLUE
+                    t["advisory"] = True
                 elif t.get("bet_tier") == TIER_SKY_BLUE:
                     t["fun_bet"] = False
                     t["advisory"] = False
-        except Exception as exc:
+                elif t.get("bet_tier") == TIER_BLUE:
+                    t["fun_bet"] = False
+                    t["advisory"] = False
+                elif not t.get("bet_tier"):
+                    # Fail closed — never invent Blue
+                    t["bet_tier"] = TIER_YELLOW
+                    t["fun_bet"] = True
+                    t["advisory"] = True
+                    t["suggested_stake"] = 0.0
+                    t["stake_usd"] = 0.0
+                    t["stake_pct"] = 0.0        except Exception as exc:
             _debug_log(f"Fun tier fill skipped: {exc}")
 
         # Single merge: dedupe + rank + true Top 5 (never concat HA + fun past N)

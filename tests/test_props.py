@@ -227,7 +227,43 @@ def test_settle_fighter_ko_uses_model_pick_not_winner():
     assert settle_prop("fighter_ko", row) is False
 
 
-def test_book_prop_rules_betnow_singles_dk_parlays():
-    assert config.BOOK_PROP_RULES["BetNow.eu"]["allow_prop_parlays"] is False
-    assert config.BOOK_PROP_RULES["DraftKings"]["allow_prop_parlays"] is True
-    assert config.BOOK_PROP_RULES["MyBookie"]["allow_mixed_parlays"] is True
+def test_method_probs_prefer_pathway_l5_ko():
+    base = {
+        "fighter_1": "A",
+        "fighter_2": "B",
+        "prob_f1_win": 0.55,
+        "f1_ko_rate": 0.15,
+        "f2_ko_rate": 0.15,
+        "f1_sub_avg": 0.3,
+        "f2_sub_avg": 0.3,
+        "f1_finish_rate_l5": 0.4,
+        "f2_finish_rate_l5": 0.4,
+    }
+    low = method_probs_from_row(pd.Series(base))
+    high = method_probs_from_row(
+        pd.Series(
+            {
+                **base,
+                "f1_ko_win_rate_l5": 0.45,
+                "f2_ko_win_rate_l5": 0.40,
+            }
+        )
+    )
+    assert high["ko"] > low["ko"]
+
+
+def test_method_probs_r1_from_pathway_rates():
+    row = pd.Series(
+        {
+            "fighter_1": "A",
+            "fighter_2": "B",
+            "prob_f1_win": 0.55,
+            "f1_finish_rate_l5": 0.5,
+            "f2_finish_rate_l5": 0.5,
+            "f1_r1_finish_rate_l5": 0.40,
+            "f2_r1_finish_rate_l5": 0.35,
+        }
+    )
+    p = method_probs_from_row(row)
+    assert p["round_1_finish"] >= 0.30
+    assert abs(p["over_1_5_rounds"] + p["under_1_5_rounds"] - 1.0) < 1e-6

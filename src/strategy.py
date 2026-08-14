@@ -736,6 +736,8 @@ def build_auto_parlay_recommendations(
             continue
         fid = str(row.get("fight_id") or fight).strip()
         conf = str(row.get("confidence_label") or row.get("confidence") or "").strip().lower()
+        from src.props import event_from_record
+
         legs.append(
             {
                 "fight": fight,
@@ -745,6 +747,8 @@ def build_auto_parlay_recommendations(
                 "confidence": conf or "-",
                 "ha_leg": bool(fid in preferred or fight in preferred),
                 "weight_class": str(row.get("weight_class") or ""),
+                "event": event_from_record(row),
+                "event_name": event_from_record(row),
             }
         )
 
@@ -785,6 +789,8 @@ def build_auto_parlay_recommendations(
                             "prob": c["prob"],
                             "confidence": c["confidence"],
                             "ha_leg": c["ha_leg"],
+                            "event": c.get("event") or "",
+                            "event_name": c.get("event_name") or c.get("event") or "",
                         }
                         for c in combo
                     ],
@@ -803,6 +809,8 @@ def build_auto_parlay_recommendations(
                     "stake_pct": 0.0,
                     "ha_legs": ha_count,
                     "ha_qualified": n == 2 and ha_count == n,
+                    "event": next((str(c.get("event") or "") for c in combo if c.get("event")), ""),
+                    "event_name": next((str(c.get("event") or "") for c in combo if c.get("event")), ""),
                     "reason": "",
                     "brief": (
                         f"Auto {n}-leg · combined {combined:.0%}"
@@ -2256,6 +2264,18 @@ def aggregate_top_recommended_bets(
                     "f2_gym": str(row.get("f2_gym") or "") if row is not None else "",
                     "f1_gym_strengths": str(row.get("f1_gym_strengths") or "") if row is not None else "",
                     "f2_gym_strengths": str(row.get("f2_gym_strengths") or "") if row is not None else "",
+                    "event": str(
+                        single.get("event")
+                        or single.get("event_name")
+                        or (row.get("event_name") if row is not None else "")
+                        or ""
+                    ),
+                    "event_name": str(
+                        single.get("event_name")
+                        or single.get("event")
+                        or (row.get("event_name") if row is not None else "")
+                        or ""
+                    ),
                 }
             )
 
@@ -2447,6 +2467,8 @@ def aggregate_overview_recommendations(
                     "odds_display": "-",
                     "is_parlay": False,
                     "market_type": "moneyline",
+                    "event": str(s.get("event") or s.get("event_name") or ""),
+                    "event_name": str(s.get("event_name") or s.get("event") or ""),
                 }
             )
             seen.add(fid)

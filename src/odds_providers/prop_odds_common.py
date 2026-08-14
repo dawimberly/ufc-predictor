@@ -58,6 +58,75 @@ def normalize_totals_point(point: float | None) -> float | None:
     return float(point)
 
 
+def map_rounds_total(side: str, point: float | None) -> tuple[str, str] | None:
+    """
+    Map Over/Under + rounds line to (prop_key, selection).
+
+    Uses the actual totals point (1.5 / 2.5 / 3.5 / 4.5). Callers must not
+    hard-code Over 1.5 when ``data-points`` / API point is something else.
+    """
+    pt = normalize_totals_point(point)
+    if pt is None:
+        return None
+    side_l = str(side or "").strip().lower()
+    if side_l in ("o", "over"):
+        side_l = "over"
+    elif side_l in ("u", "under"):
+        side_l = "under"
+    else:
+        return None
+
+    # Snap common MMA half-round lines
+    for candidate in (1.5, 2.5, 3.5, 4.5, 0.5):
+        if abs(pt - candidate) < 0.01:
+            pt = candidate
+            break
+
+    pt_tag = f"{pt:.1f}".replace(".", "_")  # 2.5 -> 2_5
+    if side_l == "over":
+        return f"over_{pt_tag}_rounds", f"Over {pt:g}"
+    return f"under_{pt_tag}_rounds", f"Under {pt:g}"
+
+
+def remap_totals_prop_keys(df: pd.DataFrame) -> pd.DataFrame:
+    """Fix rows where selection/prop_key say 1.5 but ``point`` is a different line."""
+    if df is None or df.empty or "point" not in df.columns:
+        return df
+    out = df.copy()
+    for idx, row in out.iterrows():
+        market = str(row.get("market_key", "") or "").lower()
+        prop_key = str(row.get("prop_key", "") or "")
+        if market and market != "totals" and "round" not in prop_key:
+            continue
+        if prop_key in ("fighter_ko", "fighter_sub", "fighter_decision", "goes_to_decision", "finish", "ko_tko", "submission"):
+            continue
+        pt = normalize_totals_point(row.get("point"))
+        if pt is None:
+            continue
+        sel = str(row.get("selection", "") or "").lower()
+        side = "over" if ("over" in sel or sel.startswith("o ")) else None
+        if side is None and ("under" in sel or sel.startswith("u ") or prop_key in ("round_1_finish", "under_1_5_rounds")):
+            side = "under"
+        if side is None:
+            if prop_key.startswith("over_"):
+                side = "over"
+            elif prop_key.startswith("under_") or prop_key == "round_1_finish":
+                side = "under"
+        if side is None:
+            continue
+        mapped = map_rounds_total(side, pt)
+        if mapped is None:
+            continue
+        key, selection = mapped
+        # Keep legacy alias row for Under 1.5 ↔ R1 finish consumers
+        if key == "under_1_5_rounds" and prop_key == "round_1_finish":
+            out.at[idx, "selection"] = "Under 1.5 / R1 Finish"
+            continue
+        out.at[idx, "prop_key"] = key
+        out.at[idx, "selection"] = selection
+    return out
+
+
 def prop_row(
     *,
     fighter_1: str,
@@ -112,11 +181,14 @@ def lookup_prop_odds_row(
     odds: pd.DataFrame,
     *,
     selection: str | None = None,
+    fighter_name: str | None = None,
 ) -> pd.Series | None:
-    """Find a prop line for a fight, optionally matching selection (Over/Under/Yes)."""
+    """Find a prop line for a fight, optionally matching selection / method fighter."""
     if odds is None or odds.empty:
         return None
     keys = PROP_KEY_ALIASES.get(str(prop_key), (str(prop_key),))
+    named = str(fighter_name or "").strip()
+    fallback: pd.Series | None = None
     for _, row in odds.iterrows():
         f1 = str(row.get("fighter_1", ""))
         f2 = str(row.get("fighter_2", ""))
@@ -126,10 +198,21 @@ def lookup_prop_odds_row(
             continue
         if str(row.get("prop_key", "")) not in keys:
             continue
-        if selection is not None and str(row.get("selection", "")).lower() != selection.lower():
+        row_sel = str(row.get("selection", "") or "")
+        if selection is not None and row_sel.lower() != selection.lower():
+            continue
+        if named:
+            sel_fighter = row_sel
+            if sel_fighter.lower().endswith(" yes"):
+                sel_fighter = sel_fighter[:-4].strip()
+            if _names_match(named, sel_fighter) or named.lower() in sel_fighter.lower():
+                return row
+            # Keep first fight+key match as fallback when selection fighter unknown
+            if fallback is None:
+                fallback = row
             continue
         return row
-    return None
+    return fallback
 
 
 def attach_prop_odds_to_predictions(

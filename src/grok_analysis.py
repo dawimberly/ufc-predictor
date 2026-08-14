@@ -444,8 +444,10 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
             action = action_label_for_bet(t)
         else:
             action = "FUN ONLY ($0)" if is_fun else "BET THIS"
+        ev = str(t.get("event") or t.get("event_name") or "").strip()
+        ev_bit = f"event={ev} | " if ev else ""
         ticket_lines.append(
-            f"- id={t.get('id')} | ACTION={action} | {t.get('side')} | {t.get('market')} | "
+            f"- id={t.get('id')} | {ev_bit}ACTION={action} | {t.get('side')} | {t.get('market')} | "
             f"book={t.get('book') or 'n/a'} | stake={t.get('stake_pct')}%/${t.get('stake_usd')} | "
             f"prob={t.get('prob')} | edge={t.get('edge_pct')}% | conf={t.get('confidence')}"
         )
@@ -453,8 +455,10 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
 
     parlay_lines: list[str] = []
     for p in parlays:
+        ev = str(p.get("event") or p.get("event_name") or "").strip()
+        ev_bit = f"event={ev} | " if ev else ""
         parlay_lines.append(
-            f"- id={p.get('id')} | FUN ONLY research $0 | {p.get('n_legs')}-leg | {p.get('picks')} | "
+            f"- id={p.get('id')} | {ev_bit}FUN ONLY research $0 | {p.get('n_legs')}-leg | {p.get('picks')} | "
             f"combined_prob={float(p.get('combined_prob') or 0):.0%} | "
             f"ha_qualified={bool(p.get('ha_qualified'))}"
         )
@@ -478,6 +482,7 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
 {what_to_do}{warning}
 Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
 In summary + each pick reason, lead with ACTION verbs: BET THIS ($), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
+Name the event on every pick and parlay (Next Two often has two cards).
 FUN ONLY / advisory stakes stay 0 — never tell the user to size those as bankroll bets.
 Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars); empty ACT list => say sized NO BET.
 
@@ -489,7 +494,7 @@ Auto parlays (narrate as FUN ONLY research — do not invent legs):
 {parlays_block}
 
 Return JSON:
-{{"event":"{event}","summary":"start with WHAT TO BET line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"BET THIS $x or FUN ONLY $0 — ...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","n_legs":2,"reason":"FUN ONLY $0 — ...","conviction":"high|medium|low"}}]}}"""
+{{"event":"{event}","summary":"start with WHAT TO BET line and name the event(s)","picks":[{{"id":"...","event":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"BET THIS $x or FUN ONLY $0 — Event — ...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","event":"...","n_legs":2,"reason":"FUN ONLY $0 — Event — ...","conviction":"high|medium|low"}}]}}"""
 
 
 def _ticket_slip_id(ticket: dict[str, Any]) -> str:
@@ -511,24 +516,32 @@ def _ticket_to_slip_row(
     tier: str = "actionable",
 ) -> dict[str, Any]:
     """Normalize an HA-sized ticket into Ollama bet-slip row fields."""
+    from src.props import PROP_MARKET_LABELS, event_from_record
+
     is_parlay = bool(ticket.get("is_parlay")) or int(ticket.get("n_legs") or 1) >= 2
     is_prop = (
         str(ticket.get("market_type") or "").lower() == "prop"
-        or str(ticket.get("prop_key") or "") == "over_1_5_rounds"
+        or str(ticket.get("prop_key") or "").endswith("_rounds")
     )
     fight = str(ticket.get("fight") or "").strip()
+    event = event_from_record(ticket)
     if is_parlay:
         n_legs = int(ticket.get("n_legs") or 2)
         market = f"{n_legs}-leg parlay"
         side = str(ticket.get("pick_line") or ticket.get("picks") or ticket.get("display_label") or "")
     elif is_prop:
-        market = "Over 1.5 Rounds"
+        market = str(
+            ticket.get("prop_short")
+            or ticket.get("prop_type")
+            or PROP_MARKET_LABELS.get(str(ticket.get("prop_key") or ""), "")
+            or "Prop"
+        )
         label = str(
             ticket.get("display_label")
             or ticket.get("label")
             or ticket.get("prop_short")
             or ticket.get("pick_line")
-            or "Over 1.5 Rounds"
+            or market
         )
         side = f"{fight} — {label}" if fight and fight not in label else label
     else:
@@ -581,6 +594,8 @@ def _ticket_to_slip_row(
         "confidence": conf,
         "strength_score": ticket.get("strength_score"),
         "uncertainty_action": ticket.get("uncertainty_action") or "allow",
+        "event": event,
+        "event_name": event,
         "fight": ticket.get("fight"),
         "pick": ticket.get("pick") or (side if is_prop else ticket.get("pick")),
         "prop_key": ticket.get("prop_key") if is_prop else "",
@@ -625,6 +640,23 @@ def _candidate_dedupe_key(ticket: dict[str, Any]) -> str:
         return f"{base}|{market}|{selection}|{book}"
 
 
+def _uncertainty_blocks_ticket(ticket: dict[str, Any]) -> bool:
+    unc = str(ticket.get("uncertainty_action") or "").strip().lower()
+    return unc in {"skip", "block", "missing", "missing_uncertainty"}
+
+
+def _ticket_in_cleared_keys(ticket: dict[str, Any], cleared: set[str]) -> bool:
+    if not cleared:
+        return False
+    for k in (
+        str(ticket.get("fight_id") or "").strip(),
+        str(ticket.get("fight") or "").strip(),
+    ):
+        if k and k in cleared:
+            return True
+    return False
+
+
 def collect_card_analysis_inputs(
     books: dict[str, dict[str, Any]],
     budget_state: dict[str, Any] | None,
@@ -639,13 +671,21 @@ def collect_card_analysis_inputs(
     Gather HA-gated + fun-tier tickets for Ollama bet-slip narration.
 
     Builds one merged Top N list (default 5):
-    - CLEARS GATES (HA-sized) first
+    - CLEARS GATES (HA-sized) first — Blue/Sky only from real alert clears
     - then DECENT FUN / caution fillers
-    - props (Over 1.5) compete in the same pool — never concatenated past Top N
+    - props compete in the same pool — never concatenated past Top N
 
     Dedupes on (fight_id, market_type, selection, book) via dedupe_rank_top_tickets.
     """
     from src.bet_slip import dedupe_rank_top_tickets
+    from src.bet_tiers import (
+        TIER_BLUE,
+        TIER_GREEN,
+        TIER_SKY_BLUE,
+        TIER_YELLOW,
+        is_sky_blue_ticket,
+        singles_cleared_keys,
+    )
     from src.strategy import (
         aggregate_overview_recommendations,
         aggregate_top_recommended_bets,
@@ -673,22 +713,75 @@ def collect_card_analysis_inputs(
             + list(slip.get("parlays") or [])
         )
 
+    # HA-cleared keys from book alerts (same source Overview uses for Blue)
+    cleared_singles: list[dict[str, Any]] = []
+    for book_data in (books or {}).values():
+        if not isinstance(book_data, dict):
+            continue
+        cleared_singles.extend(list((book_data.get("alerts") or {}).get("singles") or []))
+    cleared_keys = singles_cleared_keys(cleared_singles)
+
     raw_candidates: list[dict[str, Any]] = []
 
-    # HA / overview sized tickets
+    # Overview tickets: Blue only when HA-cleared + sized + not uncertainty-blocked
     for t in items:
-        row = _ticket_to_slip_row(t, rank=0, tier="actionable")
-        stake_ok = float(row.get("stake_usd") or 0) > 0 and float(row.get("stake_pct") or 0) > 0
-        if stake_ok:
-            row["bet_tier"] = "blue"
+        stake_usd = float(t.get("suggested_stake") or t.get("stake_usd") or 0)
+        stake_pct = float(t.get("stake_pct") or 0)
+        stake_ok = stake_usd > 0 and stake_pct > 0
+        ha_ok = (
+            stake_ok
+            and _ticket_in_cleared_keys(t, cleared_keys)
+            and not _uncertainty_blocks_ticket(t)
+            and not bool(t.get("advisory") or t.get("fun_bet"))
+            and not bool(t.get("is_parlay"))
+            and int(t.get("n_legs") or 1) < 2
+        )
+        # Live Over 1.5 props: only HA-Blue if classify agrees (never invent from stake alone)
+        is_prop = str(t.get("market_type") or "").lower() == "prop" or bool(t.get("prop_key"))
+        if is_prop and stake_ok and not _uncertainty_blocks_ticket(t):
+            from src.bet_tiers import classify_prop_bet_tier
+            from src.props import is_live_prop_odds_source
+
+            prop_tier, _ = classify_prop_bet_tier(t, debug=False)
+            if (
+                prop_tier in {TIER_BLUE, TIER_SKY_BLUE}
+                and is_live_prop_odds_source(str(t.get("odds_source") or ""))
+                and t.get("strict_qualified") is not False
+                and str(t.get("prop_key") or "") == "over_1_5_rounds"
+            ):
+                ha_ok = True
+            else:
+                ha_ok = False
+        if ha_ok:
+            row = _ticket_to_slip_row(t, rank=0, tier="actionable")
+            if not row.get("event") and event_label:
+                row["event"] = event_label
+                row["event_name"] = event_label
+            if is_sky_blue_ticket(
+                stake_pct=stake_pct if stake_pct > 0 else None,
+                stake_usd=stake_usd if stake_usd > 0 else None,
+                uncertainty_reason=str(t.get("uncertainty_reason") or ""),
+            ):
+                row["bet_tier"] = TIER_SKY_BLUE
+            else:
+                row["bet_tier"] = TIER_BLUE
             row["fun_bet"] = False
             row["advisory"] = False
             raw_candidates.append(row)
         else:
             adv = _ticket_to_slip_row(t, rank=0, tier="advisory")
+            if not adv.get("event") and event_label:
+                adv["event"] = event_label
+                adv["event_name"] = event_label
+            adv["advisory"] = True
+            adv["fun_bet"] = True
+            adv["stake_usd"] = 0.0
+            adv["stake_pct"] = 0.0
+            if not adv.get("bet_tier") or adv.get("bet_tier") in {"blue", "sky_blue"}:
+                adv["bet_tier"] = TIER_YELLOW
             raw_candidates.append(adv)
 
-    # Extra ranked singles (may overlap — dedupe later)
+    # Extra ranked singles (may overlap — dedupe later); never invent Blue here
     try:
         extra = aggregate_top_recommended_bets(
             books, bs, limit=top_n, per_book_cap=2, profile=prof
@@ -696,7 +789,17 @@ def collect_card_analysis_inputs(
     except Exception:
         extra = []
     for t in list(slip.get("prop_singles") or []) + list(slip.get("parlays") or []) + list(extra):
-        raw_candidates.append(_ticket_to_slip_row(t, rank=0, tier="advisory"))
+        extra_row = _ticket_to_slip_row(t, rank=0, tier="advisory")
+        if not extra_row.get("event") and event_label:
+            extra_row["event"] = event_label
+            extra_row["event_name"] = event_label
+        extra_row["advisory"] = True
+        extra_row["fun_bet"] = True
+        extra_row["stake_usd"] = 0.0
+        extra_row["stake_pct"] = 0.0
+        if not extra_row.get("bet_tier") or extra_row.get("bet_tier") in {"blue", "sky_blue"}:
+            extra_row["bet_tier"] = TIER_YELLOW
+        raw_candidates.append(extra_row)
 
     # Skips (context only — not in top list)
     skipped_payload: list[dict[str, Any]] = []
@@ -734,10 +837,6 @@ def collect_card_analysis_inputs(
     prop_tiers: dict[str, Any] = {}
     try:
         from src.bet_tiers import (
-            TIER_BLUE,
-            TIER_GREEN,
-            TIER_SKY_BLUE,
-            TIER_YELLOW,
             classify_prop_bet_tier,
             collect_props_from_books,
             merge_bet_tier_dicts,
@@ -745,12 +844,10 @@ def collect_card_analysis_inputs(
             rank_prop_bet_tiers,
         )
 
-        cleared: list[dict[str, Any]] = []
         preds = None
         for book_data in (books or {}).values():
             if not isinstance(book_data, dict):
                 continue
-            cleared.extend((book_data.get("alerts") or {}).get("singles") or [])
             if preds is None:
                 p = book_data.get("predictions")
                 if isinstance(p, pd.DataFrame) and not p.empty:
@@ -758,7 +855,7 @@ def collect_card_analysis_inputs(
         overview = (books or {}).get("Overview") or {}
         if preds is None and isinstance(overview.get("predictions"), pd.DataFrame):
             preds = overview.get("predictions")
-        fun_tiers = rank_card_bet_tiers(preds, cleared_singles=cleared, limit_per_tier=6)
+        fun_tiers = rank_card_bet_tiers(preds, cleared_singles=cleared_singles, limit_per_tier=6)
 
         raw_props = collect_props_from_books(
             books, limit=prop_cap, allowed_fights=allowed_fights
@@ -777,9 +874,28 @@ def collect_card_analysis_inputs(
         prop_tiers = rank_prop_bet_tiers(merged_props, limit_per_tier=prop_cap)
         fun_tiers = merge_bet_tier_dicts(fun_tiers, prop_tiers, limit_per_tier=8)
 
+        # Inject HA Blue/Sky from tier ranker (authoritative — matches Overview colors)
+        for tier_name in (TIER_BLUE, TIER_SKY_BLUE):
+            for b in fun_tiers.get(tier_name) or []:
+                row = _ticket_to_slip_row(b, rank=0, tier="actionable")
+                if not row.get("event") and event_label:
+                    row["event"] = event_label
+                    row["event_name"] = event_label
+                row["bet_tier"] = tier_name
+                row["fun_bet"] = False
+                row["advisory"] = False
+                # Keep stakes only when the tier source actually sized them
+                if float(row.get("stake_usd") or 0) <= 0 and float(b.get("suggested_stake") or b.get("stake_usd") or 0) > 0:
+                    row["stake_usd"] = float(b.get("suggested_stake") or b.get("stake_usd") or 0)
+                    row["stake_pct"] = float(b.get("stake_pct") or 0)
+                raw_candidates.append(row)
+
         # Fun ML + prop candidates compete in the SAME pool (merged below)
         for fun in list(fun_tiers.get(TIER_GREEN) or []) + list(fun_tiers.get(TIER_YELLOW) or []):
             row = _ticket_to_slip_row(fun, rank=0, tier="advisory")
+            if not row.get("event") and event_label:
+                row["event"] = event_label
+                row["event_name"] = event_label
             row["bet_tier"] = fun.get("bet_tier") or TIER_GREEN
             row["fun_bet"] = True
             row["advisory"] = True
@@ -795,22 +911,18 @@ def collect_card_analysis_inputs(
                 stake_ok = float(src.get("suggested_stake") or src.get("stake_usd") or 0) > 0 and float(
                     src.get("stake_pct") or 0
                 ) > 0
+                # Props: Blue only when tier ranker said blue/sky AND live stake exists
+                prop_ha = tier_name in {TIER_BLUE, TIER_SKY_BLUE} and stake_ok
                 row = _ticket_to_slip_row(
                     src,
                     rank=0,
-                    tier="actionable" if stake_ok else "advisory",
+                    tier="actionable" if prop_ha else "advisory",
                 )
                 row["bet_tier"] = p.get("bet_tier") or tier_name
-                row["fun_bet"] = bool(p.get("fun_bet")) and not stake_ok
                 row["tier_reason"] = p.get("tier_reason") or row.get("tier_reason") or ""
-                if not stake_ok:
-                    row["stake_usd"] = 0.0
-                    row["stake_pct"] = 0.0
-                    row["advisory"] = True
-                    row["fun_bet"] = True
-                else:
-                    from src.bet_tiers import is_sky_blue_ticket
-
+                if prop_ha:
+                    row["fun_bet"] = False
+                    row["advisory"] = False
                     if is_sky_blue_ticket(
                         stake_pct=float(src.get("stake_pct") or 0) or None,
                         stake_usd=float(src.get("suggested_stake") or src.get("stake_usd") or 0)
@@ -820,30 +932,48 @@ def collect_card_analysis_inputs(
                         row["bet_tier"] = TIER_SKY_BLUE
                     else:
                         row["bet_tier"] = TIER_BLUE
-                    row["fun_bet"] = False
-                    row["advisory"] = False
+                else:
+                    row["stake_usd"] = 0.0
+                    row["stake_pct"] = 0.0
+                    row["advisory"] = True
+                    row["fun_bet"] = True
+                    if row.get("bet_tier") in {TIER_BLUE, TIER_SKY_BLUE}:
+                        # Downgrade — no size means not Blue
+                        try:
+                            tier, reason = classify_prop_bet_tier(src, debug=False)
+                            row["bet_tier"] = tier if tier not in {TIER_BLUE, TIER_SKY_BLUE} else TIER_YELLOW
+                            row["tier_reason"] = reason
+                        except Exception:
+                            row["bet_tier"] = TIER_YELLOW
+                if not row.get("event") and event_label:
+                    row["event"] = event_label
+                    row["event_name"] = event_label
                 raw_candidates.append(row)
     except Exception as exc:
         logger.debug("fun/prop tier build skipped: %s", exc)
 
-    # Annotate missing bet_tier before merge
+    # Annotate missing bet_tier — never invent Blue from stake
     for t in raw_candidates:
         if t.get("bet_tier"):
-            continue
-        if float(t.get("stake_usd") or 0) > 0:
-            t["bet_tier"] = "blue"
             continue
         if str(t.get("market_type") or "") == "prop" or "Over 1.5" in str(t.get("market") or ""):
             try:
                 from src.bet_tiers import classify_prop_bet_tier
 
                 tier, reason = classify_prop_bet_tier(t, debug=False)
+                if tier in {TIER_BLUE, TIER_SKY_BLUE} and float(t.get("stake_usd") or 0) <= 0:
+                    tier = TIER_YELLOW
                 t["bet_tier"] = tier
                 t["tier_reason"] = reason
             except Exception:
-                t["bet_tier"] = "yellow"
+                t["bet_tier"] = TIER_YELLOW
         else:
-            t["bet_tier"] = "yellow"
+            t["bet_tier"] = TIER_YELLOW
+        if t.get("bet_tier") not in {TIER_BLUE, TIER_SKY_BLUE}:
+            t["advisory"] = True
+            t["fun_bet"] = True
+            t["stake_usd"] = 0.0
+            t["stake_pct"] = 0.0
 
     tickets = dedupe_rank_top_tickets(
         raw_candidates,
@@ -852,7 +982,14 @@ def collect_card_analysis_inputs(
         log=logger,
     )
 
-    actionable_only = [t for t in tickets if not t.get("advisory") and float(t.get("stake_usd") or 0) > 0]
+    actionable_only = [
+        t
+        for t in tickets
+        if str(t.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+        and not t.get("advisory")
+        and not t.get("fun_bet")
+        and float(t.get("stake_usd") or 0) > 0
+    ]
     total_pct = round(sum(float(t.get("stake_pct") or 0) for t in actionable_only), 1)
     total_usd = round(sum(float(t.get("stake_usd") or 0) for t in actionable_only), 2)
     br = float(bs.get("total_bankroll") or config.DEFAULT_TOTAL_BANKROLL)
@@ -875,8 +1012,6 @@ def collect_card_analysis_inputs(
         if allowed_fights and preds_df is not None and not preds_df.empty:
             # Soft-filter to loaded card fights when keys are available
             try:
-                import pandas as pd
-
                 mask = pd.Series(False, index=preds_df.index)
                 if "fight_id" in preds_df.columns:
                     mask = mask | preds_df["fight_id"].astype(str).isin(allowed_fights)
@@ -986,6 +1121,10 @@ def merge_ollama_reasons_into_slip(
             conv = str(match.get("conviction") or "").lower()
             if conv in {"high", "medium", "low"}:
                 row["conviction"] = conv
+            ev = str(match.get("event") or match.get("event_name") or "").strip()
+            if ev and not str(row.get("event") or row.get("event_name") or "").strip():
+                row["event"] = ev
+                row["event_name"] = ev
         if not row.get("reason"):
             # Deterministic fallback reason from model fields
             conf = str(row.get("confidence") or "-")
@@ -1036,6 +1175,10 @@ def merge_ollama_reasons_into_parlays(
             conv = str(match.get("conviction") or "").lower()
             if conv in {"high", "medium", "low"}:
                 row["conviction"] = conv
+            ev = str(match.get("event") or match.get("event_name") or "").strip()
+            if ev and not str(row.get("event") or row.get("event_name") or "").strip():
+                row["event"] = ev
+                row["event_name"] = ev
         if not row.get("reason"):
             comb = float(row.get("combined_prob") or 0)
             tag = "HA legs" if row.get("ha_qualified") else "research"
@@ -1114,6 +1257,7 @@ def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict
                 "stake_usd": row.get("stake_usd"),
                 "reason": narrative,
                 "narrative_edge": narrative,
+                "event": str(row.get("event") or row.get("event_name") or event_label or "").strip(),
                 "crowd_positioning": str(
                     row.get("crowd_positioning") or row.get("crowd") or ""
                 ).strip()[:80],
@@ -1155,6 +1299,7 @@ def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict
                 "n_legs": n_legs,
                 "reason": reason,
                 "conviction": str(row.get("conviction") or "medium").lower(),
+                "event": str(row.get("event") or row.get("event_name") or event_label or "").strip(),
             }
         )
 
@@ -1571,7 +1716,6 @@ def build_best_bets_briefing(
 ) -> str:
     """Best-bet briefing with Blue/Green/Yellow/Red — HA gates unchanged for Blue."""
     from src.bet_tiers import (
-        TIER_BLUE,
         format_tiered_best_bets,
         rank_card_bet_tiers,
     )
@@ -1587,8 +1731,18 @@ def build_best_bets_briefing(
             )
 
     singles = list(cleared_singles or [])
-    if not singles:
-        singles = [b for b in slip if not b.get("advisory") and not b.get("fun_bet")]
+    if not singles and slip:
+        # Only HA-tagged Blue/Sky rows — never promote bare stake leftovers to Blue
+        from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE
+
+        singles = [
+            b
+            for b in slip
+            if str(b.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+            and not b.get("advisory")
+            and not b.get("fun_bet")
+            and float(b.get("stake_usd") or b.get("suggested_stake") or 0) > 0
+        ]
 
     preds = predictions
     if preds is None and isinstance(result, dict):
@@ -1603,14 +1757,7 @@ def build_best_bets_briefing(
         preds = None
 
     tiers = rank_card_bet_tiers(preds, cleared_singles=singles, limit_per_tier=6)
-    # Ensure blue from slip when preds didn't mark them
-    if not tiers.get(TIER_BLUE) and singles:
-        for s in singles[:5]:
-            item = dict(s)
-            item["bet_tier"] = TIER_BLUE
-            item["tier"] = TIER_BLUE
-            item["fun_bet"] = False
-            tiers[TIER_BLUE].append(item)
+    # Do NOT invent Blue from slip leftovers — if HA cleared none, Blue stays empty.
 
     if not isinstance(result, dict) and preds is None and not singles:
         return (

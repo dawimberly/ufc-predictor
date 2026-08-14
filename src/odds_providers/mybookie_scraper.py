@@ -20,8 +20,10 @@ from src.odds_providers.odds_reliability import (
 from src.odds_providers.prop_odds_common import (
     american_to_decimal,
     empty_prop_odds_df,
+    map_rounds_total,
     parse_american_odds,
     prop_row,
+    remap_totals_prop_keys,
 )
 from src.predictor import OddsAPIError, _implied_probs
 
@@ -42,8 +44,9 @@ LAST_WARNING: str = ""
 _METHOD_PROP_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(.+?)\s+by\s+ko(?:/tko)?$", re.I), "fighter_ko"),
     (re.compile(r"^(.+?)\s+by\s+submission$", re.I), "fighter_sub"),
+    (re.compile(r"^(.+?)\s+by\s+decision$", re.I), "fighter_decision"),
 ]
-_SKIP_PROP_RE = re.compile(r"^draw$|by\s+decision$|&\s*\d|^\{\{\{", re.I)
+_SKIP_PROP_RE = re.compile(r"^draw$|&\s*\d|^\{\{\{", re.I)
 
 _PROP_LABEL_MAP: list[tuple[re.Pattern[str], str, str]] = [
     (re.compile(r"goes?\s+to\s+decision|fight\s+goes\s+to\s+decision", re.I), "goes_to_decision", "Yes"),
@@ -201,28 +204,37 @@ def _parse_totals_props(soup) -> list[dict[str, Any]]:
                 game_id = str(btn.get("data-gameid", "")).strip()
             american = parse_american_odds(str(btn.get("data-odd", "")))
             if re.search(r"\bO\b|over", text, re.I):
-                props.append(
-                    prop_row(
-                        fighter_1=f1_name,
-                        fighter_2=f2_name,
-                        prop_key="over_1_5_rounds",
-                        selection="Over 1.5",
-                        decimal_odds=odd,
-                        bookmaker="MyBookie",
-                        odds_source="live",
-                        market_key="totals",
-                        point=point,
-                        rotation=game_id,
-                        american_odds=american,
-                    )
-                )
+                mapped = map_rounds_total("over", point)
             elif re.search(r"\bU\b|under", text, re.I):
+                mapped = map_rounds_total("under", point)
+            else:
+                mapped = None
+            if mapped is None:
+                continue
+            prop_key, selection = mapped
+            props.append(
+                prop_row(
+                    fighter_1=f1_name,
+                    fighter_2=f2_name,
+                    prop_key=prop_key,
+                    selection=selection,
+                    decimal_odds=odd,
+                    bookmaker="MyBookie",
+                    odds_source="live",
+                    market_key="totals",
+                    point=point,
+                    rotation=game_id,
+                    american_odds=american,
+                )
+            )
+            # Legacy alias: Under 1.5 ≡ round-1 finish for older consumers
+            if prop_key == "under_1_5_rounds":
                 props.append(
                     prop_row(
                         fighter_1=f1_name,
                         fighter_2=f2_name,
                         prop_key="round_1_finish",
-                        selection="Under 1.5",
+                        selection="Under 1.5 / R1 Finish",
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",
@@ -317,28 +329,36 @@ def _parse_prop_buttons(soup, *, f1_default: str = "", f2_default: str = "", gam
                 point = 1.5
             american = parse_american_odds(str(btn.get("data-odd", "")))
             if re.search(r"\bO\b|over", text, re.I):
-                props.append(
-                    prop_row(
-                        fighter_1=fight_f1,
-                        fighter_2=fight_f2,
-                        prop_key="over_1_5_rounds",
-                        selection="Over 1.5",
-                        decimal_odds=odd,
-                        bookmaker="MyBookie",
-                        odds_source="live",
-                        market_key="totals",
-                        point=point,
-                        rotation=rotation,
-                        american_odds=american,
-                    )
-                )
+                mapped = map_rounds_total("over", point)
             elif re.search(r"\bU\b|under", text, re.I):
+                mapped = map_rounds_total("under", point)
+            else:
+                mapped = None
+            if mapped is None:
+                continue
+            prop_key, selection = mapped
+            props.append(
+                prop_row(
+                    fighter_1=fight_f1,
+                    fighter_2=fight_f2,
+                    prop_key=prop_key,
+                    selection=selection,
+                    decimal_odds=odd,
+                    bookmaker="MyBookie",
+                    odds_source="live",
+                    market_key="totals",
+                    point=point,
+                    rotation=rotation,
+                    american_odds=american,
+                )
+            )
+            if prop_key == "under_1_5_rounds":
                 props.append(
                     prop_row(
                         fighter_1=fight_f1,
                         fighter_2=fight_f2,
                         prop_key="round_1_finish",
-                        selection="Under 1.5",
+                        selection="Under 1.5 / R1 Finish",
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",
@@ -359,7 +379,7 @@ def _parse_prop_buttons(soup, *, f1_default: str = "", f2_default: str = "", gam
         if not fight_f1 or not fight_f2:
             continue
 
-        if prop_key in ("fighter_ko", "fighter_sub"):
+        if prop_key in ("fighter_ko", "fighter_sub", "fighter_decision"):
             fighter = selection_or_fighter if isinstance(selection_or_fighter, str) else team
             selection = f"{fighter} Yes"
         else:
@@ -622,15 +642,51 @@ def fetch_mybookie_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if not force_refresh and _cache_fresh(MYBOOKIE_PROP_CACHE_PATH):
         cached = pd.read_csv(MYBOOKIE_PROP_CACHE_PATH)
         if not cached.empty:
-            logger.info("Using cached MyBookie prop odds (%s rows)", len(cached))
-            return cached
+            fixed = remap_totals_prop_keys(cached)
+            # Persist remapped keys so UI/cache stop showing wrong 1.5 labels
+            changed = list(fixed["prop_key"].astype(str)) != list(
+                cached["prop_key"].astype(str)
+            ) or list(fixed["selection"].astype(str)) != list(
+                cached["selection"].astype(str)
+            )
+            if changed:
+                fixed.to_csv(MYBOOKIE_PROP_CACHE_PATH, index=False)
+            logger.info("Using cached MyBookie prop odds (%s rows)", len(fixed))
+            return fixed
+
+    prev_method = empty_prop_odds_df()
+    if MYBOOKIE_PROP_CACHE_PATH.is_file():
+        try:
+            prev = pd.read_csv(MYBOOKIE_PROP_CACHE_PATH)
+            method_keys = {"fighter_ko", "fighter_sub", "fighter_decision"}
+            prev_method = prev[prev["prop_key"].astype(str).isin(method_keys)].copy()
+        except Exception:
+            prev_method = empty_prop_odds_df()
 
     _, props, _ = _scrape_pages()
-    df = pd.DataFrame(props)
-    if df.empty:
+    df = pd.DataFrame(props) if props else empty_prop_odds_df()
+    if df.empty and prev_method.empty:
         logger.info("MyBookie prop scrape returned no live lines.")
         return empty_prop_odds_df()
 
+    if not df.empty:
+        df = remap_totals_prop_keys(df)
+    method_keys = {"fighter_ko", "fighter_sub", "fighter_decision"}
+    scraped_has_method = (
+        not df.empty and df["prop_key"].astype(str).isin(method_keys).any()
+    )
+    # Prop pages often fail (geo/cookie); keep prior KO/sub/decision lines for analysis
+    if not scraped_has_method and not prev_method.empty:
+        df = pd.concat([df, prev_method], ignore_index=True) if not df.empty else prev_method
+        logger.info(
+            "MyBookie prop scrape missed method markets — kept %s cached method rows",
+            len(prev_method),
+        )
+
+    if df.empty:
+        return empty_prop_odds_df()
+
+    df = remap_totals_prop_keys(df)
     df = df.drop_duplicates(
         subset=["fighter_1", "fighter_2", "prop_key", "selection"],
         keep="first",

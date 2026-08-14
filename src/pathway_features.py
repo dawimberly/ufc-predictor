@@ -338,3 +338,149 @@ def log_pathway_coverage(
         coverage[col] = nn
         logger.info("  %s: %.1f%% non-null", col, nn)
     return coverage
+
+
+# Fighter-side rates used by the props engine (not FEATURE_COLUMNS).
+_PROPS_PATHWAY_SIDE_FIELDS: tuple[str, ...] = (
+    "ko_win_rate_l5",
+    "ko_win_rate_career",
+    "sub_win_rate_l5",
+    "sub_win_rate_career",
+    "dec_win_rate_l5",
+    "dec_win_rate_career",
+    "ko_loss_rate_l5",
+    "sub_loss_rate_l5",
+    "dec_loss_rate_l5",
+    "r1_finish_rate_l5",
+    "r1_finish_rate_career",
+    "distance_rate_l5",
+    "distance_rate_career",
+    "late_finish_rate_l5",
+)
+
+
+def attach_pathway_rates_for_props(
+    df: pd.DataFrame,
+    *,
+    fights: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Attach f1_/f2_ pathway method rates for props only.
+
+    Does NOT set ENABLE_PATHWAY_FEATURES or mutate FEATURE_COLUMNS.
+    Leakage-safe as-of rates from prior fights (same rolling as production PATH block).
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    need = any(
+        f"f1_{c}" not in df.columns or df[f"f1_{c}"].isna().all()
+        for c in ("ko_win_rate_l5", "r1_finish_rate_l5", "sub_win_rate_l5")
+    )
+    if not need:
+        return df
+
+    import config
+    from src.data_loader import clean_fighter_name, load_fights
+
+    def _flags(method: Any) -> tuple[int, int, int]:
+        text = str(method or "").upper()
+        is_ko = int("KO" in text or "TKO" in text)
+        is_sub = int("SUB" in text)
+        is_dec = int("DEC" in text or "DECISION" in text)
+        if not is_ko and not is_sub and not is_dec and text.strip():
+            is_dec = 1
+        return is_ko, is_sub, is_dec
+
+    out = df.copy()
+    fid = config.FIGHT_ID_COLUMN
+    date_col = config.DATE_COLUMN
+    f1c = "fighter_1" if "fighter_1" in out.columns else "fighter1"
+    f2c = "fighter_2" if "fighter_2" in out.columns else "fighter2"
+    if f1c not in out.columns or f2c not in out.columns or fid not in out.columns:
+        return out
+
+    src = fights if isinstance(fights, pd.DataFrame) and not fights.empty else None
+    if src is None:
+        try:
+            src = load_fights()
+        except Exception as exc:
+            logger.warning("pathway props attach: load_fights failed: %s", exc)
+            return out
+    if src is None or src.empty:
+        return out
+
+    sf1 = "fighter_1" if "fighter_1" in src.columns else "fighter1"
+    sf2 = "fighter_2" if "fighter_2" in src.columns else "fighter2"
+    date_src = date_col if date_col in src.columns else "date"
+    if date_src not in src.columns or "method" not in src.columns:
+        return out
+
+    work = src[
+        [c for c in (fid, date_src, sf1, sf2, "method", "round", "winner") if c in src.columns]
+    ].copy()
+    work[date_src] = pd.to_datetime(work[date_src], errors="coerce")
+    work = work.dropna(subset=[date_src]).sort_values(date_src)
+
+    rows: list[dict[str, Any]] = []
+    for _, r in work.iterrows():
+        a = clean_fighter_name(r.get(sf1))
+        b = clean_fighter_name(r.get(sf2))
+        if not a or not b:
+            continue
+        winner = clean_fighter_name(r.get("winner")) if "winner" in work.columns else ""
+        method = r.get("method")
+        is_ko, is_sub, is_dec = _flags(method)
+        for name in (a, b):
+            if not winner:
+                won = np.nan
+            else:
+                won = 1 if name == winner else 0
+            rows.append(
+                {
+                    fid: r.get(fid),
+                    date_col: r[date_src],
+                    "fighter": name,
+                    "won": won,
+                    "method": method,
+                    "round": r.get("round") if "round" in work.columns else np.nan,
+                    "is_ko": is_ko,
+                    "is_sub": is_sub,
+                    "is_dec": is_dec,
+                }
+            )
+    hist = pd.DataFrame(rows).dropna(subset=["won"])
+    if hist.empty:
+        logger.warning("pathway props attach: empty history")
+        return out
+    hist["won"] = hist["won"].astype(int)
+    hist = apply_pathway_rolling_extras(hist)
+
+    side_cols = [c for c in _PROPS_PATHWAY_SIDE_FIELDS if c in hist.columns]
+    keep = [fid, "fighter"] + side_cols
+    slim = hist[keep].drop_duplicates([fid, "fighter"], keep="last")
+
+    left = out[[fid, f1c, f2c]].copy()
+    left["_f1k"] = left[f1c].map(clean_fighter_name)
+    left["_f2k"] = left[f2c].map(clean_fighter_name)
+
+    f1_cols = {c: f"f1_{c}" for c in side_cols}
+    f2_cols = {c: f"f2_{c}" for c in side_cols}
+    s1 = slim.rename(columns={"fighter": "_f1k", **f1_cols})
+    s2 = slim.rename(columns={"fighter": "_f2k", **f2_cols})
+    merged = left.merge(
+        s1[[fid, "_f1k"] + list(f1_cols.values())], on=[fid, "_f1k"], how="left"
+    )
+    merged = merged.merge(
+        s2[[fid, "_f2k"] + list(f2_cols.values())], on=[fid, "_f2k"], how="left"
+    )
+
+    for c in list(f1_cols.values()) + list(f2_cols.values()):
+        if c in merged.columns:
+            out[c] = merged[c].to_numpy()
+
+    logger.info(
+        "pathway rates attached for props: %s side fields (ENABLE_PATHWAY_FEATURES unchanged)",
+        len(side_cols),
+    )
+    return out

@@ -18,7 +18,7 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
-from src.odds_providers.prop_odds_common import empty_prop_odds_df, prop_row
+from src.odds_providers.prop_odds_common import empty_prop_odds_df, map_rounds_total, prop_row
 from src.predictor import (
     OddsAPIError,
     _implied_probs,
@@ -165,11 +165,7 @@ def _pick_best_totals_price(
     return mid
 
 
-# Odds API totals point → internal prop_key (+ display selection).
-_TOTALS_POINT_MAP: dict[tuple[float, str], tuple[str, str]] = {
-    (1.5, "over"): ("over_1_5_rounds", "Over 1.5"),
-    (1.5, "under"): ("under_1_5_rounds", "Under 1.5"),
-}
+# Odds API totals point → internal prop_key (+ display selection) via map_rounds_total.
 
 
 def _collect_totals_points(
@@ -187,9 +183,9 @@ def _collect_totals_points(
 
 def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     """
-    Fetch UFC totals from The Odds API and map known round lines to prop keys.
+    Fetch UFC totals from The Odds API and map round lines to prop keys.
 
-    Currently maps Over/Under 1.5 → ``over_1_5_rounds`` / ``under_1_5_rounds``.
+    Maps Over/Under 1.5 / 2.5 / 3.5 / 4.5 via ``map_rounds_total``.
     Method props are not offered by The Odds API for MMA; those still come from
     optional book scrapers when enabled.
     """
@@ -335,9 +331,7 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
 
         for point in sorted(_collect_totals_points(outcomes_by_book)):
             for side in ("over", "under"):
-                mapped = _TOTALS_POINT_MAP.get((round(point, 1), side))
-                if mapped is None and abs(point - 1.5) < 0.01:
-                    mapped = _TOTALS_POINT_MAP.get((1.5, side))
+                mapped = map_rounds_total(side, point)
                 if mapped is None:
                     continue
                 prop_key, selection = mapped

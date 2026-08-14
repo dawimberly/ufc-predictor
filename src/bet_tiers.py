@@ -599,6 +599,8 @@ def _bet_dict_from_row(
         "advisory": tier not in _ACTIONABLE_TIERS,
         "brief": f"{TIER_LABELS.get(tier, tier)} — {reason.replace('_', ' ')}",
         "description": f"{TIER_LABELS.get(tier, tier)} — {reason.replace('_', ' ')}",
+        "event": str(row.get("event_name") or row.get("event") or "").strip(),
+        "event_name": str(row.get("event_name") or row.get("event") or "").strip(),
     }
 
 
@@ -741,19 +743,9 @@ def action_label_for_bet(bet: dict[str, Any] | None) -> str:
     if tier == "advisory":
         tier = TIER_GREEN if b.get("fun_bet") else TIER_YELLOW
     if tier not in TIER_ACTIONS:
-        stake = _safe_float(b.get("stake_usd"))
-        if stake is None:
-            stake = _safe_float(b.get("suggested_stake"))
-        stake_pct = _safe_float(b.get("stake_pct"))
-        if (stake is not None and stake > 0) or (stake_pct is not None and stake_pct > 0):
-            if is_sky_blue_ticket(
-                stake_pct=stake_pct,
-                uncertainty_reason=b.get("uncertainty_reason") or b.get("tier_reason"),
-            ):
-                tier = TIER_SKY_BLUE
-            else:
-                tier = TIER_BLUE
-        elif b.get("fun_bet") or b.get("advisory"):
+        # Fail closed: never invent Blue/Sky from leftover stake fields alone.
+        # Only explicit bet_tier (from HA clears) can say BET THIS.
+        if b.get("fun_bet") or b.get("advisory"):
             tier = TIER_GREEN
         else:
             tier = TIER_YELLOW
@@ -792,12 +784,7 @@ def format_what_to_do_header(
     elif slip:
         for b in slip:
             t = str(b.get("bet_tier") or "").strip().lower()
-            if t == TIER_BLUE or (
-                not t
-                and not b.get("fun_bet")
-                and not b.get("advisory")
-                and float(b.get("stake_usd") or 0) > 0
-            ):
+            if t == TIER_BLUE:
                 blue.append(b)
             elif t == TIER_SKY_BLUE:
                 sky.append(b)
@@ -822,14 +809,39 @@ def format_what_to_do_header(
 
 
 def prop_status_for_tier(prop: dict[str, Any]) -> str:
-    """Map prop payload fields onto classify_bet_tier status (HA stake → BET)."""
+    """Map prop payload fields onto classify_bet_tier status (HA stake → BET).
+
+    Display/card-budget stakes must NEVER turn synthetic or relaxed props into BET/Blue.
+    Synthetic and non-strict lines are always SKIP (Green/Yellow leans only).
+    """
+    odds_source = str(prop.get("odds_source") or "").strip().lower()
+    if odds_source in {"", "synthetic", "model", "fair"}:
+        return "SKIP:relaxed"
+    if prop.get("strict_qualified") is False:
+        return "SKIP:relaxed"
+
+    try:
+        from src.props import is_live_prop_odds_source
+
+        live = is_live_prop_odds_source(odds_source)
+    except Exception:
+        live = odds_source in {"live", "the_odds_api"}
+
+    key = str(prop.get("prop_key") or "").strip().lower()
+    # HA actionable props are Over 1.5 only
+    if key and key not in {"over_1_5_rounds", "under_1_5_rounds", "round_1_finish"}:
+        return "SKIP:prop_gate"
+
     stake = _safe_float(prop.get("suggested_stake"))
     if stake is None:
         stake = _safe_float(prop.get("stake_usd"))
     stake_pct = _safe_float(prop.get("stake_pct"))
-    if (stake is not None and stake > 0) or (stake_pct is not None and stake_pct > 0):
+    has_stake = (stake is not None and stake > 0) or (stake_pct is not None and stake_pct > 0)
+
+    # Live + strict Over 1.5 with real HA size → BET (Blue candidate)
+    if live and has_stake and key in {"", "over_1_5_rounds"}:
         return "BET"
-    odds_source = str(prop.get("odds_source") or "").strip().lower()
+
     edge = _safe_float(prop.get("edge"))
     if edge is None and prop.get("edge_pct") is not None:
         try:
@@ -838,10 +850,6 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
             edge = None
     if edge is None:
         return "SKIP:no_odds"
-    if odds_source in {"", "synthetic", "model", "fair"}:
-        return "SKIP:relaxed"
-    if prop.get("strict_qualified") is False:
-        return "SKIP:relaxed"
     return "SKIP:prop_gate"
 
 
@@ -878,11 +886,15 @@ def prop_bet_dict_from_row(prop: dict[str, Any], *, tier: str, reason: str) -> d
     if edge_pct is None:
         edge_pct = edge * 100.0
     fight = str(prop.get("fight") or "").strip()
+    from src.props import PROP_MARKET_LABELS, event_from_record
+
+    event = event_from_record(prop)
     label = str(
         prop.get("display_label")
         or prop.get("label")
         or prop.get("prop_short")
-        or "Over 1.5 Rounds"
+        or PROP_MARKET_LABELS.get(str(prop.get("prop_key") or ""), "")
+        or "Prop"
     ).strip()
     stake = _safe_float(prop.get("suggested_stake"))
     if stake is None:
@@ -893,10 +905,12 @@ def prop_bet_dict_from_row(prop: dict[str, Any], *, tier: str, reason: str) -> d
         **dict(prop),
         "fight_id": str(prop.get("fight_id") or fight),
         "fight": fight,
+        "event": event,
+        "event_name": event,
         "pick": label,
         "pick_line": f"{fight} — {label}" if fight and fight not in label else label,
         "display_label": label,
-        "bet_type": "Over 1.5 Rounds",
+        "bet_type": label,
         "market_type": "prop",
         "prop_key": str(prop.get("prop_key") or "over_1_5_rounds"),
         "edge": edge,
@@ -1004,8 +1018,22 @@ def rank_prop_bet_tiers(
         "best_fun": [],
     }
     for p in props or []:
-        tier, reason = classify_prop_bet_tier(p, debug=False)
-        item = prop_bet_dict_from_row(p, tier=tier, reason=reason)
+        # Classify on a copy so card-budget display stakes cannot invent Blue
+        # for synthetic / relaxed MyBookie lines.
+        gate = dict(p)
+        src = str(gate.get("odds_source") or "").strip().lower()
+        if src in {"", "synthetic", "model", "fair"} or gate.get("strict_qualified") is False:
+            gate["suggested_stake"] = 0.0
+            gate["stake_usd"] = 0.0
+            gate["stake_pct"] = 0.0
+        tier, reason = classify_prop_bet_tier(gate, debug=False)
+        item = prop_bet_dict_from_row(gate if tier not in _ACTIONABLE_TIERS else p, tier=tier, reason=reason)
+        if tier not in _ACTIONABLE_TIERS:
+            item["suggested_stake"] = 0.0
+            item["stake_usd"] = 0.0
+            item["stake_pct"] = 0.0
+            item["fun_bet"] = True
+            item["advisory"] = True
         out[tier].append(item)
 
     for tier in TIER_ORDER:
@@ -1145,16 +1173,43 @@ def format_tiered_best_bets(
     return "\n".join(lines)
 
 
+def _prop_market_short(b: dict[str, Any]) -> str:
+    key = str(b.get("prop_key") or "")
+    label = str(b.get("prop_short") or b.get("prop_type") or b.get("market") or "").strip()
+    if label and label.lower() not in {"prop", "over 1.5"}:
+        if "round" in label.lower() or label.lower().startswith("over") or label.lower().startswith("under"):
+            return label.replace(" Rounds", "").replace(" rounds", "")
+    try:
+        from src.props import PROP_MARKET_LABELS
+
+        mapped = PROP_MARKET_LABELS.get(key, "")
+        if mapped:
+            return mapped.replace(" Rounds", "")
+    except Exception:
+        pass
+    return "Prop" if str(b.get("market_type") or "").lower() == "prop" else "ML"
+
+
+def _event_bit(b: dict[str, Any]) -> str:
+    try:
+        from src.props import event_from_record
+
+        ev = event_from_record(b)
+    except Exception:
+        ev = str(b.get("event") or b.get("event_name") or "").strip()
+    return f"{ev} · " if ev else ""
+
+
 def _line(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
     is_prop = (
         str(b.get("market_type") or "").lower() == "prop"
-        or str(b.get("prop_key") or "") == "over_1_5_rounds"
+        or str(b.get("prop_key") or "").endswith("_rounds")
     )
     side = str(b.get("pick") or b.get("side") or "—")
     fight = str(b.get("fight") or "").strip()
     if is_prop and fight and fight not in side:
         side = f"{fight} — {side}"
-    market = "Over 1.5" if is_prop else "ML"
+    market = _prop_market_short(b) if is_prop else "ML"
     edge = b.get("edge_pct")
     if edge is None and b.get("edge") is not None:
         edge = float(b["edge"]) * 100.0
@@ -1165,7 +1220,7 @@ def _line(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
     action = action_label_for_bet({**b, "fun_bet": fun or b.get("fun_bet")})
     fight_s = f" | {fight}" if fight and fight not in side else ""
     return (
-        f"{rank}. {action} · [{market}] {side}{fight_s} · edge {edge_s} · "
+        f"{rank}. {action} · {_event_bit(b)}[{market}] {side}{fight_s} · edge {edge_s} · "
         f"prob {prob_s} · {reason}"
     )
 
@@ -1174,7 +1229,7 @@ def _line_compact(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
     """Short single-line pick for chat / compact briefing."""
     is_prop = (
         str(b.get("market_type") or "").lower() == "prop"
-        or str(b.get("prop_key") or "") == "over_1_5_rounds"
+        or str(b.get("prop_key") or "").endswith("_rounds")
     )
     side = str(b.get("pick") or b.get("side") or "—")
     fight = str(b.get("fight") or "").strip()
@@ -1184,10 +1239,10 @@ def _line_compact(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
         label = f"{side} ({fight})"
     else:
         label = side
-    market = "O1.5" if is_prop else "ML"
+    market = _prop_market_short(b) if is_prop else "ML"
     edge = b.get("edge_pct")
     if edge is None and b.get("edge") is not None:
         edge = float(b["edge"]) * 100.0
     edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
     action = action_label_for_bet({**b, "fun_bet": fun or b.get("fun_bet")})
-    return f"  {rank}. {action} | {label} | {market} | edge {edge_s}"
+    return f"  {rank}. {action} | {_event_bit(b)}{label} | {market} | edge {edge_s}"
