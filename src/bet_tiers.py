@@ -85,14 +85,40 @@ _HARD_SKIP = frozenset(
 )
 
 
+def displayed_edge_pct_points(ticket: dict[str, Any] | None) -> float | None:
+    """The number Overview/Ollama print as +26.3%."""
+    if not isinstance(ticket, dict):
+        return None
+    try:
+        from src.strategy import _coerce_edge_number
+
+        raw = _coerce_edge_number(ticket.get("edge_pct"))
+        if raw is not None:
+            return raw
+        edge = _coerce_edge_number(ticket.get("edge"))
+    except Exception:
+        raw = _safe_float(ticket.get("edge_pct"))
+        if raw is not None:
+            return raw
+        edge = _safe_float(ticket.get("edge"))
+    if edge is None:
+        return None
+    if abs(edge) <= 1.5:
+        return edge * 100.0
+    return edge
+
+
 def _ticket_over_edge_cap(ticket: dict[str, Any] | None) -> bool:
     """True when sizing edge or displayed edge_pct is above HA's 25% cap."""
     try:
         from src.strategy import ticket_edge_exceeds_actionable_cap
 
-        return bool(ticket_edge_exceeds_actionable_cap(ticket))
+        if ticket_edge_exceeds_actionable_cap(ticket):
+            return True
     except Exception:
-        return False
+        pass
+    points = displayed_edge_pct_points(ticket)
+    return points is not None and abs(points) > 25.0
 
 
 def demote_suspect_edge_ticket(ticket: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -110,6 +136,13 @@ def demote_suspect_edge_ticket(ticket: dict[str, Any] | None) -> dict[str, Any] 
     ticket["stake_usd"] = 0.0
     ticket["stake_pct"] = 0.0
     return ticket
+
+
+def sanitize_bet_for_display(ticket: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Last-mile: a printed +26.3% line can never stay BET THIS Blue."""
+    if not isinstance(ticket, dict):
+        return ticket
+    return demote_suspect_edge_ticket(dict(ticket))
 
 
 _SOFT_UNCERTAINTY_SKIP = frozenset(

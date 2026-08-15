@@ -2116,7 +2116,14 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
             bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
         )
         edge_pct = float(bet.get("edge_pct") or 0)
-        action = action_label_for_bet({**bet, "bet_tier": tier})
+        try:
+            printed_over_cap = abs(float(edge_pct)) > 25.0
+        except (TypeError, ValueError):
+            printed_over_cap = False
+        action = action_label_for_bet({**bet, "bet_tier": "yellow" if printed_over_cap else tier})
+        if printed_over_cap:
+            tier = "yellow"
+            color = TIER_COLORS.get(tier, "#eab308")
         from src.props import event_from_record
 
         ev = event_from_record(bet)
@@ -2127,8 +2134,13 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
     def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
         """All top picks in a single bubble (colored lines, not separate cards)."""
         from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
-        from src.bet_tiers import format_tier_legend, format_what_to_do_header
+        from src.bet_tiers import format_tier_legend, format_what_to_do_header, sanitize_bet_for_display
 
+        bets = [
+            sanitize_bet_for_display(dict(b)) or b
+            for b in (bets or [])
+            if isinstance(b, dict)
+        ]
         bets = dedupe_rank_top_tickets(list(bets or []), limit=5)
         bubble = ctk.CTkFrame(
             self.list_frame,
@@ -2902,9 +2914,15 @@ class GrokAnalysisPanel(_CTK_FRAME):
             TIER_COLORS,
             action_label_for_bet,
             format_what_to_do_header,
+            sanitize_bet_for_display,
         )
 
         # Fail-safe: never show duplicates / >5 even if upstream missed a merge
+        slip = [
+            sanitize_bet_for_display(dict(b)) or b
+            for b in (slip or [])
+            if isinstance(b, dict)
+        ]
         slip = dedupe_rank_top_tickets(list(slip or []), limit=5)
 
         bubble = ctk.CTkFrame(
@@ -2943,10 +2961,15 @@ class GrokAnalysisPanel(_CTK_FRAME):
                     edge = float(bet.get("edge")) * 100.0
                 except (TypeError, ValueError):
                     edge = None
+            printed_over_cap = False
+            try:
+                printed_over_cap = edge is not None and abs(float(edge)) > 25.0
+            except (TypeError, ValueError):
+                printed_over_cap = False
             bet_tier = str(bet.get("bet_tier") or "").strip().lower()
             from src.strategy import ticket_edge_exceeds_actionable_cap
 
-            if ticket_edge_exceeds_actionable_cap(bet):
+            if printed_over_cap or ticket_edge_exceeds_actionable_cap(bet):
                 bet_tier = "yellow"
             elif bet_tier not in TIER_COLORS:
                 # Fail closed: never invent Blue from leftover stake fields.

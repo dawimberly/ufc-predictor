@@ -253,6 +253,57 @@ def test_edge_pct_1_2_percent_is_not_suspect() -> None:
     assert ticket_edge_exceeds_actionable_cap(ticket) is False
 
 
+def test_johnson_mcconico_printed_263_line_is_not_bet_this() -> None:
+    """Exact Ollama slip line: printed +26.3% must not stay dark-blue BET THIS $7.17."""
+    from src.bet_tiers import (
+        TIER_BLUE,
+        TIER_YELLOW,
+        action_label_for_bet,
+        format_what_to_do_header,
+        sanitize_bet_for_display,
+    )
+    from src.strategy import allocate_card_budget_pct, compute_ticket_strength
+
+    bet = {
+        "rank": 1,
+        "side": "Over 1.5 Rounds (Donte Johnson vs Eric McConico)",
+        "market": "Over 1.5 Rounds",
+        "book": "MyBookie",
+        "edge": 0.08,
+        "edge_pct": 26.3,
+        "stake_usd": 7.17,
+        "suggested_stake": 7.17,
+        "stake_pct": 40.0,
+        "bet_tier": TIER_BLUE,
+        "prop_key": "over_1_5_rounds",
+        "odds_source": "live",
+        "strict_qualified": True,
+        "decimal_odds": 1.45,
+        "prob": 0.82,
+        "market_type": "prop",
+    }
+    out = sanitize_bet_for_display(bet)
+    assert out is not None
+    assert out["bet_tier"] == TIER_YELLOW
+    assert float(out.get("stake_usd") or 0) == 0.0
+    action = action_label_for_bet(out)
+    assert "BET THIS" not in action
+    line = (
+        f"#{bet['rank']}  {action}   |   {out['side']}   |   "
+        f"{out['market']} @ {out['book']}   |   edge {float(out['edge_pct']):+.1f}%"
+    )
+    assert "BET THIS" not in line
+    assert "+26.3%" in line
+    header = format_what_to_do_header(slip=[out])
+    assert "BET THIS" not in header
+
+    strength = compute_ticket_strength(bet, live=False)
+    assert float(strength["target_stake_pct"]) == 0.0
+    assert strength["fail_closed_reason"] == "suspect_edge"
+    sized = allocate_card_budget_pct([dict(bet)], 12.0, profile="paper", inplace=False)
+    assert all(float(s.get("suggested_stake") or 0) == 0.0 for s in sized)
+
+
 def test_collect_inputs_zeros_unclear_overview_stakes() -> None:
     books = {
         "Odds API": {

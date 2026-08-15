@@ -1043,19 +1043,10 @@ def _ticket_confidence_label(ticket: dict[str, Any]) -> str:
 
 
 def _ticket_edge_fraction(ticket: dict[str, Any]) -> float:
-    edge = ticket.get("edge")
-    if edge is None and ticket.get("edge_pct") is not None:
-        try:
-            edge = float(ticket["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge = 0.0
-    try:
-        e = float(edge or 0.0)
-    except (TypeError, ValueError):
-        e = 0.0
-    if abs(e) > 1.5:  # likely already percent
-        e = e / 100.0
-    return max(0.0, e)
+    frac = ticket_max_edge_fraction(ticket)
+    if frac is None:
+        return 0.0
+    return max(0.0, float(frac))
 
 
 def _ticket_prob(ticket: dict[str, Any]) -> float:
@@ -1225,6 +1216,31 @@ def compute_ticket_strength(ticket: dict[str, Any], *, live: bool) -> dict[str, 
     conf_score = _ticket_confidence_score(ticket)
     prob = _ticket_prob(ticket)
     edge, implied = _ticket_edge_vs_market(ticket)
+    if ticket_edge_exceeds_actionable_cap(ticket) or abs(float(edge or 0)) > MAX_ACTIONABLE_EDGE:
+        return {
+            "strength": 0.0,
+            "strength_score": 0.0,
+            "target_stake_pct": 0.0,
+            "edge": float(edge or 0.0),
+            "confidence": conf_label,
+            "confidence_score": float(conf_score),
+            "model_prob": float(prob),
+            "decimal_odds": odds,
+            "market_implied": implied,
+            "prob_score": 0.0,
+            "edge_score": 0.0,
+            "odds_score": 0.0,
+            "uncertainty_penalty": 0.0,
+            "uncertainty_action": "skip",
+            "type_mult": 1.0,
+            "is_parlay": bool(ticket.get("is_parlay")),
+            "no_inflate": True,
+            "fail_closed_reason": "suspect_edge",
+            "sizing_mode": "conf_odds",
+            "curve_gamma": float(curve["gamma"]),
+            "max_ticket_pct": float(curve["max_ticket_pct"]),
+            "profile": "live" if live else "paper",
+        }
     unc_pen, unc_no_inflate, unc_action = _uncertainty_penalty(
         ticket, live=live, tighten_mult=float(curve["tighten_mult"])
     )
@@ -1473,6 +1489,19 @@ def allocate_card_budget_pct(
     out: list[dict[str, Any]] = []
     for i, (ticket, pct, details) in enumerate(zip(tickets, pcts, details_list), start=1):
         row = ticket if inplace else dict(ticket)
+        if ticket_edge_exceeds_actionable_cap(row) or str(details.get("fail_closed_reason") or "") == "suspect_edge":
+            dollars = 0.0
+            pct = 0.0
+            row["stake_pct"] = 0.0
+            row["suggested_stake"] = 0.0
+            row["stake_usd"] = 0.0
+            row["advisory"] = True
+            row["sizing_no_inflate"] = True
+            row["sizing_fail_closed"] = "suspect_edge"
+            row["card_pool_usd"] = pool
+            row["allocation_rank"] = i
+            out.append(row)
+            continue
         dollars = round(pool * (pct / 100.0), 2) if pool > 0 else 0.0
         row["stake_pct"] = float(pct)
         row["suggested_stake"] = dollars
@@ -2182,18 +2211,33 @@ def _as_edge_fraction(value: Any, *, percent_points: bool = False) -> float | No
     ``edge`` is a fraction, or percent points when |value| > 1.5.
     ``edge_pct`` is always percent points (26.3 means 26.3%).
     """
-    try:
-        if value is None:
-            return None
-        v = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(v):
+    v = _coerce_edge_number(value)
+    if v is None:
         return None
     if percent_points:
         return v / 100.0
     if abs(v) > 1.5:
         return v / 100.0
+    return v
+
+
+def _coerce_edge_number(value: Any) -> float | None:
+    """Parse edge fields that may be floats or strings like '+26.3%'."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        s = value.strip().replace(",", "").replace("%", "").replace("\uff05", "")
+        if s.startswith("+"):
+            s = s[1:]
+        if not s:
+            return None
+        value = s
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v):
+        return None
     return v
 
 
@@ -2240,7 +2284,20 @@ def ticket_edge_exceeds_actionable_cap(
     (what Overview/Ollama print). Either field over 25% is a bogus scrape.
     """
     frac = ticket_max_edge_fraction(ticket, edge=edge, edge_pct=edge_pct)
-    return frac is not None and abs(frac) > MAX_ACTIONABLE_EDGE
+    if frac is not None and abs(frac) > MAX_ACTIONABLE_EDGE:
+        return True
+    blob: dict[str, Any]
+    if isinstance(ticket, dict):
+        blob = ticket
+    elif ticket is not None:
+        try:
+            blob = dict(ticket)
+        except Exception:
+            blob = {}
+    else:
+        blob = {}
+    printed = _coerce_edge_number(edge_pct if edge_pct is not None else blob.get("edge_pct"))
+    return printed is not None and abs(printed) > (MAX_ACTIONABLE_EDGE * 100.0)
 
 
 def edge_is_actionable(
