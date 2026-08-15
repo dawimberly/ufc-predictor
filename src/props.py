@@ -732,11 +732,14 @@ def extract_prop_candidate(
     odds = float(quote["decimal_odds"])
     odds_source = str(quote.get("odds_source", "synthetic"))
 
-    # Betting path: require live / Odds API odds + model floor + live edge
+    from src.strategy import edge_is_actionable
+
+    # Betting path: require live / Odds API odds + model floor + live edge + not a bogus scrape
     qualifies_live = (
         is_live_prop_odds_source(odds_source)
         and model_p >= model_floor
         and edge >= edge_floor
+        and edge_is_actionable(edge, decimal_odds=odds, model_prob=model_p)
     )
     # Display-only synthetic (research browse) — Over 1.5 only via ALLOWED_PROP_KEYS
     qualifies_synth = (
@@ -760,6 +763,16 @@ def extract_prop_candidate(
                 fight=fight_lbl,
                 prop_key=prop_key,
                 detail=f"prob={model_p:.3f}<{model_floor:.3f}",
+            )
+        elif is_live_prop_odds_source(odds_source) and not edge_is_actionable(
+            edge, decimal_odds=odds, model_prob=model_p
+        ):
+            log_strategy_block(
+                "prop_suspect_edge",
+                context="prop",
+                fight=fight_lbl,
+                prop_key=prop_key,
+                detail=f"edge={edge:.3f}",
             )
         elif is_live_prop_odds_source(odds_source) and edge < edge_floor:
             log_strategy_block(
@@ -1078,16 +1091,56 @@ def _collect_prop_candidates(
                 for_display=True,
             )
             if cand is not None:
+                from src.strategy import edge_is_actionable
+
+                src = str(getattr(cand, "odds_source", "") or "")
+                strict = is_live_prop_odds_source(src) and edge_is_actionable(
+                    float(cand.edge),
+                    decimal_odds=float(cand.decimal_odds or 0) or None,
+                    model_prob=float(cand.prob),
+                )
                 dedupe = f"{cand.fight_id}|{key}"
                 if dedupe not in seen:
                     seen.add(dedupe)
-                    collected.append((cand, row, probs, True))
+                    collected.append((cand, row, probs, strict))
                 continue
             if not include_relaxed:
                 continue
             quote = resolve_prop_quote(row, key, book=book, prop_odds=prop_odds, probs=probs)
             model_p = prop_model_prob(key, row, probs)
-            if str(quote.get("odds_source", "synthetic")) != "synthetic":
+            src = str(quote.get("odds_source", "synthetic"))
+            # Live line that missed HA (suspect 26% scrape, low prob, etc.) — show $0
+            if is_live_prop_odds_source(src):
+                if model_p < config.PROP_SHOW_ALL_MIN_PROB:
+                    continue
+                dedupe = f"{row.get('fight_id', '')}|{key}"
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
+                f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
+                label = prop_display_label(key, row, probs)
+                relaxed = BetCandidate(
+                    fight_id=str(row.get("fight_id", "")),
+                    event_key=str(row.get("event_name", row.get("event", ""))),
+                    bet_side=probs.get("pick_side", "f1"),
+                    prob=model_p,
+                    decimal_odds=float(quote["decimal_odds"]),
+                    edge=float(quote["edge"]),
+                    kelly_full=0.0,
+                    expected_value=bet_expected_value(model_p, float(quote["decimal_odds"])),
+                    fighter1_name=f1,
+                    fighter2_name=f2,
+                    pick_name=label,
+                    winner_name=label,
+                    market_type="prop",
+                    prop_key=key,
+                    display_label=label,
+                )
+                relaxed.odds_source = src
+                collected.append((relaxed, row, probs, False))
+                continue
+            if src != "synthetic":
                 continue
             if model_p < config.PROP_SHOW_ALL_MIN_PROB:
                 continue

@@ -751,7 +751,9 @@ def collect_card_analysis_inputs(
                 and t.get("strict_qualified") is not False
                 and str(t.get("prop_key") or "") == "over_1_5_rounds"
             ):
-                ha_ok = True
+                from src.strategy import prop_may_receive_ha_stake
+
+                ha_ok = prop_may_receive_ha_stake(t)
             else:
                 ha_ok = False
         if ha_ok:
@@ -913,8 +915,14 @@ def collect_card_analysis_inputs(
                 stake_ok = float(src.get("suggested_stake") or src.get("stake_usd") or 0) > 0 and float(
                     src.get("stake_pct") or 0
                 ) > 0
-                # Props: Blue only when tier ranker said blue/sky AND live stake exists
-                prop_ha = tier_name in {TIER_BLUE, TIER_SKY_BLUE} and stake_ok
+                # Props: Blue only when tier ranker said blue/sky AND live HA-eligible stake
+                from src.strategy import prop_may_receive_ha_stake
+
+                prop_ha = (
+                    tier_name in {TIER_BLUE, TIER_SKY_BLUE}
+                    and stake_ok
+                    and prop_may_receive_ha_stake(src)
+                )
                 row = _ticket_to_slip_row(
                     src,
                     rank=0,

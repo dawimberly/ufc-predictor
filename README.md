@@ -6,7 +6,7 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 ## Recent changes
 
-- **2026-08-15** — Ollama WHAT TO BET header splits HA-passed Deep Blue from Sky Blue paper overrides that failed the wide-CI gate.
+- **2026-08-15** — MyBookie Over 1.5 with bogus edges (e.g. +26%) is no longer BET THIS Blue — HA caps actionable edge at 25%.
 - **2026-08-15** — Land unmerged dashboard work on master: empty-book odds restore, fetch-once slate locks, instant fight-stats chat, MyBookie KO/sub/decision props with model edges, totals label fix, and no false Blue on research lines.
 - **2026-08-14** — Show MyBookie method props (KO/sub/decision) on Props with model edges, fix totals labels, and stop false Blue on research lines.
 - **2026-08-12** — Fix Odds API fetch-once slate locks and make Ollama fight stats instant.

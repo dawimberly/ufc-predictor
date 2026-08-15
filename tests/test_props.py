@@ -165,8 +165,10 @@ def test_rank_prop_singles_includes_synthetic_when_no_live(monkeypatch):
     )
     ranked, meta = rank_prop_singles(preds, book="BetNow.eu", prop_odds=pd.DataFrame())
     assert ranked
-    assert meta["strict_count"] >= 1
+    assert meta["strict_count"] == 0  # synthetic is research-only, never HA Blue
+    assert meta["total_found"] >= 1
     assert all(r["odds_source"] == "synthetic" for r in ranked)
+    assert all(r.get("strict_qualified") is False for r in ranked)
     assert all(r["prop_key"] == "over_1_5_rounds" for r in ranked)
     assert ranked[0]["prob"] >= 0.78
     assert ranked[0].get("prop_type")

@@ -87,6 +87,77 @@ def test_best_bets_briefing_does_not_force_blue() -> None:
     assert "NONE" in text or "no decent" in text.lower() or "Sized bankroll = $0" in text or "Blue) — none" in text
 
 
+def test_mybookie_over_15_suspect_edge_never_blue() -> None:
+    """Donte Johnson vs McConico Over 1.5 @ MyBookie +26.3% must not be BET THIS."""
+    from src.bet_tiers import (
+        TIER_BLUE,
+        TIER_SKY_BLUE,
+        action_label_for_bet,
+        classify_prop_bet_tier,
+        rank_prop_bet_tiers,
+    )
+    from src.grok_analysis import collect_card_analysis_inputs
+    from src.strategy import attach_prop_stakes, prop_may_receive_ha_stake
+
+    prop = {
+        "fight_id": "donte-mcconico",
+        "fight": "Donte Johnson vs Eric McConico",
+        "prop_key": "over_1_5_rounds",
+        "prop_short": "Over 1.5 Rounds",
+        "label": "Over 1.5 Rounds (Donte Johnson vs Eric McConico)",
+        "prob": 0.82,
+        "edge": 0.263,
+        "edge_pct": 26.3,
+        "odds_source": "live",
+        "strict_qualified": True,
+        "suggested_stake": 7.17,
+        "stake_usd": 7.17,
+        "stake_pct": 40.0,
+        "decimal_odds": 1.45,
+        "book": "MyBookie",
+        "market_type": "prop",
+    }
+    assert prop_may_receive_ha_stake(prop) is False
+    tier, reason = classify_prop_bet_tier(prop, debug=False)
+    assert tier not in {TIER_BLUE, TIER_SKY_BLUE}, (tier, reason)
+    assert reason == "suspect_edge"
+    assert "BET THIS" not in action_label_for_bet({**prop, "bet_tier": tier})
+
+    buckets = rank_prop_bet_tiers([prop], limit_per_tier=4)
+    assert buckets[TIER_BLUE] == []
+    assert buckets[TIER_SKY_BLUE] == []
+
+    sized = attach_prop_stakes(
+        [prop],
+        {"total_bankroll": 75, "card_budget": 12, "use_mybookie": True},
+        "MyBookie",
+        profile="paper",
+    )
+    assert all(float(s.get("suggested_stake") or 0) == 0.0 for s in sized)
+
+    books = {
+        "MyBookie": {
+            "alerts": {"singles": [], "prop_singles": [prop]},
+            "props": {"singles": [prop]},
+            "predictions": None,
+        },
+        "Overview": {"alerts": {"singles": []}, "predictions": None},
+    }
+    out = collect_card_analysis_inputs(
+        books,
+        {"total_bankroll": 75, "card_budget": 12, "use_mybookie": True},
+        event_label="UFC Fight Night",
+    )
+    blues = [
+        t
+        for t in (out.get("tickets") or [])
+        if str(t.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+        and not t.get("advisory")
+    ]
+    assert blues == []
+    assert out.get("n_actionable") == 0
+
+
 def test_collect_inputs_zeros_unclear_overview_stakes() -> None:
     books = {
         "Odds API": {

@@ -1638,6 +1638,52 @@ def format_stake_pct_dollars(ticket: dict[str, Any] | float, stake: float | None
     return f"{pct_txt} | ${dol_f:.2f}"
 
 
+def prop_may_receive_ha_stake(prop: dict[str, Any]) -> bool:
+    """True only for live Over 1.5 that still clears HA edge/odds (not a 26% scrape)."""
+    if str(prop.get("prop_key") or "").strip().lower() != "over_1_5_rounds":
+        return False
+    if prop.get("strict_qualified") is False:
+        return False
+    try:
+        from src.props import is_live_prop_odds_source
+
+        if not is_live_prop_odds_source(str(prop.get("odds_source") or "")):
+            return False
+    except Exception:
+        if str(prop.get("odds_source") or "").strip().lower() not in {"live", "the_odds_api"}:
+            return False
+    edge = prop.get("edge")
+    try:
+        edge_f = float(edge) if edge is not None else None
+    except (TypeError, ValueError):
+        edge_f = None
+    if edge_f is None and prop.get("edge_pct") is not None:
+        try:
+            edge_f = float(prop["edge_pct"]) / 100.0
+        except (TypeError, ValueError):
+            edge_f = None
+    if edge_f is not None and abs(edge_f) > 1.5:
+        edge_f = edge_f / 100.0
+    if edge_f is None:
+        return False
+    odds = prop.get("decimal_odds") or prop.get("odds")
+    try:
+        odds_f = float(odds) if odds is not None else None
+    except (TypeError, ValueError):
+        odds_f = None
+    prob = prop.get("prob")
+    try:
+        prob_f = float(prob) if prob is not None else None
+    except (TypeError, ValueError):
+        prob_f = None
+    return edge_is_actionable(
+        edge_f,
+        decimal_odds=odds_f,
+        model_prob=prob_f,
+        edge_suspect=bool(prop.get("edge_suspect")),
+    )
+
+
 def attach_prop_stakes(
     singles: list[dict[str, Any]],
     budget_state: dict[str, Any] | None,
@@ -1669,15 +1715,25 @@ def attach_prop_stakes(
                 sum(1 for b in plan.values() if b.get("enabled")),
             )
 
-    # Only Over 1.5 participates under HA strategy; still allocate 100% among shown props
+    # Only Over 1.5 that still pass HA edge/odds gates get card-budget size.
     tickets = []
+    zeroed: list[dict[str, Any]] = []
     for s in singles:
         row = dict(s)
         row["market_type"] = "prop"
         row["is_parlay"] = False
+        if not prop_may_receive_ha_stake(row):
+            row["suggested_stake"] = 0.0
+            row["stake_usd"] = 0.0
+            row["stake_pct"] = 0.0
+            row["advisory"] = True
+            zeroed.append(row)
+            continue
         tickets.append(row)
+    if not tickets:
+        return zeroed
     allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
-    return allocated
+    return allocated + zeroed
 
 
 def budget_summary_text(budget_state: dict[str, Any]) -> str:
@@ -2367,6 +2423,8 @@ def _overview_over_15_props(
                 }:
                     continue
             if p.get("strict_qualified") is False:
+                continue
+            if not prop_may_receive_ha_stake({**p, "prop_key": "over_1_5_rounds"}):
                 continue
             fid = str(p.get("fight_id") or p.get("fight") or "")
             if not fid or fid in seen:

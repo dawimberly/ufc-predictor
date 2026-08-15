@@ -15,7 +15,8 @@ from src.bet_tiers import (
 )
 
 
-def test_guilherme_skip_wide_huge_edge_is_green() -> None:
+def test_guilherme_skip_wide_huge_edge_is_not_blue() -> None:
+    # 56% "edge" is a scraper/odds glitch — caution, never BET THIS or FUN ONLY.
     tier, reason = classify_bet_tier(
         None,
         status="SKIP:wide",
@@ -24,8 +25,8 @@ def test_guilherme_skip_wide_huge_edge_is_green() -> None:
         pick="Guilherme Pat",
         debug=False,
     )
-    assert tier == TIER_GREEN, (tier, reason)
-    assert "skip" in reason
+    assert tier == TIER_YELLOW, (tier, reason)
+    assert reason == "suspect_edge"
 
 
 def test_negative_edge_skip_is_red() -> None:

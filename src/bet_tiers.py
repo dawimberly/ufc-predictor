@@ -450,6 +450,27 @@ def classify_bet_tier(
     if stake_pct_f is None:
         stake_pct_f = _parse_stake_pct_from_status(status_s)
 
+    # --- Rule 0: bogus scraper edges never Blue (e.g. MyBookie Over 1.5 +26%) ---
+    edge_for_gate = edge_f
+    if edge_for_gate is not None and abs(edge_for_gate) > 1.5:
+        edge_for_gate = edge_for_gate / 100.0
+    suspect_edge = False
+    if edge_for_gate is not None:
+        try:
+            from src.strategy import MAX_ACTIONABLE_EDGE, edge_is_actionable
+
+            if abs(edge_for_gate) > MAX_ACTIONABLE_EDGE or (
+                edge_for_gate > 0
+                and not edge_is_actionable(edge_for_gate, model_prob=prob_f)
+            ):
+                suspect_edge = True
+        except Exception:
+            suspect_edge = abs(edge_for_gate) > 0.25
+    if suspect_edge:
+        tier, reason = TIER_YELLOW, "suspect_edge"
+        _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
+        return tier, reason
+
     # --- Rule 1: SKY BLUE — Paper wide override tiny stake only ---
     # SKIP in the Kelly/status text is authoritative. Do not let resolve_row_decision
     # "SKIP" override a positive stake % status (book tables pass Kelly text only).
@@ -846,6 +867,28 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
     if key and key not in {"over_1_5_rounds", "under_1_5_rounds", "round_1_finish"}:
         return "SKIP:prop_gate"
 
+    edge = _safe_float(prop.get("edge"))
+    if edge is None and prop.get("edge_pct") is not None:
+        try:
+            edge = float(prop["edge_pct"]) / 100.0
+        except (TypeError, ValueError):
+            edge = None
+    if edge is not None and abs(edge) > 1.5:
+        edge = edge / 100.0
+    try:
+        from src.strategy import edge_is_actionable
+
+        if edge is not None and not edge_is_actionable(
+            float(edge),
+            decimal_odds=_safe_float(prop.get("decimal_odds") or prop.get("odds")),
+            model_prob=_safe_float(prop.get("prob")),
+            edge_suspect=bool(prop.get("edge_suspect")),
+        ):
+            return "SKIP:suspect_edge"
+    except Exception:
+        if edge is not None and abs(float(edge)) > 0.25:
+            return "SKIP:suspect_edge"
+
     stake = _safe_float(prop.get("suggested_stake"))
     if stake is None:
         stake = _safe_float(prop.get("stake_usd"))
@@ -856,12 +899,6 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
     if live and has_stake and key in {"", "over_1_5_rounds"}:
         return "BET"
 
-    edge = _safe_float(prop.get("edge"))
-    if edge is None and prop.get("edge_pct") is not None:
-        try:
-            edge = float(prop["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge = None
     if edge is None:
         return "SKIP:no_odds"
     return "SKIP:prop_gate"
