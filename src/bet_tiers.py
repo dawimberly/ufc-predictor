@@ -83,6 +83,35 @@ _HARD_SKIP = frozenset(
         "no_pick",
     }
 )
+
+
+def _ticket_over_edge_cap(ticket: dict[str, Any] | None) -> bool:
+    """True when sizing edge or displayed edge_pct is above HA's 25% cap."""
+    try:
+        from src.strategy import ticket_edge_exceeds_actionable_cap
+
+        return bool(ticket_edge_exceeds_actionable_cap(ticket))
+    except Exception:
+        return False
+
+
+def demote_suspect_edge_ticket(ticket: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Zero HA stake and paint Yellow when either edge field is above 25%."""
+    if not isinstance(ticket, dict):
+        return ticket
+    if not _ticket_over_edge_cap(ticket):
+        return ticket
+    ticket["bet_tier"] = TIER_YELLOW
+    ticket["tier"] = TIER_YELLOW
+    ticket["tier_reason"] = "suspect_edge"
+    ticket["fun_bet"] = True
+    ticket["advisory"] = True
+    ticket["suggested_stake"] = 0.0
+    ticket["stake_usd"] = 0.0
+    ticket["stake_pct"] = 0.0
+    return ticket
+
+
 _SOFT_UNCERTAINTY_SKIP = frozenset(
     {
         "wide_interval",
@@ -382,6 +411,7 @@ def classify_bet_tier(
     min_model_prob: float | None = None,
     status: str | None = None,
     edge: float | None = None,
+    edge_pct: float | None = None,
     model_prob: float | None = None,
     pick: str | None = None,
     uncertainty_reason: str | None = None,
@@ -451,21 +481,42 @@ def classify_bet_tier(
         stake_pct_f = _parse_stake_pct_from_status(status_s)
 
     # --- Rule 0: bogus scraper edges never Blue (e.g. MyBookie Over 1.5 +26%) ---
-    edge_for_gate = edge_f
-    if edge_for_gate is not None and abs(edge_for_gate) > 1.5:
-        edge_for_gate = edge_for_gate / 100.0
-    suspect_edge = False
-    if edge_for_gate is not None:
+    # Gate on BOTH sizing `edge` and displayed `edge_pct` — a ticket can store
+    # edge=0.08 (passes) while Overview prints edge_pct=26.3.
+    edge_pct_f = _safe_float(edge_pct)
+    if edge_pct_f is None and row is not None:
         try:
-            from src.strategy import MAX_ACTIONABLE_EDGE, edge_is_actionable
-
-            if abs(edge_for_gate) > MAX_ACTIONABLE_EDGE or (
-                edge_for_gate > 0
-                and not edge_is_actionable(edge_for_gate, model_prob=prob_f)
-            ):
-                suspect_edge = True
+            if isinstance(row, dict):
+                edge_pct_f = _safe_float(row.get("edge_pct"))
+            else:
+                edge_pct_f = _safe_float(pd.Series(row).get("edge_pct"))
         except Exception:
-            suspect_edge = abs(edge_for_gate) > 0.25
+            edge_pct_f = None
+    suspect_edge = False
+    try:
+        from src.strategy import (
+            MAX_ACTIONABLE_EDGE,
+            edge_is_actionable,
+            ticket_max_edge_fraction,
+        )
+
+        max_frac = ticket_max_edge_fraction({"edge": edge_f, "edge_pct": edge_pct_f})
+        if max_frac is not None and abs(max_frac) > MAX_ACTIONABLE_EDGE:
+            suspect_edge = True
+        elif (
+            max_frac is not None
+            and max_frac > 0
+            and not edge_is_actionable(max_frac, model_prob=prob_f)
+        ):
+            suspect_edge = True
+    except Exception:
+        edge_for_gate = edge_f
+        if edge_for_gate is not None and abs(edge_for_gate) > 1.5:
+            edge_for_gate = edge_for_gate / 100.0
+        if edge_for_gate is not None and abs(edge_for_gate) > 0.25:
+            suspect_edge = True
+        elif edge_pct_f is not None and abs(edge_pct_f) > 25.0:
+            suspect_edge = True
     if suspect_edge:
         tier, reason = TIER_YELLOW, "suspect_edge"
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
@@ -648,6 +699,23 @@ def rank_card_bet_tiers(
             if stake <= 0 and stake_pct <= 0:
                 continue
             item = dict(s)
+            try:
+                from src.strategy import ticket_edge_exceeds_actionable_cap
+
+                if ticket_edge_exceeds_actionable_cap(item):
+                    item["bet_tier"] = TIER_YELLOW
+                    item["tier"] = TIER_YELLOW
+                    item["tier_label"] = TIER_LABELS[TIER_YELLOW]
+                    item["tier_reason"] = "suspect_edge"
+                    item["fun_bet"] = True
+                    item["advisory"] = True
+                    item["suggested_stake"] = 0.0
+                    item["stake_usd"] = 0.0
+                    item["stake_pct"] = 0.0
+                    out[TIER_YELLOW].append(item)
+                    continue
+            except Exception:
+                pass
             unc = str(s.get("uncertainty_reason") or "")
             if is_sky_blue_ticket(
                 stake_pct=stake_pct if stake_pct > 0 else None,
@@ -771,6 +839,11 @@ def action_label_for_bet(bet: dict[str, Any] | None) -> str:
         else:
             tier = TIER_YELLOW
 
+    # Last mile: a displayed 26% scrape is never BET THIS, even if bet_tier is Blue.
+    if tier in _ACTIONABLE_TIERS or tier == TIER_GREEN:
+        if _ticket_over_edge_cap(b):
+            tier = TIER_YELLOW
+
     action = TIER_ACTIONS.get(tier, "CAUTION — SKIP SIZED")
     if tier in _ACTIONABLE_TIERS:
         stake = _safe_float(b.get("stake_usd"))
@@ -807,11 +880,13 @@ def format_what_to_do_header(
     sky: list[dict[str, Any]] = []
     green: list[dict[str, Any]] = []
     if isinstance(tiers, dict):
-        blue = list(tiers.get(TIER_BLUE) or [])
-        sky = list(tiers.get(TIER_SKY_BLUE) or [])
+        blue = [b for b in (tiers.get(TIER_BLUE) or []) if not _ticket_over_edge_cap(b)]
+        sky = [b for b in (tiers.get(TIER_SKY_BLUE) or []) if not _ticket_over_edge_cap(b)]
         green = list(tiers.get(TIER_GREEN) or [])
     elif slip:
         for b in slip:
+            if _ticket_over_edge_cap(b):
+                continue
             t = str(b.get("bet_tier") or "").strip().lower()
             if t == TIER_BLUE:
                 blue.append(b)
@@ -868,13 +943,22 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
         return "SKIP:prop_gate"
 
     edge = _safe_float(prop.get("edge"))
-    if edge is None and prop.get("edge_pct") is not None:
-        try:
-            edge = float(prop["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge = None
-    if edge is not None and abs(edge) > 1.5:
-        edge = edge / 100.0
+    edge_pct = _safe_float(prop.get("edge_pct"))
+    try:
+        from src.strategy import ticket_edge_exceeds_actionable_cap, ticket_max_edge_fraction
+
+        if ticket_edge_exceeds_actionable_cap(prop, edge=edge, edge_pct=edge_pct):
+            return "SKIP:suspect_edge"
+        edge = ticket_max_edge_fraction(prop, edge=edge, edge_pct=edge_pct)
+    except Exception:
+        if edge is None and edge_pct is not None:
+            edge = edge_pct / 100.0
+        if edge is not None and abs(edge) > 1.5:
+            edge = edge / 100.0
+        if edge is not None and abs(float(edge)) > 0.25:
+            return "SKIP:suspect_edge"
+        if edge_pct is not None and abs(edge_pct) > 25.0:
+            return "SKIP:suspect_edge"
     try:
         from src.strategy import edge_is_actionable
 
@@ -907,11 +991,9 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
 def classify_prop_bet_tier(prop: dict[str, Any], *, debug: bool = False) -> tuple[str, str]:
     """Color-tier a prop single with the same Blue/Green/Yellow/Red math as ML."""
     edge = _safe_float(prop.get("edge"))
-    if edge is None and prop.get("edge_pct") is not None:
-        try:
-            edge = float(prop["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge = None
+    edge_pct = _safe_float(prop.get("edge_pct"))
+    if edge is None and edge_pct is not None:
+        edge = edge_pct / 100.0
     stake = _safe_float(prop.get("suggested_stake"))
     if stake is None:
         stake = _safe_float(prop.get("stake_usd"))
@@ -919,6 +1001,7 @@ def classify_prop_bet_tier(prop: dict[str, Any], *, debug: bool = False) -> tupl
         None,
         status=prop_status_for_tier(prop),
         edge=edge,
+        edge_pct=edge_pct,
         model_prob=_safe_float(prop.get("prob")),
         stake_pct=_safe_float(prop.get("stake_pct")),
         stake_usd=stake,

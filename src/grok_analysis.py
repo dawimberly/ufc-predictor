@@ -566,6 +566,14 @@ def _ticket_to_slip_row(
         edge_f = 0.0
     if abs(edge_f) > 1.5:
         edge_f = edge_f / 100.0
+    displayed_pct = None
+    if ticket.get("edge_pct") is not None:
+        try:
+            displayed_pct = float(ticket["edge_pct"])
+        except (TypeError, ValueError):
+            displayed_pct = None
+    if displayed_pct is None:
+        displayed_pct = round(edge_f * 100.0, 1)
     stake_pct = float(ticket.get("stake_pct") or 0.0)
     stake_usd = float(ticket.get("suggested_stake") or ticket.get("stake_usd") or 0.0)
     conf = str(ticket.get("confidence") or ticket.get("confidence_label") or "-")
@@ -592,7 +600,7 @@ def _ticket_to_slip_row(
         "stake_usd": round(stake_usd, 2),
         "prob": ticket.get("prob") or ticket.get("combined_prob"),
         "edge": edge_f,
-        "edge_pct": round(edge_f * 100.0, 1),
+        "edge_pct": displayed_pct,
         "confidence": conf,
         "strength_score": ticket.get("strength_score"),
         "uncertainty_action": ticket.get("uncertainty_action") or "allow",
@@ -685,12 +693,14 @@ def collect_card_analysis_inputs(
         TIER_GREEN,
         TIER_SKY_BLUE,
         TIER_YELLOW,
+        demote_suspect_edge_ticket,
         is_sky_blue_ticket,
         singles_cleared_keys,
     )
     from src.strategy import (
         aggregate_overview_recommendations,
         aggregate_top_recommended_bets,
+        ticket_edge_exceeds_actionable_cap,
     )
 
     fight_cap = max_fights if max_fights is not None else config.GROK_MAX_FIGHTS
@@ -737,6 +747,7 @@ def collect_card_analysis_inputs(
             and not bool(t.get("advisory") or t.get("fun_bet"))
             and not bool(t.get("is_parlay"))
             and int(t.get("n_legs") or 1) < 2
+            and not ticket_edge_exceeds_actionable_cap(t)
         )
         # Live Over 1.5 props: only HA-Blue if classify agrees (never invent from stake alone)
         is_prop = str(t.get("market_type") or "").lower() == "prop" or bool(t.get("prop_key"))
@@ -984,6 +995,8 @@ def collect_card_analysis_inputs(
             t["fun_bet"] = True
             t["stake_usd"] = 0.0
             t["stake_pct"] = 0.0
+
+    raw_candidates = [demote_suspect_edge_ticket(t) or t for t in raw_candidates]
 
     tickets = dedupe_rank_top_tickets(
         raw_candidates,

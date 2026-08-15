@@ -42,6 +42,21 @@ def test_negative_edge_skip_is_red() -> None:
     assert reason == "negative_edge"
 
 
+def test_stake_positive_with_displayed_26pct_is_not_blue() -> None:
+    tier, reason = classify_bet_tier(
+        None,
+        status="BET",
+        edge=0.08,
+        edge_pct=26.3,
+        model_prob=0.72,
+        stake_pct=2.5,
+        pick="Sized Fighter",
+        debug=False,
+    )
+    assert tier == TIER_YELLOW, (tier, reason)
+    assert reason == "suspect_edge"
+
+
 def test_stake_positive_is_blue() -> None:
     tier, reason = classify_bet_tier(
         None,

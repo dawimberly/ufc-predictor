@@ -1652,18 +1652,9 @@ def prop_may_receive_ha_stake(prop: dict[str, Any]) -> bool:
     except Exception:
         if str(prop.get("odds_source") or "").strip().lower() not in {"live", "the_odds_api"}:
             return False
-    edge = prop.get("edge")
-    try:
-        edge_f = float(edge) if edge is not None else None
-    except (TypeError, ValueError):
-        edge_f = None
-    if edge_f is None and prop.get("edge_pct") is not None:
-        try:
-            edge_f = float(prop["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge_f = None
-    if edge_f is not None and abs(edge_f) > 1.5:
-        edge_f = edge_f / 100.0
+    if ticket_edge_exceeds_actionable_cap(prop):
+        return False
+    edge_f = ticket_max_edge_fraction(prop)
     if edge_f is None:
         return False
     odds = prop.get("decimal_odds") or prop.get("odds")
@@ -2185,6 +2176,73 @@ MAX_ACTIONABLE_EDGE = 0.25  # 25% — filters bogus scraper edges (e.g. MyBookie
 SUSPECT_EDGE_FLAG = 0.25
 
 
+def _as_edge_fraction(value: Any, *, percent_points: bool = False) -> float | None:
+    """Normalize one edge field to a fraction.
+
+    ``edge`` is a fraction, or percent points when |value| > 1.5.
+    ``edge_pct`` is always percent points (26.3 means 26.3%).
+    """
+    try:
+        if value is None:
+            return None
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v):
+        return None
+    if percent_points:
+        return v / 100.0
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
+
+
+def ticket_max_edge_fraction(
+    ticket: dict[str, Any] | None = None,
+    *,
+    edge: Any = None,
+    edge_pct: Any = None,
+) -> float | None:
+    """Largest |edge| implied by sizing ``edge`` and displayed ``edge_pct``."""
+    blob: dict[str, Any]
+    if isinstance(ticket, dict):
+        blob = ticket
+    elif ticket is not None:
+        try:
+            blob = dict(ticket)
+        except Exception:
+            blob = {}
+    else:
+        blob = {}
+    e = edge if edge is not None else blob.get("edge")
+    ep = edge_pct if edge_pct is not None else blob.get("edge_pct")
+    fracs: list[float] = []
+    ef = _as_edge_fraction(e, percent_points=False)
+    epf = _as_edge_fraction(ep, percent_points=True)
+    if ef is not None:
+        fracs.append(ef)
+    if epf is not None:
+        fracs.append(epf)
+    if not fracs:
+        return None
+    return max(fracs, key=lambda x: abs(x))
+
+
+def ticket_edge_exceeds_actionable_cap(
+    ticket: dict[str, Any] | None = None,
+    *,
+    edge: Any = None,
+    edge_pct: Any = None,
+) -> bool:
+    """True if sizing ``edge`` or displayed ``edge_pct`` is above the 25% HA cap.
+
+    Tickets can store ``edge=0.08`` (passes the cap) and ``edge_pct=26.3``
+    (what Overview/Ollama print). Either field over 25% is a bogus scrape.
+    """
+    frac = ticket_max_edge_fraction(ticket, edge=edge, edge_pct=edge_pct)
+    return frac is not None and abs(frac) > MAX_ACTIONABLE_EDGE
+
+
 def edge_is_actionable(
     edge: float,
     *,
@@ -2252,8 +2310,9 @@ def aggregate_top_recommended_bets(
             dec = decimal_odds_for_pick(row, pick) if row is not None else None
             prob_val = single.get("prob")
             prob_f = float(prob_val) if prob_val is not None else None
-            if not edge_is_actionable(
-                edge,
+            max_edge = ticket_max_edge_fraction(single, edge=edge)
+            if max_edge is None or not edge_is_actionable(
+                max_edge,
                 decimal_odds=dec,
                 model_prob=prob_f,
                 edge_suspect=bool(row.get("edge_suspect")) if row is not None else False,
@@ -2502,7 +2561,8 @@ def aggregate_overview_recommendations(
             edge = float(s.get("edge") or 0)
             prob = s.get("prob")
             prob_f = float(prob) if prob is not None else None
-            if not edge_is_actionable(edge, model_prob=prob_f):
+            max_edge = ticket_max_edge_fraction(s, edge=edge)
+            if max_edge is None or not edge_is_actionable(max_edge, model_prob=prob_f):
                 continue
             brief = str(s.get("brief") or s.get("reasoning") or "").strip()
             singles.append(
@@ -2542,14 +2602,14 @@ def aggregate_overview_recommendations(
 
     cleaned_singles: list[dict[str, Any]] = []
     for item in singles:
-        edge = float(item.get("edge") or 0)
-        if not edge and item.get("edge_pct") is not None:
-            edge = float(item.get("edge_pct")) / 100.0
+        max_edge = ticket_max_edge_fraction(item)
+        if max_edge is None:
+            continue
         prob = item.get("prob")
         prob_f = float(prob) if prob is not None else None
         dec = item.get("decimal_odds")
         dec_f = float(dec) if dec is not None else None
-        if edge_is_actionable(edge, decimal_odds=dec_f, model_prob=prob_f):
+        if edge_is_actionable(max_edge, decimal_odds=dec_f, model_prob=prob_f):
             cleaned_singles.append(item)
     singles = cleaned_singles
 

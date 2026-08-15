@@ -2101,8 +2101,12 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
 
         # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
         # Fail closed: never invent Blue from leftover stake fields.
+        from src.strategy import ticket_edge_exceeds_actionable_cap
+
         tier = str(bet.get("bet_tier") or "").strip().lower()
-        if tier not in TIER_COLORS:
+        if ticket_edge_exceeds_actionable_cap(bet):
+            tier = "yellow"
+        elif tier not in TIER_COLORS:
             if bet.get("fun_bet") or bet.get("advisory"):
                 tier = "green"
             else:
@@ -2940,7 +2944,11 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 except (TypeError, ValueError):
                     edge = None
             bet_tier = str(bet.get("bet_tier") or "").strip().lower()
-            if bet_tier not in TIER_COLORS:
+            from src.strategy import ticket_edge_exceeds_actionable_cap
+
+            if ticket_edge_exceeds_actionable_cap(bet):
+                bet_tier = "yellow"
+            elif bet_tier not in TIER_COLORS:
                 # Fail closed: never invent Blue from leftover stake fields.
                 if bet.get("fun_bet") or bet.get("advisory"):
                     bet_tier = "green"
@@ -5571,6 +5579,18 @@ class UFCDashboardApp(_CTK_BASE):
                     return None
 
             existing = str(t.get("bet_tier") or "").strip().lower()
+            from src.strategy import ticket_edge_exceeds_actionable_cap
+
+            if ticket_edge_exceeds_actionable_cap(t):
+                t["bet_tier"] = TIER_YELLOW
+                t["tier"] = TIER_YELLOW
+                t["tier_reason"] = "suspect_edge"
+                t["fun_bet"] = True
+                t["advisory"] = True
+                t["suggested_stake"] = 0.0
+                t["stake_usd"] = 0.0
+                t["stake_pct"] = 0.0
+                continue
             if existing in {"green", "yellow", "red"}:
                 t["fun_bet"] = True
                 t["advisory"] = True
@@ -5650,12 +5670,21 @@ class UFCDashboardApp(_CTK_BASE):
                     t["stake_pct"] = 0.0
                     t["fun_bet"] = True
                     t["advisory"] = True
-                elif t.get("bet_tier") == TIER_SKY_BLUE:
-                    t["fun_bet"] = False
-                    t["advisory"] = False
-                elif t.get("bet_tier") == TIER_BLUE:
-                    t["fun_bet"] = False
-                    t["advisory"] = False
+                elif t.get("bet_tier") in {TIER_SKY_BLUE, TIER_BLUE}:
+                    from src.strategy import ticket_edge_exceeds_actionable_cap
+
+                    if ticket_edge_exceeds_actionable_cap(t):
+                        t["bet_tier"] = TIER_YELLOW
+                        t["tier"] = TIER_YELLOW
+                        t["tier_reason"] = "suspect_edge"
+                        t["fun_bet"] = True
+                        t["advisory"] = True
+                        t["suggested_stake"] = 0.0
+                        t["stake_usd"] = 0.0
+                        t["stake_pct"] = 0.0
+                    else:
+                        t["fun_bet"] = False
+                        t["advisory"] = False
                 elif not t.get("bet_tier"):
                     # Fail closed — never invent Blue
                     t["bet_tier"] = TIER_YELLOW

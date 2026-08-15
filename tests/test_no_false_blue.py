@@ -158,6 +158,101 @@ def test_mybookie_over_15_suspect_edge_never_blue() -> None:
     assert out.get("n_actionable") == 0
 
 
+def test_mismatched_edge_pct_above_25_never_blue() -> None:
+    """edge=0.08 (passes the fraction cap) with displayed +26.3% must not be BET THIS."""
+    from src.bet_tiers import (
+        TIER_BLUE,
+        TIER_SKY_BLUE,
+        TIER_YELLOW,
+        action_label_for_bet,
+        classify_bet_tier,
+        classify_prop_bet_tier,
+        format_what_to_do_header,
+    )
+    from src.strategy import (
+        prop_may_receive_ha_stake,
+        ticket_edge_exceeds_actionable_cap,
+        ticket_max_edge_fraction,
+    )
+
+    mixed = {
+        "fight_id": "donte-mcconico",
+        "fight": "Donte Johnson vs Eric McConico",
+        "prop_key": "over_1_5_rounds",
+        "prop_short": "Over 1.5 Rounds",
+        "label": "Over 1.5 Rounds (Donte Johnson vs Eric McConico)",
+        "prob": 0.82,
+        "edge": 0.08,
+        "edge_pct": 26.3,
+        "odds_source": "live",
+        "strict_qualified": True,
+        "suggested_stake": 7.17,
+        "stake_usd": 7.17,
+        "stake_pct": 40.0,
+        "decimal_odds": 1.45,
+        "book": "MyBookie",
+        "market_type": "prop",
+        "bet_tier": TIER_BLUE,
+    }
+    assert abs(ticket_max_edge_fraction(mixed) - 0.263) < 1e-9
+    assert ticket_edge_exceeds_actionable_cap(mixed) is True
+    assert prop_may_receive_ha_stake(mixed) is False
+
+    tier, reason = classify_prop_bet_tier(mixed, debug=False)
+    assert tier == TIER_YELLOW, (tier, reason)
+    assert reason == "suspect_edge"
+
+    ml_tier, ml_reason = classify_bet_tier(
+        None,
+        status="BET",
+        edge=0.08,
+        edge_pct=26.3,
+        model_prob=0.82,
+        stake_pct=2.5,
+        stake_usd=7.17,
+        pick="Donte Johnson",
+        debug=False,
+    )
+    assert ml_tier == TIER_YELLOW, (ml_tier, ml_reason)
+    assert ml_reason == "suspect_edge"
+
+    assert "BET THIS" not in action_label_for_bet(mixed)
+    header = format_what_to_do_header(slip=[mixed])
+    assert "BET THIS" not in header
+    assert "NONE" in header
+
+    books = {
+        "MyBookie": {
+            "alerts": {"singles": [], "prop_singles": [mixed]},
+            "props": {"singles": [mixed]},
+            "predictions": None,
+        },
+        "Overview": {"alerts": {"singles": []}, "predictions": None},
+    }
+    out = collect_card_analysis_inputs(
+        books,
+        {"total_bankroll": 75, "card_budget": 12, "use_mybookie": True},
+        event_label="UFC Fight Night",
+    )
+    blues = [
+        t
+        for t in (out.get("tickets") or [])
+        if str(t.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+        and not t.get("advisory")
+    ]
+    assert blues == []
+    assert out.get("n_actionable") == 0
+
+
+def test_edge_pct_1_2_percent_is_not_suspect() -> None:
+    """edge_pct is percent points — 1.2 means 1.2%, not a 120% fraction."""
+    from src.strategy import ticket_edge_exceeds_actionable_cap, ticket_max_edge_fraction
+
+    ticket = {"edge": 0.012, "edge_pct": 1.2}
+    assert abs(ticket_max_edge_fraction(ticket) - 0.012) < 1e-9
+    assert ticket_edge_exceeds_actionable_cap(ticket) is False
+
+
 def test_collect_inputs_zeros_unclear_overview_stakes() -> None:
     books = {
         "Odds API": {
