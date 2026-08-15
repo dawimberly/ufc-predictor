@@ -5661,7 +5661,8 @@ class UFCDashboardApp(_CTK_BASE):
                     t["advisory"] = True
                     t["suggested_stake"] = 0.0
                     t["stake_usd"] = 0.0
-                    t["stake_pct"] = 0.0        except Exception as exc:
+                    t["stake_pct"] = 0.0
+        except Exception as exc:
             _debug_log(f"Fun tier fill skipped: {exc}")
 
         # Single merge: dedupe + rank + true Top 5 (never concat HA + fun past N)

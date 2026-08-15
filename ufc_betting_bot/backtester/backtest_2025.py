@@ -200,14 +200,21 @@ def backtest_2025(
     bankroll = bankroll_settings or settings.bankroll
     thresholds = edge_thresholds or settings.edge_thresholds
 
-    if not model_exists():
-        raise FileNotFoundError("No ufc-predictor model. Run: cd ufc-predictor && python main.py --train")
-
     if features is None:
         features = load_features()
 
     if TARGET_COLUMN not in features.columns:
         raise ValueError(f"Features missing '{TARGET_COLUMN}'.")
+
+    dates = pd.to_datetime(features[DATE_COLUMN], errors="coerce")
+    if int((dates.dt.year == year).sum()) == 0:
+        raise ValueError(
+            f"No fights for {year}. Max date: {dates.max()}. "
+            "Refresh ufc-predictor data first."
+        )
+
+    if not model_exists():
+        raise FileNotFoundError("No ufc-predictor model. Run: cd ufc-predictor && python main.py --train")
 
     predictor = get_predictor()
     predictions = walk_forward_events(features, predictor, target_year=year)

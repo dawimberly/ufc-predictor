@@ -1614,7 +1614,7 @@ def allocate_alerts_card_budget_pct(
 
 
 def format_stake_pct_dollars(ticket: dict[str, Any] | float, stake: float | None = None) -> str:
-    """Display '38% · $4.56' for a ticket or (pct, dollars)."""
+    """Display '38% | $4.56' for a ticket or (pct, dollars)."""
     if isinstance(ticket, dict):
         pct = ticket.get("stake_pct")
         dollars = stake if stake is not None else ticket.get("suggested_stake")

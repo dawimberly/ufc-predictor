@@ -56,7 +56,7 @@ def test_analyze_no_usable_odds_fail_closed(monkeypatch):
         lambda force=False: {
             "reachable": False,
             "error_class": "offline",
-            "banner": "Ollama offline — showing model tickets only",
+            "banner": "Ollama offline — showing HA tickets",
             "latency_ms": 12,
             "error": "unreachable",
             "resolved_model": None,
@@ -71,5 +71,6 @@ def test_analyze_no_usable_odds_fail_closed(monkeypatch):
     assert result.get("no_usable_odds") is True
     assert "no usable odds" in str(result.get("summary") or "").lower()
     assert result.get("bet_slip") == []
-    assert "showing model tickets only" in str(result.get("health_banner") or "").lower()
-    assert result.get("error_class") == "offline"
+    assert "showing ha tickets" in str(result.get("health_banner") or "").lower()
+    assert result.get("ollama_error_class") == "offline"
+    assert result.get("error_class") == "ok"

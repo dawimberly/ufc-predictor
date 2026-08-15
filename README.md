@@ -6,6 +6,8 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 ## Recent changes
 
+- **2026-08-15** — Land unmerged dashboard work on master: empty-book odds restore, fetch-once slate locks, instant fight-stats chat, MyBookie KO/sub/decision props with model edges, totals label fix, and no false Blue on research lines.
+- **2026-08-14** — Show MyBookie method props (KO/sub/decision) on Props with model edges, fix totals labels, and stop false Blue on research lines.
 - **2026-08-12** — Fix Odds API fetch-once slate locks and make Ollama fight stats instant.
 - **2026-08-11** — Empty-book odds: fixed `UnboundLocalError` in book odds merge that blanked all books; Soft Update / Quick Odds restore matched lines. See `data/reports/odds_empty_incident.md`.
 - **2026-08-11** — Sky Blue on Odds API / MyBookie fight tables now matches Ollama (Kelly `paper_wide_override` status is parsed for color).
@@ -78,7 +80,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Odds API** | Primary free-tier moneylines + edges |
 | **Odds API Props** | Over/Under 1.5 (HA Blue props = **Over 1.5 only**, live) |
 | **MyBookie** | Optional moneyline scraper (`MYBOOKIE_ENABLED=true`) |
-| **Props - MyBookie** | Optional MyBookie prop lines |
+| **Props - MyBookie** | Optional MyBookie prop lines (totals + KO/sub/decision method props; method lines are research-only, never HA Blue) |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin |
 | **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
