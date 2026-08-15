@@ -2052,7 +2052,9 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         ctk.CTkLabel(
             title_block,
             text=(
-                "BET THIS (Blue) = sized $ · FUN ONLY (Green) = $0 lean · "
+                "BET THIS (Blue) = passed HA gates · "
+                "TINY PAPER (Sky) = failed wide CI · "
+                "FUN ONLY (Green) = $0 lean · "
                 "CAUTION (Yellow) / DO NOT BET (Red)"
             ),
             font=ctk.CTkFont(size=11),

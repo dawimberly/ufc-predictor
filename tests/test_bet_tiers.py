@@ -212,3 +212,50 @@ def test_action_label_fun_vs_bet() -> None:
     assert "NONE" in header
     assert "FUN ONLY" in header
     assert "Diego Ferreira" in header
+    assert "passed gates" in header
+
+
+def test_what_to_do_header_splits_ha_pass_from_failed_wide_ci() -> None:
+    from src.bet_tiers import format_what_to_do_header
+
+    ha_only = format_what_to_do_header(
+        slip=[
+            {
+                "bet_tier": "blue",
+                "pick": "Islam Makhachev",
+                "stake_usd": 4.2,
+                "advisory": False,
+            }
+        ]
+    )
+    assert "passed gates" in ha_only
+    assert "Islam Makhachev" in ha_only
+    assert "BET THIS" in ha_only
+    assert "failed wide CI" not in ha_only
+
+    sky_only = format_what_to_do_header(
+        slip=[
+            {
+                "bet_tier": "sky_blue",
+                "pick": "Diego Ferreira",
+                "stake_usd": 0.75,
+                "uncertainty_reason": "paper_wide_override",
+            }
+        ]
+    )
+    assert "WHAT TO BET (HA — passed gates): NONE" in sky_only
+    assert "failed wide CI" in sky_only
+    assert "Diego Ferreira" in sky_only
+    assert "TINY PAPER BET" in sky_only
+
+    both = format_what_to_do_header(
+        slip=[
+            {"bet_tier": "blue", "pick": "Islam Makhachev", "stake_usd": 4.2},
+            {"bet_tier": "sky_blue", "pick": "Diego Ferreira", "stake_usd": 0.75},
+        ]
+    )
+    assert "Islam Makhachev" in both
+    assert "Diego Ferreira" in both
+    assert "passed gates" in both
+    assert "failed wide CI" in both
+    assert both.index("Islam Makhachev") < both.index("Diego Ferreira")

@@ -481,7 +481,9 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
 {what_to_do}{warning}
 Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
-In summary + each pick reason, lead with ACTION verbs: BET THIS ($), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
+BET THIS (Blue) = passed HA gates (live odds, min prob, min edge, uncertainty). Never call TINY PAPER BET a passed HA bet.
+TINY PAPER BET (Sky) = FAILED wide CI — Paper override only, not Live HA.
+In summary + each pick reason, lead with ACTION verbs: BET THIS ($), TINY PAPER BET (failed wide CI), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
 Name the event on every pick and parlay (Next Two often has two cards).
 FUN ONLY / advisory stakes stay 0 — never tell the user to size those as bankroll bets.
 Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars); empty ACT list => say sized NO BET.
@@ -2210,9 +2212,10 @@ def answer_ollama_chat(
         "You are a concise UFC betting assistant for this dashboard. "
         "Use ONLY the provided ticket/stats context. "
         "Never invent fights, odds, edges, or stakes. "
-        "Always separate BET THIS (sized $) from FUN ONLY ($0 research) and DO NOT BET. "
-        "If no BET THIS tickets, say sized NO BET first, then optional FUN ONLY leans. "
-        "Never imply FUN ONLY picks should use bankroll sizing. "
+        "Always separate BET THIS (passed HA gates, sized $) from "
+        "TINY PAPER BET (failed wide CI, Paper only) from FUN ONLY ($0 research) and DO NOT BET. "
+        "If no BET THIS tickets, say HA NO BET first even if Sky Blue overrides exist. "
+        "Never imply FUN ONLY or Sky Blue picks passed the full HA test. "
         "Keep answers under 180 words with short bullets when listing bets."
     )
     prompt = (
@@ -2220,7 +2223,8 @@ def answer_ollama_chat(
         f"GROUNDED CONTEXT (source of truth):\n{context}\n\n"
         f"USER QUESTION: {q}\n\n"
         "Answer using the context. If they ask what to bet, start with "
-        "'WHAT TO BET (sized):' listing only BET THIS tickets + dollar stakes; "
+        "'WHAT TO BET (HA — passed gates):' listing only BET THIS tickets + dollar stakes; "
+        "then 'PAPER OVERRIDE (failed wide CI):' for Sky Blue if any; "
         "then 'FUN ONLY ($0):' if any; then 'SKIP:' for caution/red."
     )
     try:

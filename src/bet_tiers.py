@@ -728,8 +728,8 @@ def rank_card_bet_tiers(
 
 def format_tier_legend() -> str:
     return (
-        "BET THIS (Blue) = sized bankroll ticket | "
-        "TINY PAPER BET (Sky blue) = paper override only | "
+        "BET THIS (Blue) = sized bankroll ticket that passed HA gates | "
+        "TINY PAPER BET (Sky blue) = failed wide CI — Paper override only, not Live HA | "
         "FUN ONLY (Green) = $0 research lean — not sized | "
         "CAUTION (Yellow) = skip sized bankroll | "
         "DO NOT BET (Red)"
@@ -768,12 +768,20 @@ def action_label_for_bet(bet: dict[str, Any] | None) -> str:
     return action
 
 
+def _header_pick_names(bets: list[dict[str, Any]], *, limit: int = 5) -> list[str]:
+    names: list[str] = []
+    for b in bets[:limit]:
+        side = str(b.get("pick") or b.get("side") or "—")
+        names.append(f"{side} ({action_label_for_bet(b)})")
+    return names
+
+
 def format_what_to_do_header(
     tiers: dict[str, list[dict[str, Any]]] | None = None,
     *,
     slip: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Lead line so next week's card is unambiguous: bet / fun / skip."""
+    """Lead line: HA-passed Blue vs Paper override (failed wide CI) vs fun/skip."""
     blue: list[dict[str, Any]] = []
     sky: list[dict[str, Any]] = []
     green: list[dict[str, Any]] = []
@@ -791,21 +799,27 @@ def format_what_to_do_header(
             elif t == TIER_GREEN or b.get("fun_bet"):
                 green.append(b)
 
-    sized = blue + sky
-    if sized:
-        names = []
-        for b in sized[:5]:
-            side = str(b.get("pick") or b.get("side") or "—")
-            names.append(f"{side} ({action_label_for_bet(b)})")
-        return "WHAT TO BET (sized): " + " · ".join(names)
+    ha_line = "WHAT TO BET (HA — passed gates): NONE"
+    if blue:
+        ha_line = "WHAT TO BET (HA — passed gates): " + " · ".join(_header_pick_names(blue))
+
+    if sky:
+        override = (
+            "PAPER OVERRIDE (failed wide CI — not Live HA): "
+            + " · ".join(_header_pick_names(sky))
+        )
+        return f"{ha_line}. {override}"
+
+    if blue:
+        return ha_line
 
     if green:
         names = [str(b.get("pick") or b.get("side") or "—") for b in green[:3]]
         return (
-            "WHAT TO BET (sized): NONE — bankroll stays flat. "
+            "WHAT TO BET (HA — passed gates): NONE — bankroll stays flat. "
             f"FUN ONLY leans (not sized): {', '.join(names)}."
         )
-    return "WHAT TO BET (sized): NONE — NO BET this card."
+    return "WHAT TO BET (HA — passed gates): NONE — NO BET this card."
 
 
 def prop_status_for_tier(prop: dict[str, Any]) -> str:
@@ -1120,10 +1134,15 @@ def format_tiered_best_bets(
         if event:
             lines.append(str(event).strip())
         lines.append(format_what_to_do_header(tiers=tiers))
-        if blue or sky:
+        if blue:
             lines.append("")
-            lines.append("Sized:")
-            for i, b in enumerate((blue + sky)[:5], start=1):
+            lines.append("HA passed gates:")
+            for i, b in enumerate(blue[:5], start=1):
+                lines.append(_line_compact(b, i))
+        if sky:
+            lines.append("")
+            lines.append("Paper override (failed wide CI):")
+            for i, b in enumerate(sky[:5], start=1):
                 lines.append(_line_compact(b, i))
         if green:
             lines.append("")
@@ -1154,7 +1173,9 @@ def format_tiered_best_bets(
         lines.append("BET THIS (Blue) — none. Sized bankroll = $0 this card.")
 
     if sky:
-        lines.append(f"TINY PAPER BET (Sky blue) — {len(sky)}:")
+        lines.append(
+            f"TINY PAPER BET (Sky blue) — failed wide-CI HA gate, Paper only — {len(sky)}:"
+        )
         for i, b in enumerate(sky[:5], start=1):
             lines.append(_line(b, i))
 

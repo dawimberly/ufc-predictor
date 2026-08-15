@@ -6,6 +6,7 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 ## Recent changes
 
+- **2026-08-15** — Ollama WHAT TO BET header splits HA-passed Deep Blue from Sky Blue paper overrides that failed the wide-CI gate.
 - **2026-08-15** — Land unmerged dashboard work on master: empty-book odds restore, fetch-once slate locks, instant fight-stats chat, MyBookie KO/sub/decision props with model edges, totals label fix, and no false Blue on research lines.
 - **2026-08-14** — Show MyBookie method props (KO/sub/decision) on Props with model edges, fix totals labels, and stop false Blue on research lines.
 - **2026-08-12** — Fix Odds API fetch-once slate locks and make Ollama fight stats instant.
@@ -83,7 +84,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Props - MyBookie** | Optional MyBookie prop lines (totals + KO/sub/decision method props; method lines are research-only, never HA Blue) |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin |
-| **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
+| **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (HA — passed gates)** vs **PAPER OVERRIDE (failed wide CI)** vs **FUN ONLY ($0)** |
 | **Arb Scanner** | Cross-book arb scan |
 
 BetNow / DraftKings (and their Props tabs) appear only when those scrapers are enabled in `.env` (keep DraftKings off to protect Odds API quota).
@@ -108,13 +109,13 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 | Color | Action verb | Meaning | Money |
 |-------|-------------|---------|-------|
-| **Deep Blue** `#3b82f6` | **BET THIS** | Clears full HA gates | Real ticket ($) |
-| **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Paper-only `paper_wide_override` | Paper $ only (not Live) |
+| **Deep Blue** `#3b82f6` | **BET THIS** | Passed full HA gates (live odds, min prob, min edge, uncertainty) | Real ticket ($) |
+| **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Failed wide CI — Paper-only `paper_wide_override` | Paper $ only (not Live HA) |
 | **Green** | **FUN ONLY** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | `$0` research — not bankroll |
 | **Yellow** | **CAUTION — SKIP SIZED** | Thin edge / borderline | `$0` |
 | **Red** | **DO NOT BET** | Negative edge, low prob, or `no_odds` | `$0` |
 
-If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE** and may list FUN ONLY leans separately. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
+If no Deep Blue tickets exist, the header says **WHAT TO BET (HA — passed gates): NONE** even when Sky Blue paper overrides are listed separately as **PAPER OVERRIDE (failed wide CI — not Live HA)**. FUN ONLY leans may follow. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
 
 ### Paper wide override (Sky Blue)
 
