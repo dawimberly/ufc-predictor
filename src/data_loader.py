@@ -1360,7 +1360,7 @@ def _fetch_espn_historical(*, since: pd.Timestamp | None = None) -> pd.DataFrame
         )
         try:
             df = _fetch_espn_scoreboard_url(url, completed_only=True)
-        except DataLoaderError as exc:
+        except (DataLoaderError, requests.RequestException) as exc:
             logger.debug("ESPN year %s skipped: %s", year, exc)
             continue
         if since is not None:
@@ -1995,7 +1995,7 @@ def load_historical_data(
             espn_df = _fetch_espn_historical(since=since if incremental else None)
             if not espn_df.empty:
                 frames.append(espn_df)
-        except DataLoaderError as exc:
+        except (DataLoaderError, requests.RequestException, OSError) as exc:
             errors.append(f"espn: {exc}")
 
     if not frames:
