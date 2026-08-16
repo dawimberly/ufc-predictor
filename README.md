@@ -4,6 +4,18 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 **Repos:** [dawimberly/ufc-predictor](https://github.com/dawimberly/ufc-predictor) · [infinite-robots/ufc-predictor](https://github.com/infinite-robots/ufc-predictor) (private)
 
+## Recent changes
+
+- **2026-08-16** — Fighter-photo desk: local Ollama vision reads cached stills; both-finisher look fades Over 1.5 to caution (not BET THIS). Camp strip flags shared-gym / camp-switch underdogs.
+- **2026-08-15** — MyBookie Over 1.5 with bogus edges (e.g. +26%) is no longer BET THIS Blue — HA caps actionable edge at 25%.
+- **2026-08-15** — Land unmerged dashboard work on master: empty-book odds restore, fetch-once slate locks, instant fight-stats chat, MyBookie KO/sub/decision props with model edges, totals label fix, and no false Blue on research lines.
+- **2026-08-14** — Show MyBookie method props (KO/sub/decision) on Props with model edges, fix totals labels, and stop false Blue on research lines.
+- **2026-08-12** — Fix Odds API fetch-once slate locks and make Ollama fight stats instant.
+- **2026-08-11** — Empty-book odds: fixed `UnboundLocalError` in book odds merge that blanked all books; Soft Update / Quick Odds restore matched lines. See `data/reports/odds_empty_incident.md`.
+- **2026-08-11** — Sky Blue on Odds API / MyBookie fight tables now matches Ollama (Kelly `paper_wide_override` status is parsed for color).
+
+Every **Commit** (UI or CLI) auto-appends a **Recent changes** bullet from the commit subject and **pushes `origin`** (personal + Infinite Robots push URLs). Skip with `[skip-readme]` / `[no-push]` in the message, or `SKIP_README_HOOK=1` / `SKIP_AUTO_PUSH=1`.
+
 ## Project layout
 
 ```
@@ -15,6 +27,7 @@ UFC-Predictor/
 │   ├── strategy.py            HA sizing + auto 2/3-leg parlay recs
 │   ├── uncertainty_gates.py   Conformal CI gates + Paper wide override
 │   ├── fight_context.py       Display-only context strip
+│   ├── photo_analysis.py      Local vision read of fighter stills (research)
 │   ├── weigh_in.py            Weigh-in photos / missed-weight notes
 │   ├── fighter_flags.py       Integrity skip / badge flags
 │   └── ufc_dashboard.py       CustomTkinter GUI
@@ -70,10 +83,10 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Odds API** | Primary free-tier moneylines + edges |
 | **Odds API Props** | Over/Under 1.5 (HA Blue props = **Over 1.5 only**, live) |
 | **MyBookie** | Optional moneyline scraper (`MYBOOKIE_ENABLED=true`) |
-| **Props - MyBookie** | Optional MyBookie prop lines |
+| **Props - MyBookie** | Optional MyBookie prop lines (totals + KO/sub/decision method props; method lines are research-only, never HA Blue) |
 | **Next Two Cards** | Upcoming UFC.com cards (closest first) |
 | **Risk Analysis** | Monte Carlo drawdown / ruin |
-| **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
+| **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (HA — passed gates)** vs **PAPER OVERRIDE (failed wide CI)** vs **FUN ONLY ($0)** |
 | **Arb Scanner** | Cross-book arb scan |
 
 BetNow / DraftKings (and their Props tabs) appear only when those scrapers are enabled in `.env` (keep DraftKings off to protect Odds API quota).
@@ -98,13 +111,13 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 | Color | Action verb | Meaning | Money |
 |-------|-------------|---------|-------|
-| **Deep Blue** `#3b82f6` | **BET THIS** | Clears full HA gates | Real ticket ($) |
-| **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Paper-only `paper_wide_override` | Paper $ only (not Live) |
+| **Deep Blue** `#3b82f6` | **BET THIS** | Passed full HA gates (live odds, min prob, min edge, uncertainty) | Real ticket ($) |
+| **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Failed wide CI — Paper-only `paper_wide_override` | Paper $ only (not Live HA) |
 | **Green** | **FUN ONLY** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | `$0` research — not bankroll |
 | **Yellow** | **CAUTION — SKIP SIZED** | Thin edge / borderline | `$0` |
 | **Red** | **DO NOT BET** | Negative edge, low prob, or `no_odds` | `$0` |
 
-If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE** and may list FUN ONLY leans separately. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
+If no Deep Blue tickets exist, the header says **WHAT TO BET (HA — passed gates): NONE** even when Sky Blue paper overrides are listed separately as **PAPER OVERRIDE (failed wide CI — not Live HA)**. FUN ONLY leans may follow. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
 
 ### Paper wide override (Sky Blue)
 
@@ -131,7 +144,7 @@ Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `X
 
 ### Context strip (display only)
 
-Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Controversial methods / decision-profile / home-country / pathway A/Bs are **DROP** for production features; leave those flags off unless a keep rule is re-run and passes.
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`), a local **photo desk** (`photo_analysis` — physique / both-finishers / Over 1.5 fade when a vision model is installed), camp/gym notes including shared-gym camp-switch cautions (`gym_data`), and integrity flags (`fighter_flags`) — **context only**, not model features. Always-on strip lines: market implied + Disagree; decision profile / judges when known. DROP research blocks (pathway, market, home, local, judge-geo, decision-profile, overseas, controversy) stay out of production features — see `data/reports/research_keep_drop.md`.
 
 ## Odds sources
 
@@ -174,19 +187,38 @@ Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Bl
 | `no_odds` | No matched / usable price |
 | `min_edge` | Edge below profile floor |
 
+## Production features & Soft Update
+
+**Production model** = **HV features** (`ENABLE_HIGH_VALUE_FEATURES=true`) + **HA uncertainty gates**. Sized tickets only clear those gates (Deep Blue / Paper Sky Blue). Ledger: `data/reports/research_keep_drop.md`. Freeze snapshot: `data/reports/PRODUCTION_FREEZE.md`.
+
+**KEEP:** HV (+ gates). **DROP (flags default false):** pathway, market, home-country, local advantage, judge-geo (model), decision-profile, overseas travel, controversy. Do not flip `ADD_*` / `ENABLE_PATHWAY_*` / `ENABLE_MARKET_*` unless you re-run the A/B and the keep rule passes. Preflight warns (Live fails) if DROP flags are on.
+
+**Display-only extras** (not model features): fight context strip (market implied, Disagree, decision profile / judges when known), weigh-in photos + digital photo desk, camp/gym notes, integrity badges, overseas notes, Ollama/Grok narrative, FUN ONLY greens.
+
+### Soft Update (canonical odds path)
+
+1. **Refresh Next Two** — load UFC.com cards + model predictions; with `ODDS_FETCH_ONCE=true`, first Odds API download is cached.
+2. **Soft Update** — reload `.env` + re-attach book moneylines/props from **cache** (no live Odds API burn while cache files exist). Soft-fail per book: missing lines stay blank (no fake −100% edges).
+3. Fresh live pull only when needed: **Quick Odds + Props**, or delete `data/cache/ufc_odds_api.csv` (+ prop once markers).
+4. After **code** changes: **Restart** (Soft Update does not reload Python modules).
+
+Evaluate-only 2025 check (no retrain):
+
+```bash
+python scripts/run_production_backtest_2025.py
+```
+
+Trading-bot Task Scheduler jobs are out of scope for this UFC repo — do not edit them here.
+
 ## Model features (HV)
 
-Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV.
-
-Helpers:
+Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV. Research A/B helpers stay available but are **not** part of the freeze path:
 
 ```bash
 python scripts/ab_high_value_features.py
 python scripts/productionize_hv_features.py
-python scripts/rescore_2025_upset.py
-python scripts/upset_autopsy_backtest.py
+python scripts/run_production_backtest_2025.py
 ```
-
 ## CLI
 
 ```bash
@@ -246,10 +278,6 @@ Prefer `START_DASHBOARD.bat` / Python day-to-day. Frozen builds may hit PyArrow 
 - **BET THIS (Deep Blue / Sky Blue) = money tickets** — FUN ONLY / Yellow / Red never get HA stake
 - **Sky Blue caps** — 1% bankroll + max 2 override singles/card
 - **Ollama clarity** — sized NO BET vs FUN ONLY leans stated up front
-- **Daily loss circuit breaker** — `src/circuit_breaker.py`
-- **Peak drawdown halt** — `risk_manager.DrawdownHalt`
-- **Alert cooldown + fingerprint dedup**
-- **Dry-run** — `ALERT_DRY_RUN=true` or `--dry-run`
 
 ## Configuration
 
@@ -273,6 +301,8 @@ Copy `.env.example` → `.env`. Important keys:
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
+| `OLLAMA_VISION_MODEL` | (auto) | Photo desk; `ollama pull llava` or qwen2.5vl |
+| `PHOTO_ANALYSIS_ENABLED` | true | Digital stills analysis (not a model feature) |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |
 
 ## Ops artifacts
@@ -291,11 +321,7 @@ Copy `.env.example` → `.env`. Important keys:
 python -m pytest tests/ -q
 ```
 
-Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, fighter flags, weigh-in context, and Ollama props wiring.
+Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, fighter flags, weigh-in context, photo desk, and Ollama props wiring.
 
 ## Design notes
 
-- **Leakage-safe features**: rolling stats use only prior fights.
-- **No paid odds required**: Odds API free tier + optional scrapers.
-- **Credit-safe by default**: `ODDS_FETCH_ONCE` + fail-closed without usable lines.
-- **Separate from PythonTrading**: no merge with the Alpaca stock bot.

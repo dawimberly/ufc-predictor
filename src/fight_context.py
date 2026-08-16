@@ -293,7 +293,7 @@ def build_fight_context(row: pd.Series | dict[str, Any] | None) -> dict[str, str
     """
     Return display sections (omit empty).
 
-    Keys: method, decision, style, market, judges, disagree, title, summary.
+    Keys: method, decision, style, market, judges, disagree, gym, photos, title, summary.
     """
     if row is None:
         return {}
@@ -337,6 +337,28 @@ def build_fight_context(row: pd.Series | dict[str, Any] | None) -> dict[str, str
             out["weigh_in"] = weigh
     except Exception:
         pass
+    try:
+        from src.gym_data import gym_matchup_summary
+
+        event_loc = str(
+            _get(series, "location")
+            or _get(series, "event_location")
+            or _get(series, "venue")
+            or ""
+        )
+        gym = gym_matchup_summary(f1, f2, event_location=event_loc)
+        if gym:
+            out["gym"] = "Camp: " + (gym if len(gym) <= 280 else gym[:277].rstrip() + "...")
+    except Exception:
+        pass
+    try:
+        from src.photo_analysis import format_photo_analysis_line
+
+        photos = format_photo_analysis_line(f1, f2, fetch_vision=False)
+        if photos:
+            out["photos"] = photos
+    except Exception:
+        pass
     pick = str(_get(series, "predicted_winner") or _get(series, "pick") or "")
     title = f"{f1} vs {f2}" if f1 and f2 else "Fight"
     if pick:
@@ -347,6 +369,8 @@ def build_fight_context(row: pd.Series | dict[str, Any] | None) -> dict[str, str
         for k in (
             "integrity",
             "weigh_in",
+            "gym",
+            "photos",
             "method",
             "decision",
             "style",
@@ -370,6 +394,8 @@ def format_fight_context_lines(ctx: dict[str, str]) -> list[str]:
     for key in (
         "integrity",
         "weigh_in",
+        "gym",
+        "photos",
         "method",
         "decision",
         "style",

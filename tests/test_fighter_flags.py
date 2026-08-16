@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pandas as pd
 
+import pytest
+
 from src.fighter_flags import (
+    FLAGS_PATH,
     format_flag_badge,
     lookup_fighter_flag,
     reload_fighter_flags,
@@ -14,6 +17,8 @@ from src.strategy import StrategyConfig, extract_bet_candidates
 
 
 def test_sutherland_and_montanha_flagged():
+    if not FLAGS_PATH.is_file():
+        pytest.skip(f"missing fighter flags: {FLAGS_PATH}")
     reload_fighter_flags()
     assert lookup_fighter_flag("Louie Sutherland") is not None
     assert lookup_fighter_flag("José Montanha") is not None
@@ -26,6 +31,8 @@ def test_sutherland_and_montanha_flagged():
 
 
 def test_extract_bet_skips_flagged_fight(monkeypatch):
+    if not FLAGS_PATH.is_file():
+        pytest.skip(f"missing fighter flags: {FLAGS_PATH}")
     reload_fighter_flags()
     row = pd.Series(
         {

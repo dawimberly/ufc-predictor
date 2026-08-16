@@ -10,7 +10,9 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+ProgressFn = Callable[[str, float | None], None]
 
 import config
 import pandas as pd
@@ -442,17 +444,34 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
             action = action_label_for_bet(t)
         else:
             action = "FUN ONLY ($0)" if is_fun else "BET THIS"
+        ev = str(t.get("event") or t.get("event_name") or "").strip()
+        ev_bit = f"event={ev} | " if ev else ""
         ticket_lines.append(
-            f"- id={t.get('id')} | ACTION={action} | {t.get('side')} | {t.get('market')} | "
+            f"- id={t.get('id')} | {ev_bit}ACTION={action} | {t.get('side')} | {t.get('market')} | "
             f"book={t.get('book') or 'n/a'} | stake={t.get('stake_pct')}%/${t.get('stake_usd')} | "
             f"prob={t.get('prob')} | edge={t.get('edge_pct')}% | conf={t.get('confidence')}"
+            + (f" | gym={t.get('gym_note')}" if t.get("gym_note") else "")
+            + (f" | photo={t.get('photo_note')}" if t.get("photo_note") else "")
+            + (" | PHOTO_FADE_OVER_15" if t.get("photo_over_15_caution") else "")
         )
     tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET / sized $0)"
 
+    photo_notes = str(inputs.get("photo_notes") or "").strip()
+    if not photo_notes:
+        try:
+            from src.photo_analysis import card_photo_notes
+
+            photo_notes = card_photo_notes(tickets)
+        except Exception:
+            photo_notes = ""
+    photo_block = f"\nPhoto desk (stills only, not HA):\n{photo_notes}\n" if photo_notes else ""
+
     parlay_lines: list[str] = []
     for p in parlays:
+        ev = str(p.get("event") or p.get("event_name") or "").strip()
+        ev_bit = f"event={ev} | " if ev else ""
         parlay_lines.append(
-            f"- id={p.get('id')} | FUN ONLY research $0 | {p.get('n_legs')}-leg | {p.get('picks')} | "
+            f"- id={p.get('id')} | {ev_bit}FUN ONLY research $0 | {p.get('n_legs')}-leg | {p.get('picks')} | "
             f"combined_prob={float(p.get('combined_prob') or 0):.0%} | "
             f"ha_qualified={bool(p.get('ha_qualified'))}"
         )
@@ -475,19 +494,22 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
 {what_to_do}{warning}
 Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
-In summary + each pick reason, lead with ACTION verbs: BET THIS ($), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
+BET THIS (Blue) = passed HA gates (live odds, min prob, min edge, uncertainty). Never call TINY PAPER BET a passed HA bet.
+TINY PAPER BET (Sky) = FAILED wide CI — Paper override only, not Live HA.
+In summary + each pick reason, lead with ACTION verbs: BET THIS ($), TINY PAPER BET (failed wide CI), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
+Name the event on every pick and parlay (Next Two often has two cards).
 FUN ONLY / advisory stakes stay 0 — never tell the user to size those as bankroll bets.
 Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars); empty ACT list => say sized NO BET.
 
 Tickets ({n_act} BET THIS / {n_adv} FUN ONLY):
 {tickets_block}
-BET THIS totals: {total_pct}% / ${total_usd}
+{photo_block}BET THIS totals: {total_pct}% / ${total_usd}
 
 Auto parlays (narrate as FUN ONLY research — do not invent legs):
 {parlays_block}
 
 Return JSON:
-{{"event":"{event}","summary":"start with WHAT TO BET line","picks":[{{"id":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"BET THIS $x or FUN ONLY $0 — ...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","n_legs":2,"reason":"FUN ONLY $0 — ...","conviction":"high|medium|low"}}]}}"""
+{{"event":"{event}","summary":"start with WHAT TO BET line and name the event(s)","picks":[{{"id":"...","event":"...","side":"...","market":"...","book":"...","stake_pct":0.0,"stake_usd":0.0,"reason":"BET THIS $x or FUN ONLY $0 — Event — ...","conviction":"high|medium|low"}}],"parlays":[{{"id":"...","event":"...","n_legs":2,"reason":"FUN ONLY $0 — Event — ...","conviction":"high|medium|low"}}]}}"""
 
 
 def _ticket_slip_id(ticket: dict[str, Any]) -> str:
@@ -509,24 +531,32 @@ def _ticket_to_slip_row(
     tier: str = "actionable",
 ) -> dict[str, Any]:
     """Normalize an HA-sized ticket into Ollama bet-slip row fields."""
+    from src.props import PROP_MARKET_LABELS, event_from_record
+
     is_parlay = bool(ticket.get("is_parlay")) or int(ticket.get("n_legs") or 1) >= 2
     is_prop = (
         str(ticket.get("market_type") or "").lower() == "prop"
-        or str(ticket.get("prop_key") or "") == "over_1_5_rounds"
+        or str(ticket.get("prop_key") or "").endswith("_rounds")
     )
     fight = str(ticket.get("fight") or "").strip()
+    event = event_from_record(ticket)
     if is_parlay:
         n_legs = int(ticket.get("n_legs") or 2)
         market = f"{n_legs}-leg parlay"
         side = str(ticket.get("pick_line") or ticket.get("picks") or ticket.get("display_label") or "")
     elif is_prop:
-        market = "Over 1.5 Rounds"
+        market = str(
+            ticket.get("prop_short")
+            or ticket.get("prop_type")
+            or PROP_MARKET_LABELS.get(str(ticket.get("prop_key") or ""), "")
+            or "Prop"
+        )
         label = str(
             ticket.get("display_label")
             or ticket.get("label")
             or ticket.get("prop_short")
             or ticket.get("pick_line")
-            or "Over 1.5 Rounds"
+            or market
         )
         side = f"{fight} — {label}" if fight and fight not in label else label
     else:
@@ -549,6 +579,14 @@ def _ticket_to_slip_row(
         edge_f = 0.0
     if abs(edge_f) > 1.5:
         edge_f = edge_f / 100.0
+    displayed_pct = None
+    if ticket.get("edge_pct") is not None:
+        try:
+            displayed_pct = float(ticket["edge_pct"])
+        except (TypeError, ValueError):
+            displayed_pct = None
+    if displayed_pct is None:
+        displayed_pct = round(edge_f * 100.0, 1)
     stake_pct = float(ticket.get("stake_pct") or 0.0)
     stake_usd = float(ticket.get("suggested_stake") or ticket.get("stake_usd") or 0.0)
     conf = str(ticket.get("confidence") or ticket.get("confidence_label") or "-")
@@ -575,10 +613,12 @@ def _ticket_to_slip_row(
         "stake_usd": round(stake_usd, 2),
         "prob": ticket.get("prob") or ticket.get("combined_prob"),
         "edge": edge_f,
-        "edge_pct": round(edge_f * 100.0, 1),
+        "edge_pct": displayed_pct,
         "confidence": conf,
         "strength_score": ticket.get("strength_score"),
         "uncertainty_action": ticket.get("uncertainty_action") or "allow",
+        "event": event,
+        "event_name": event,
         "fight": ticket.get("fight"),
         "pick": ticket.get("pick") or (side if is_prop else ticket.get("pick")),
         "prop_key": ticket.get("prop_key") if is_prop else "",
@@ -591,6 +631,9 @@ def _ticket_to_slip_row(
         "bet_tier": bet_tier or None,
         "fun_bet": bool(ticket.get("fun_bet")),
         "tier_reason": ticket.get("tier_reason") or "",
+        "gym_note": str(ticket.get("gym_note") or "")[:220],
+        "photo_note": str(ticket.get("photo_note") or "")[:220],
+        "photo_over_15_caution": bool(ticket.get("photo_over_15_caution")),
     }
 
 
@@ -623,6 +666,23 @@ def _candidate_dedupe_key(ticket: dict[str, Any]) -> str:
         return f"{base}|{market}|{selection}|{book}"
 
 
+def _uncertainty_blocks_ticket(ticket: dict[str, Any]) -> bool:
+    unc = str(ticket.get("uncertainty_action") or "").strip().lower()
+    return unc in {"skip", "block", "missing", "missing_uncertainty"}
+
+
+def _ticket_in_cleared_keys(ticket: dict[str, Any], cleared: set[str]) -> bool:
+    if not cleared:
+        return False
+    for k in (
+        str(ticket.get("fight_id") or "").strip(),
+        str(ticket.get("fight") or "").strip(),
+    ):
+        if k and k in cleared:
+            return True
+    return False
+
+
 def collect_card_analysis_inputs(
     books: dict[str, dict[str, Any]],
     budget_state: dict[str, Any] | None,
@@ -637,16 +697,27 @@ def collect_card_analysis_inputs(
     Gather HA-gated + fun-tier tickets for Ollama bet-slip narration.
 
     Builds one merged Top N list (default 5):
-    - CLEARS GATES (HA-sized) first
+    - CLEARS GATES (HA-sized) first — Blue/Sky only from real alert clears
     - then DECENT FUN / caution fillers
-    - props (Over 1.5) compete in the same pool — never concatenated past Top N
+    - props compete in the same pool — never concatenated past Top N
 
     Dedupes on (fight_id, market_type, selection, book) via dedupe_rank_top_tickets.
     """
     from src.bet_slip import dedupe_rank_top_tickets
+    from src.bet_tiers import (
+        TIER_BLUE,
+        TIER_GREEN,
+        TIER_SKY_BLUE,
+        TIER_YELLOW,
+        demote_suspect_edge_ticket,
+        demote_photo_caution_ticket,
+        is_sky_blue_ticket,
+        singles_cleared_keys,
+    )
     from src.strategy import (
         aggregate_overview_recommendations,
         aggregate_top_recommended_bets,
+        ticket_edge_exceeds_actionable_cap,
     )
 
     fight_cap = max_fights if max_fights is not None else config.GROK_MAX_FIGHTS
@@ -671,22 +742,78 @@ def collect_card_analysis_inputs(
             + list(slip.get("parlays") or [])
         )
 
+    # HA-cleared keys from book alerts (same source Overview uses for Blue)
+    cleared_singles: list[dict[str, Any]] = []
+    for book_data in (books or {}).values():
+        if not isinstance(book_data, dict):
+            continue
+        cleared_singles.extend(list((book_data.get("alerts") or {}).get("singles") or []))
+    cleared_keys = singles_cleared_keys(cleared_singles)
+
     raw_candidates: list[dict[str, Any]] = []
 
-    # HA / overview sized tickets
+    # Overview tickets: Blue only when HA-cleared + sized + not uncertainty-blocked
     for t in items:
-        row = _ticket_to_slip_row(t, rank=0, tier="actionable")
-        stake_ok = float(row.get("stake_usd") or 0) > 0 and float(row.get("stake_pct") or 0) > 0
-        if stake_ok:
-            row["bet_tier"] = "blue"
+        stake_usd = float(t.get("suggested_stake") or t.get("stake_usd") or 0)
+        stake_pct = float(t.get("stake_pct") or 0)
+        stake_ok = stake_usd > 0 and stake_pct > 0
+        ha_ok = (
+            stake_ok
+            and _ticket_in_cleared_keys(t, cleared_keys)
+            and not _uncertainty_blocks_ticket(t)
+            and not bool(t.get("advisory") or t.get("fun_bet"))
+            and not bool(t.get("is_parlay"))
+            and int(t.get("n_legs") or 1) < 2
+            and not ticket_edge_exceeds_actionable_cap(t)
+        )
+        # Live Over 1.5 props: only HA-Blue if classify agrees (never invent from stake alone)
+        is_prop = str(t.get("market_type") or "").lower() == "prop" or bool(t.get("prop_key"))
+        if is_prop and stake_ok and not _uncertainty_blocks_ticket(t):
+            from src.bet_tiers import classify_prop_bet_tier
+            from src.props import is_live_prop_odds_source
+
+            prop_tier, _ = classify_prop_bet_tier(t, debug=False)
+            if (
+                prop_tier in {TIER_BLUE, TIER_SKY_BLUE}
+                and is_live_prop_odds_source(str(t.get("odds_source") or ""))
+                and t.get("strict_qualified") is not False
+                and str(t.get("prop_key") or "") == "over_1_5_rounds"
+            ):
+                from src.strategy import prop_may_receive_ha_stake
+
+                ha_ok = prop_may_receive_ha_stake(t)
+            else:
+                ha_ok = False
+        if ha_ok:
+            row = _ticket_to_slip_row(t, rank=0, tier="actionable")
+            if not row.get("event") and event_label:
+                row["event"] = event_label
+                row["event_name"] = event_label
+            if is_sky_blue_ticket(
+                stake_pct=stake_pct if stake_pct > 0 else None,
+                stake_usd=stake_usd if stake_usd > 0 else None,
+                uncertainty_reason=str(t.get("uncertainty_reason") or ""),
+            ):
+                row["bet_tier"] = TIER_SKY_BLUE
+            else:
+                row["bet_tier"] = TIER_BLUE
             row["fun_bet"] = False
             row["advisory"] = False
             raw_candidates.append(row)
         else:
             adv = _ticket_to_slip_row(t, rank=0, tier="advisory")
+            if not adv.get("event") and event_label:
+                adv["event"] = event_label
+                adv["event_name"] = event_label
+            adv["advisory"] = True
+            adv["fun_bet"] = True
+            adv["stake_usd"] = 0.0
+            adv["stake_pct"] = 0.0
+            if not adv.get("bet_tier") or adv.get("bet_tier") in {"blue", "sky_blue"}:
+                adv["bet_tier"] = TIER_YELLOW
             raw_candidates.append(adv)
 
-    # Extra ranked singles (may overlap — dedupe later)
+    # Extra ranked singles (may overlap — dedupe later); never invent Blue here
     try:
         extra = aggregate_top_recommended_bets(
             books, bs, limit=top_n, per_book_cap=2, profile=prof
@@ -694,7 +821,17 @@ def collect_card_analysis_inputs(
     except Exception:
         extra = []
     for t in list(slip.get("prop_singles") or []) + list(slip.get("parlays") or []) + list(extra):
-        raw_candidates.append(_ticket_to_slip_row(t, rank=0, tier="advisory"))
+        extra_row = _ticket_to_slip_row(t, rank=0, tier="advisory")
+        if not extra_row.get("event") and event_label:
+            extra_row["event"] = event_label
+            extra_row["event_name"] = event_label
+        extra_row["advisory"] = True
+        extra_row["fun_bet"] = True
+        extra_row["stake_usd"] = 0.0
+        extra_row["stake_pct"] = 0.0
+        if not extra_row.get("bet_tier") or extra_row.get("bet_tier") in {"blue", "sky_blue"}:
+            extra_row["bet_tier"] = TIER_YELLOW
+        raw_candidates.append(extra_row)
 
     # Skips (context only — not in top list)
     skipped_payload: list[dict[str, Any]] = []
@@ -732,10 +869,6 @@ def collect_card_analysis_inputs(
     prop_tiers: dict[str, Any] = {}
     try:
         from src.bet_tiers import (
-            TIER_BLUE,
-            TIER_GREEN,
-            TIER_SKY_BLUE,
-            TIER_YELLOW,
             classify_prop_bet_tier,
             collect_props_from_books,
             merge_bet_tier_dicts,
@@ -743,12 +876,10 @@ def collect_card_analysis_inputs(
             rank_prop_bet_tiers,
         )
 
-        cleared: list[dict[str, Any]] = []
         preds = None
         for book_data in (books or {}).values():
             if not isinstance(book_data, dict):
                 continue
-            cleared.extend((book_data.get("alerts") or {}).get("singles") or [])
             if preds is None:
                 p = book_data.get("predictions")
                 if isinstance(p, pd.DataFrame) and not p.empty:
@@ -756,7 +887,7 @@ def collect_card_analysis_inputs(
         overview = (books or {}).get("Overview") or {}
         if preds is None and isinstance(overview.get("predictions"), pd.DataFrame):
             preds = overview.get("predictions")
-        fun_tiers = rank_card_bet_tiers(preds, cleared_singles=cleared, limit_per_tier=6)
+        fun_tiers = rank_card_bet_tiers(preds, cleared_singles=cleared_singles, limit_per_tier=6)
 
         raw_props = collect_props_from_books(
             books, limit=prop_cap, allowed_fights=allowed_fights
@@ -775,9 +906,28 @@ def collect_card_analysis_inputs(
         prop_tiers = rank_prop_bet_tiers(merged_props, limit_per_tier=prop_cap)
         fun_tiers = merge_bet_tier_dicts(fun_tiers, prop_tiers, limit_per_tier=8)
 
+        # Inject HA Blue/Sky from tier ranker (authoritative — matches Overview colors)
+        for tier_name in (TIER_BLUE, TIER_SKY_BLUE):
+            for b in fun_tiers.get(tier_name) or []:
+                row = _ticket_to_slip_row(b, rank=0, tier="actionable")
+                if not row.get("event") and event_label:
+                    row["event"] = event_label
+                    row["event_name"] = event_label
+                row["bet_tier"] = tier_name
+                row["fun_bet"] = False
+                row["advisory"] = False
+                # Keep stakes only when the tier source actually sized them
+                if float(row.get("stake_usd") or 0) <= 0 and float(b.get("suggested_stake") or b.get("stake_usd") or 0) > 0:
+                    row["stake_usd"] = float(b.get("suggested_stake") or b.get("stake_usd") or 0)
+                    row["stake_pct"] = float(b.get("stake_pct") or 0)
+                raw_candidates.append(row)
+
         # Fun ML + prop candidates compete in the SAME pool (merged below)
         for fun in list(fun_tiers.get(TIER_GREEN) or []) + list(fun_tiers.get(TIER_YELLOW) or []):
             row = _ticket_to_slip_row(fun, rank=0, tier="advisory")
+            if not row.get("event") and event_label:
+                row["event"] = event_label
+                row["event_name"] = event_label
             row["bet_tier"] = fun.get("bet_tier") or TIER_GREEN
             row["fun_bet"] = True
             row["advisory"] = True
@@ -793,22 +943,24 @@ def collect_card_analysis_inputs(
                 stake_ok = float(src.get("suggested_stake") or src.get("stake_usd") or 0) > 0 and float(
                     src.get("stake_pct") or 0
                 ) > 0
+                # Props: Blue only when tier ranker said blue/sky AND live HA-eligible stake
+                from src.strategy import prop_may_receive_ha_stake
+
+                prop_ha = (
+                    tier_name in {TIER_BLUE, TIER_SKY_BLUE}
+                    and stake_ok
+                    and prop_may_receive_ha_stake(src)
+                )
                 row = _ticket_to_slip_row(
                     src,
                     rank=0,
-                    tier="actionable" if stake_ok else "advisory",
+                    tier="actionable" if prop_ha else "advisory",
                 )
                 row["bet_tier"] = p.get("bet_tier") or tier_name
-                row["fun_bet"] = bool(p.get("fun_bet")) and not stake_ok
                 row["tier_reason"] = p.get("tier_reason") or row.get("tier_reason") or ""
-                if not stake_ok:
-                    row["stake_usd"] = 0.0
-                    row["stake_pct"] = 0.0
-                    row["advisory"] = True
-                    row["fun_bet"] = True
-                else:
-                    from src.bet_tiers import is_sky_blue_ticket
-
+                if prop_ha:
+                    row["fun_bet"] = False
+                    row["advisory"] = False
                     if is_sky_blue_ticket(
                         stake_pct=float(src.get("stake_pct") or 0) or None,
                         stake_usd=float(src.get("suggested_stake") or src.get("stake_usd") or 0)
@@ -818,30 +970,51 @@ def collect_card_analysis_inputs(
                         row["bet_tier"] = TIER_SKY_BLUE
                     else:
                         row["bet_tier"] = TIER_BLUE
-                    row["fun_bet"] = False
-                    row["advisory"] = False
+                else:
+                    row["stake_usd"] = 0.0
+                    row["stake_pct"] = 0.0
+                    row["advisory"] = True
+                    row["fun_bet"] = True
+                    if row.get("bet_tier") in {TIER_BLUE, TIER_SKY_BLUE}:
+                        # Downgrade — no size means not Blue
+                        try:
+                            tier, reason = classify_prop_bet_tier(src, debug=False)
+                            row["bet_tier"] = tier if tier not in {TIER_BLUE, TIER_SKY_BLUE} else TIER_YELLOW
+                            row["tier_reason"] = reason
+                        except Exception:
+                            row["bet_tier"] = TIER_YELLOW
+                if not row.get("event") and event_label:
+                    row["event"] = event_label
+                    row["event_name"] = event_label
                 raw_candidates.append(row)
     except Exception as exc:
         logger.debug("fun/prop tier build skipped: %s", exc)
 
-    # Annotate missing bet_tier before merge
+    # Annotate missing bet_tier — never invent Blue from stake
     for t in raw_candidates:
         if t.get("bet_tier"):
-            continue
-        if float(t.get("stake_usd") or 0) > 0:
-            t["bet_tier"] = "blue"
             continue
         if str(t.get("market_type") or "") == "prop" or "Over 1.5" in str(t.get("market") or ""):
             try:
                 from src.bet_tiers import classify_prop_bet_tier
 
                 tier, reason = classify_prop_bet_tier(t, debug=False)
+                if tier in {TIER_BLUE, TIER_SKY_BLUE} and float(t.get("stake_usd") or 0) <= 0:
+                    tier = TIER_YELLOW
                 t["bet_tier"] = tier
                 t["tier_reason"] = reason
             except Exception:
-                t["bet_tier"] = "yellow"
+                t["bet_tier"] = TIER_YELLOW
         else:
-            t["bet_tier"] = "yellow"
+            t["bet_tier"] = TIER_YELLOW
+        if t.get("bet_tier") not in {TIER_BLUE, TIER_SKY_BLUE}:
+            t["advisory"] = True
+            t["fun_bet"] = True
+            t["stake_usd"] = 0.0
+            t["stake_pct"] = 0.0
+
+    raw_candidates = [demote_suspect_edge_ticket(t) or t for t in raw_candidates]
+    raw_candidates = [demote_photo_caution_ticket(t) or t for t in raw_candidates]
 
     tickets = dedupe_rank_top_tickets(
         raw_candidates,
@@ -850,7 +1023,14 @@ def collect_card_analysis_inputs(
         log=logger,
     )
 
-    actionable_only = [t for t in tickets if not t.get("advisory") and float(t.get("stake_usd") or 0) > 0]
+    actionable_only = [
+        t
+        for t in tickets
+        if str(t.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+        and not t.get("advisory")
+        and not t.get("fun_bet")
+        and float(t.get("stake_usd") or 0) > 0
+    ]
     total_pct = round(sum(float(t.get("stake_pct") or 0) for t in actionable_only), 1)
     total_usd = round(sum(float(t.get("stake_usd") or 0) for t in actionable_only), 2)
     br = float(bs.get("total_bankroll") or config.DEFAULT_TOTAL_BANKROLL)
@@ -864,6 +1044,13 @@ def collect_card_analysis_inputs(
     ]
     n_actionable = len(actionable_only)
     n_advisory = sum(1 for t in tickets if t.get("advisory") or t.get("fun_bet"))
+    photo_notes = ""
+    try:
+        from src.photo_analysis import card_photo_notes
+
+        photo_notes = card_photo_notes(tickets)
+    except Exception:
+        photo_notes = ""
 
     recommended_parlays: list[dict[str, Any]] = []
     try:
@@ -873,8 +1060,6 @@ def collect_card_analysis_inputs(
         if allowed_fights and preds_df is not None and not preds_df.empty:
             # Soft-filter to loaded card fights when keys are available
             try:
-                import pandas as pd
-
                 mask = pd.Series(False, index=preds_df.index)
                 if "fight_id" in preds_df.columns:
                     mask = mask | preds_df["fight_id"].astype(str).isin(allowed_fights)
@@ -919,6 +1104,7 @@ def collect_card_analysis_inputs(
         "top_n": top_n,
         "top_n_shown": len(tickets),
         "recommended_parlays": recommended_parlays,
+        "photo_notes": photo_notes,
     }
 
 
@@ -984,6 +1170,10 @@ def merge_ollama_reasons_into_slip(
             conv = str(match.get("conviction") or "").lower()
             if conv in {"high", "medium", "low"}:
                 row["conviction"] = conv
+            ev = str(match.get("event") or match.get("event_name") or "").strip()
+            if ev and not str(row.get("event") or row.get("event_name") or "").strip():
+                row["event"] = ev
+                row["event_name"] = ev
         if not row.get("reason"):
             # Deterministic fallback reason from model fields
             conf = str(row.get("confidence") or "-")
@@ -1034,6 +1224,10 @@ def merge_ollama_reasons_into_parlays(
             conv = str(match.get("conviction") or "").lower()
             if conv in {"high", "medium", "low"}:
                 row["conviction"] = conv
+            ev = str(match.get("event") or match.get("event_name") or "").strip()
+            if ev and not str(row.get("event") or row.get("event_name") or "").strip():
+                row["event"] = ev
+                row["event_name"] = ev
         if not row.get("reason"):
             comb = float(row.get("combined_prob") or 0)
             tag = "HA legs" if row.get("ha_qualified") else "research"
@@ -1112,6 +1306,7 @@ def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict
                 "stake_usd": row.get("stake_usd"),
                 "reason": narrative,
                 "narrative_edge": narrative,
+                "event": str(row.get("event") or row.get("event_name") or event_label or "").strip(),
                 "crowd_positioning": str(
                     row.get("crowd_positioning") or row.get("crowd") or ""
                 ).strip()[:80],
@@ -1153,6 +1348,7 @@ def normalize_grok_result(raw: dict[str, Any], *, event_label: str = "") -> dict
                 "n_legs": n_legs,
                 "reason": reason,
                 "conviction": str(row.get("conviction") or "medium").lower(),
+                "event": str(row.get("event") or row.get("event_name") or event_label or "").strip(),
             }
         )
 
@@ -1255,6 +1451,7 @@ def analyze_card_with_grok(
     use_cache: bool = True,
     profile: str | None = None,
     allowed_fights: set[str] | None = None,
+    progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """
     Run local Ollama narration on HA-sized tickets (primary bet slip).
@@ -1276,6 +1473,11 @@ def analyze_card_with_grok(
     def _latency_ms() -> int:
         return int((time.perf_counter() - t0) * 1000)
 
+    def _prog(msg: str, pct: float | None = None) -> None:
+        if progress:
+            progress(msg, pct)
+
+    _prog("Collecting HA tickets...", 0.08)
     inputs = collect_card_analysis_inputs(
         books,
         budget_state,
@@ -1328,7 +1530,9 @@ def analyze_card_with_grok(
         out.update(extra)
         return out
 
+    _prog("Checking Ollama...", 0.18)
     if not bool(getattr(config, "OLLAMA_ENABLED", True)):
+        _prog("Ollama disabled", 1.0)
         logger.warning(
             "Ollama health error_class=disabled latency_ms=%s — showing model tickets only",
             _latency_ms(),
@@ -1348,6 +1552,7 @@ def analyze_card_with_grok(
     health = check_ollama_health(force=True)
     health_class = str(health.get("error_class") or "other")
     if health_class in {"offline", "model_missing"} or not health.get("reachable"):
+        _prog("Ollama offline — HA tickets only", 1.0)
         banner = "Ollama offline — showing HA tickets"
         if health_class == "model_missing":
             banner = "Ollama model missing — showing HA tickets"
@@ -1373,6 +1578,7 @@ def analyze_card_with_grok(
 
     # Explicit NO BET when no odds or nothing at all to show
     if no_odds or not tickets:
+        _prog("No sized tickets for this card", 1.0)
         return {
             "ok": True,
             "no_bet": True,
@@ -1405,8 +1611,10 @@ def analyze_card_with_grok(
 
     cache_key = _cache_key(inputs)
     if use_cache:
+        _prog("Checking narrative cache...", 0.28)
         cached = _load_cache(cache_key)
         if cached:
+            _prog("Loaded cached narrative", 1.0)
             out = dict(cached)
             out["from_cache"] = True
             out["ok"] = True
@@ -1433,9 +1641,12 @@ def analyze_card_with_grok(
             out["n_advisory"] = inputs.get("n_advisory")
             return out
 
+    _prog("Building prompt...", 0.35)
     prompt = build_grok_prompt(inputs)
     try:
+        _prog("Ollama is thinking...", 0.45)
         model_used, raw_text = query_ollama(prompt)
+        _prog("Parsing response...", 0.88)
         try:
             parsed = _extract_json_blob(raw_text)
         except ValueError as parse_exc:
@@ -1500,8 +1711,10 @@ def analyze_card_with_grok(
             )
         except Exception:
             pass
+        _prog("Analysis complete", 1.0)
         return result
     except Exception as exc:
+        _prog("Narrative unavailable — HA tickets only", 1.0)
         err_class = classify_ollama_error(exc)
         latency = _latency_ms()
         logger.warning(
@@ -1548,10 +1761,10 @@ def build_best_bets_briefing(
     *,
     predictions: Any = None,
     cleared_singles: list[dict[str, Any]] | None = None,
+    compact: bool = False,
 ) -> str:
     """Best-bet briefing with Blue/Green/Yellow/Red — HA gates unchanged for Blue."""
     from src.bet_tiers import (
-        TIER_BLUE,
         format_tiered_best_bets,
         rank_card_bet_tiers,
     )
@@ -1562,11 +1775,23 @@ def build_best_bets_briefing(
         event = str(result.get("event") or "").strip()
         slip = list(result.get("bet_slip") or [])
         if result.get("fun_tiers"):
-            return format_tiered_best_bets(result["fun_tiers"], event=event)
+            return format_tiered_best_bets(
+                result["fun_tiers"], event=event, compact=compact
+            )
 
     singles = list(cleared_singles or [])
-    if not singles:
-        singles = [b for b in slip if not b.get("advisory") and not b.get("fun_bet")]
+    if not singles and slip:
+        # Only HA-tagged Blue/Sky rows — never promote bare stake leftovers to Blue
+        from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE
+
+        singles = [
+            b
+            for b in slip
+            if str(b.get("bet_tier") or "") in {TIER_BLUE, TIER_SKY_BLUE}
+            and not b.get("advisory")
+            and not b.get("fun_bet")
+            and float(b.get("stake_usd") or b.get("suggested_stake") or 0) > 0
+        ]
 
     preds = predictions
     if preds is None and isinstance(result, dict):
@@ -1581,14 +1806,7 @@ def build_best_bets_briefing(
         preds = None
 
     tiers = rank_card_bet_tiers(preds, cleared_singles=singles, limit_per_tier=6)
-    # Ensure blue from slip when preds didn't mark them
-    if not tiers.get(TIER_BLUE) and singles:
-        for s in singles[:5]:
-            item = dict(s)
-            item["bet_tier"] = TIER_BLUE
-            item["tier"] = TIER_BLUE
-            item["fun_bet"] = False
-            tiers[TIER_BLUE].append(item)
+    # Do NOT invent Blue from slip leftovers — if HA cleared none, Blue stays empty.
 
     if not isinstance(result, dict) and preds is None and not singles:
         return (
@@ -1596,7 +1814,7 @@ def build_best_bets_briefing(
             "(or ask again after the slip appears)."
         )
 
-    return format_tiered_best_bets(tiers, event=event or "Current card")
+    return format_tiered_best_bets(tiers, event=event or "Current card", compact=compact)
 
 
 def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
@@ -1616,23 +1834,336 @@ def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
     return briefing
 
 
+_STOP_CHAT_TOKENS = frozenset(
+    {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "vs",
+        "versus",
+        "fight",
+        "fights",
+        "fighter",
+        "stats",
+        "stat",
+        "tell",
+        "me",
+        "about",
+        "on",
+        "for",
+        "what",
+        "are",
+        "is",
+        "how",
+        "much",
+        "edge",
+        "odds",
+        "prob",
+        "probability",
+        "model",
+        "card",
+        "bet",
+        "bets",
+        "please",
+        "show",
+        "give",
+        "info",
+        "information",
+        "breakdown",
+        "analysis",
+        "ollama",
+        "this",
+        "that",
+        "with",
+        "from",
+        "into",
+        "over",
+        "under",
+        "round",
+        "rounds",
+    }
+)
+
+
+def _chat_query_tokens(question: str) -> list[str]:
+    raw = re.sub(r"[^a-z0-9\s]", " ", str(question or "").lower())
+    return [t for t in raw.split() if len(t) >= 3 and t not in _STOP_CHAT_TOKENS]
+
+
+def _token_hits_name(token: str, name: str) -> bool:
+    from src.predictor import _fighter_name_key, _names_match
+
+    if not token or not name:
+        return False
+    if _names_match(token, name):
+        return True
+    key = _fighter_name_key(name)
+    parts = [p for p in key.split() if p and p not in {"jr", "sr", "ii", "iii", "iv"}]
+    if token in parts:
+        return True
+    # Last-name / partial (e.g. "mcconico" in "eric mcconico")
+    return any(token in p or p in token for p in parts if len(token) >= 4 and len(p) >= 4)
+
+
+def _fight_label_from_row(row: dict[str, Any] | pd.Series) -> str:
+    fight = str(row.get("fight") or row.get("pick_line") or "").strip()
+    if fight:
+        return fight
+    f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+    f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+    if f1 and f2:
+        return f"{f1} vs {f2}"
+    return f1 or f2 or "Unknown fight"
+
+
+def _iter_card_fight_rows(result: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Collect unique fight rows from predictions, slip, tiers, and skips."""
+    if not isinstance(result, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _add(raw: dict[str, Any]) -> None:
+        label = _fight_label_from_row(raw).lower()
+        if not label or label in seen:
+            return
+        seen.add(label)
+        rows.append(dict(raw))
+
+    preds = result.get("predictions")
+    if isinstance(preds, pd.DataFrame) and not preds.empty:
+        for _, r in preds.iterrows():
+            _add(r.to_dict())
+
+    for b in list(result.get("bet_slip") or []):
+        if isinstance(b, dict):
+            _add(b)
+
+    fun_tiers = result.get("fun_tiers") or {}
+    if isinstance(fun_tiers, dict):
+        for bucket in fun_tiers.values():
+            for b in list(bucket or []):
+                if isinstance(b, dict):
+                    _add(b)
+
+    for s in list(result.get("skipped") or []):
+        if isinstance(s, dict):
+            _add(s)
+
+    for p in list(result.get("props") or []):
+        if isinstance(p, dict):
+            _add(p)
+
+    return rows
+
+
+def _match_fights_for_question(
+    question: str,
+    result: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    tokens = _chat_query_tokens(question)
+    if not tokens:
+        return []
+    hits: list[tuple[int, dict[str, Any]]] = []
+    for row in _iter_card_fight_rows(result):
+        f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+        f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+        fight = _fight_label_from_row(row)
+        pick = str(row.get("pick") or row.get("side") or row.get("predicted_winner") or "")
+        blob = " ".join([f1, f2, fight, pick])
+        score = sum(1 for t in tokens if _token_hits_name(t, blob) or t in fight.lower())
+        if score:
+            hits.append((score, row))
+    hits.sort(key=lambda x: (-x[0], _fight_label_from_row(x[1])))
+    return [r for _, r in hits[:3]]
+
+
+def _fmt_pct(value: Any, *, already_pct: bool = False) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        v = float(value)
+        if not already_pct and abs(v) <= 1.5:
+            v *= 100.0
+        return f"{v:.1f}%"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_prob(value: Any) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        v = float(value)
+        if v > 1.5:
+            v /= 100.0
+        return f"{v:.0%}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _fmt_odds(value: Any) -> str:
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "n/a"
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _lookup_tier_for_fight(
+    result: dict[str, Any] | None,
+    fight: str,
+) -> dict[str, Any] | None:
+    if not isinstance(result, dict):
+        return None
+    from src.predictor import _names_match
+
+    fun_tiers = result.get("fun_tiers") or {}
+    if isinstance(fun_tiers, dict):
+        for tier_name, bucket in fun_tiers.items():
+            for b in list(bucket or []):
+                if not isinstance(b, dict):
+                    continue
+                label = _fight_label_from_row(b)
+                if _names_match(fight, label) or fight.lower() in label.lower():
+                    out = dict(b)
+                    out.setdefault("bet_tier", tier_name)
+                    return out
+    for b in list(result.get("bet_slip") or []):
+        if not isinstance(b, dict):
+            continue
+        label = _fight_label_from_row(b)
+        if _names_match(fight, label) or fight.lower() in label.lower():
+            return dict(b)
+    for s in list(result.get("skipped") or []):
+        if not isinstance(s, dict):
+            continue
+        label = _fight_label_from_row(s)
+        if _names_match(fight, label) or fight.lower() in label.lower():
+            out = dict(s)
+            out.setdefault("bet_tier", "red")
+            return out
+    return None
+
+
+def build_fight_stats_answer(
+    question: str,
+    result: dict[str, Any] | None,
+    *,
+    event_label: str = "",
+) -> str | None:
+    """Instant grounded answer for fight/stats questions — no Ollama call."""
+    matches = _match_fights_for_question(question, result)
+    if not matches:
+        return None
+
+    from src.bet_tiers import action_label_for_bet
+
+    event = event_label or (
+        str((result or {}).get("event") or "").strip() if isinstance(result, dict) else ""
+    )
+    blocks: list[str] = []
+    if event:
+        blocks.append(event)
+
+    for row in matches:
+        fight = _fight_label_from_row(row)
+        f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+        f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+        if (not f1 or not f2) and " vs " in fight.lower():
+            parts = re.split(r"\s+vs\.?\s+", fight, maxsplit=1, flags=re.IGNORECASE)
+            if len(parts) == 2:
+                f1, f2 = parts[0].strip(), parts[1].strip()
+
+        p1 = row.get("p_f1", row.get("prob_f1_win", row.get("prob_f1")))
+        p2 = row.get("p_f2", row.get("prob_f2_win", row.get("prob_f2")))
+        edge_pct = row.get("edge_pct")
+        if edge_pct is None and row.get("best_edge") is not None:
+            edge_pct = float(row["best_edge"]) * 100.0
+        e1 = row.get("edge_f1")
+        e2 = row.get("edge_f2")
+        o1 = row.get("f1_odds")
+        o2 = row.get("f2_odds")
+        matched = row.get("odds_matched")
+        source = str(row.get("odds_source") or row.get("book") or "").strip() or "n/a"
+        width = row.get("interval_width")
+        disagree = row.get("disagreement")
+        pick = str(
+            row.get("predicted_winner")
+            or row.get("pick")
+            or row.get("side")
+            or ""
+        ).strip()
+
+        tier_row = _lookup_tier_for_fight(result, fight) or row
+        action = action_label_for_bet(tier_row)
+        skip_reason = str(
+            tier_row.get("skip_reason")
+            or tier_row.get("tier_reason")
+            or row.get("skip_reason")
+            or ""
+        ).replace("_", " ").strip()
+
+        lines = [fight]
+        if f1 and f2:
+            lines.append(
+                f"  Model: {f1} {_fmt_prob(p1)} / {f2} {_fmt_prob(p2)}"
+                + (f"  -> pick {pick}" if pick else "")
+            )
+            lines.append(
+                f"  Odds: {f1} {_fmt_odds(o1)} / {f2} {_fmt_odds(o2)}"
+                f"  · matched={bool(matched) if matched is not None else 'n/a'}"
+                f"  · source={source}"
+            )
+            if e1 is not None or e2 is not None:
+                lines.append(
+                    f"  Edge: {f1} {_fmt_pct(e1)} / {f2} {_fmt_pct(e2)}"
+                    + (f"  · best {_fmt_pct(edge_pct, already_pct=True)}" if edge_pct is not None else "")
+                )
+            elif edge_pct is not None:
+                lines.append(f"  Best edge: {_fmt_pct(edge_pct, already_pct=True)}")
+        else:
+            lines.append(
+                f"  Pick {pick or 'n/a'} · edge {_fmt_pct(edge_pct, already_pct=True)}"
+                f" · prob {_fmt_prob(tier_row.get('prob') or p1)}"
+            )
+        if width is not None or disagree is not None:
+            lines.append(
+                f"  Uncertainty: width={_fmt_pct(width)} · disagreement={_fmt_pct(disagree)}"
+            )
+        lines.append(f"  Action: {action}" + (f" ({skip_reason})" if skip_reason else ""))
+        blocks.append("\n".join(lines))
+
+    blocks.append("(Live card stats — no Ollama wait)")
+    return "\n\n".join(blocks)
+
+
 def answer_ollama_chat(
     question: str,
     *,
     analysis_result: dict[str, Any] | None = None,
     event_label: str = "",
+    progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """Answer a user question about the current card using grounded HA slip context.
 
-    Best-bet style questions get the deterministic briefing first; Ollama may add
-    a short commentary but must not invent new tickets.
+    Best-bet and fight-stats questions are answered instantly from card data.
+    Open-ended chat may call Ollama, but never invents tickets.
     """
     from src.ollama_client import check_ollama_health, ollama_complete, ollama_status_message
+
+    def _prog(msg: str, pct: float | None = None) -> None:
+        if progress:
+            progress(msg, pct)
 
     q = " ".join(str(question or "").split()).strip()
     if not q:
         return {"ok": False, "error": "Empty question.", "answer": "", "briefing": ""}
 
+    _prog("Preparing context...", 0.15)
     briefing = build_best_bets_briefing(analysis_result)
     q_low = q.lower()
     best_intent = any(
@@ -1654,16 +2185,60 @@ def answer_ollama_chat(
 
     # Best-bet / stats questions: instant HA briefing (never invent tickets, never wait on LLM).
     if best_intent:
+        _prog("Stats briefing ready", 1.0)
         return {
             "ok": True,
-            "answer": briefing,
+            "answer": build_best_bets_briefing(analysis_result, compact=True),
             "briefing": briefing,
             "source": "ha_briefing",
             "model": "stats",
         }
 
+    # Fight-specific stats ("mcconico fight", "edge on Alvarez") — card data only.
+    fight_answer = build_fight_stats_answer(
+        q, analysis_result, event_label=event_label
+    )
+    if fight_answer:
+        _prog("Fight stats ready", 1.0)
+        return {
+            "ok": True,
+            "answer": fight_answer,
+            "briefing": briefing,
+            "source": "ha_fight_stats",
+            "model": "stats",
+        }
+
+    stats_intent = any(
+        k in q_low
+        for k in (
+            "stats",
+            "stat",
+            "edge",
+            "odds",
+            "probability",
+            "prob",
+            "interval",
+            "uncertainty",
+            "breakdown",
+        )
+    )
+    if stats_intent:
+        _prog("No matching fight — card briefing", 1.0)
+        return {
+            "ok": True,
+            "answer": (
+                "No matching fight found on the loaded card for that name.\n\n"
+                + build_best_bets_briefing(analysis_result, compact=True)
+            ),
+            "briefing": briefing,
+            "source": "ha_briefing",
+            "model": "stats",
+        }
+
+    _prog("Checking Ollama...", 0.25)
     health = check_ollama_health(force=False)
     if not health.get("reachable") or not bool(getattr(config, "OLLAMA_ENABLED", True)):
+        _prog("Ollama offline — stats only", 1.0)
         return {
             "ok": True,
             "answer": briefing
@@ -1684,9 +2259,10 @@ def answer_ollama_chat(
         "You are a concise UFC betting assistant for this dashboard. "
         "Use ONLY the provided ticket/stats context. "
         "Never invent fights, odds, edges, or stakes. "
-        "Always separate BET THIS (sized $) from FUN ONLY ($0 research) and DO NOT BET. "
-        "If no BET THIS tickets, say sized NO BET first, then optional FUN ONLY leans. "
-        "Never imply FUN ONLY picks should use bankroll sizing. "
+        "Always separate BET THIS (passed HA gates, sized $) from "
+        "TINY PAPER BET (failed wide CI, Paper only) from FUN ONLY ($0 research) and DO NOT BET. "
+        "If no BET THIS tickets, say HA NO BET first even if Sky Blue overrides exist. "
+        "Never imply FUN ONLY or Sky Blue picks passed the full HA test. "
         "Keep answers under 180 words with short bullets when listing bets."
     )
     prompt = (
@@ -1694,23 +2270,26 @@ def answer_ollama_chat(
         f"GROUNDED CONTEXT (source of truth):\n{context}\n\n"
         f"USER QUESTION: {q}\n\n"
         "Answer using the context. If they ask what to bet, start with "
-        "'WHAT TO BET (sized):' listing only BET THIS tickets + dollar stakes; "
+        "'WHAT TO BET (HA — passed gates):' listing only BET THIS tickets + dollar stakes; "
+        "then 'PAPER OVERRIDE (failed wide CI):' for Sky Blue if any; "
         "then 'FUN ONLY ($0):' if any; then 'SKIP:' for caution/red."
     )
     try:
+        _prog("Ollama is answering...", 0.45)
+        # Chat replies should stay short — soft-cap timeout so CPU hosts don't hang.
+        chat_timeout = min(45, int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60))
         model_used, text = ollama_complete(
             prompt,
             system=system,
-            timeout_sec=min(120, int(getattr(config, "OLLAMA_TIMEOUT_SEC", 60) or 60)),
+            timeout_sec=max(20, chat_timeout),
             json_mode=False,
             temperature=0.2,
         )
+        _prog("Formatting reply...", 0.9)
         answer = " ".join(str(text or "").split())
         if not answer:
             answer = briefing
-        elif best_intent and briefing not in answer:
-            # Keep stats visible even when the model paraphrases.
-            answer = f"{briefing}\n\n---\n{answer}"
+        _prog("Done", 1.0)
         return {
             "ok": True,
             "answer": answer,
@@ -1719,10 +2298,14 @@ def answer_ollama_chat(
             "model": model_used,
         }
     except Exception as exc:
+        _prog("Chat failed — stats only", 1.0)
         logger.warning("Ollama chat failed: %s", exc)
+        fallback = build_fight_stats_answer(
+            q, analysis_result, event_label=event_label
+        ) or build_best_bets_briefing(analysis_result, compact=True)
         return {
             "ok": True,
-            "answer": f"{briefing}\n\n(Ollama chat failed: {exc})",
+            "answer": f"{fallback}\n\n(Ollama chat timed out / failed — card stats above)",
             "briefing": briefing,
             "source": "ha_briefing",
             "model": "stats",

@@ -216,6 +216,32 @@ def _location_overlap(gym_location: str, event_location: str) -> bool:
     return bool(g_toks & e_toks)
 
 
+_CAMP_SWITCH_RE = re.compile(
+    r"switch(?:ed)?\s+(?:camp|gym)|camp\s+change|new\s+(?:camp|gym)|for this fight",
+    re.IGNORECASE,
+)
+
+
+def shared_gym_caution(gym: str) -> str:
+    """Same-camp matchup: familiarity + possible underdog camp-switch (UFC 330)."""
+    name = str(gym or "").strip()
+    if not name:
+        return ""
+    return (
+        f"Shared gym ({name}) - camp familiarity; the underdog often camps "
+        "elsewhere for this fight (do not auto-fade them as a loser)"
+    )
+
+
+def camp_switch_note(fighter_name: str, profile: dict[str, str] | None) -> str:
+    """Surface gym-CSV notes that look like a one-fight camp change."""
+    notes = str((profile or {}).get("notes") or "").strip()
+    if not notes or not _CAMP_SWITCH_RE.search(notes):
+        return ""
+    clipped = notes if len(notes) <= 140 else notes[:137].rstrip() + "..."
+    return f"{fighter_name} camp switch: {clipped}"
+
+
 def gym_narrative_line(fighter_name: str, profile: dict[str, str], *, local: bool = False) -> str:
     """Human line for Ollama / briefs, e.g. 'Trains at New Wave — strong grappling'."""
     gym = profile.get("gym") or ""
@@ -257,7 +283,11 @@ def gym_matchup_summary(
     if n2:
         parts.append(f"{f2}: {n2}")
     if p1.get("gym") and p1.get("gym") == p2.get("gym"):
-        parts.append(f"Shared gym ({p1['gym']}) - camp familiarity risk")
+        parts.append(shared_gym_caution(str(p1.get("gym") or "")))
+    for name, prof in ((f1, p1), (f2, p2)):
+        switch = camp_switch_note(name, prof)
+        if switch:
+            parts.append(switch)
     return " | ".join(parts)
 
 
@@ -381,7 +411,11 @@ def attach_gym_features(df: pd.DataFrame, *, event_location_col: str | None = No
         if n2:
             parts.append(f"{f2n}: {n2}")
         if d1.get("gym") and d1.get("gym") == d2.get("gym"):
-            parts.append(f"Shared gym ({d1['gym']}) - camp familiarity risk")
+            parts.append(shared_gym_caution(str(d1.get("gym") or "")))
+        for name, prof in ((f1n, d1), (f2n, d2)):
+            switch = camp_switch_note(name, prof)
+            if switch:
+                parts.append(switch)
         notes.append(" | ".join(parts))
     out["gym_matchup_note"] = notes
 

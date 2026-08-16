@@ -78,7 +78,55 @@ def test_parse_totals_props_over_under():
     props = _parse_totals_props(soup)
     keys = {p["prop_key"] for p in props}
     assert "over_1_5_rounds" in keys
+    assert "under_1_5_rounds" in keys
     assert "round_1_finish" in keys
+    over = next(p for p in props if p["prop_key"] == "over_1_5_rounds")
+    assert over["selection"] == "Over 1.5"
+    assert float(over["point"]) == 1.5
+
+
+def test_parse_totals_props_uses_actual_point():
+    """MyBookie data-points 2.5/4.5 must not be labeled as Over 1.5."""
+    from bs4 import BeautifulSoup
+
+    html = """
+    <div class="game-line">
+      <div class="container-fluid">
+        <div class="game-line__home-team">
+          <p class="game-line__home-team__name" title="Makhachev, Islam">Makhachev, Islam</p>
+        </div>
+        <div class="game-line__visitor-team">
+          <p class="game-line__visitor-team__name" title="Garry, Ian Machado">Garry, Ian Machado</p>
+        </div>
+        <button class="lines-odds" data-markettype="to" data-odd="-161" data-points="4.5"
+                data-gameid="1">O 4.5 -161</button>
+        <button class="lines-odds" data-markettype="to" data-odd="121" data-points="4.5"
+                data-gameid="1">U 4.5 +121</button>
+      </div>
+    </div>
+    <div class="game-line">
+      <div class="container-fluid">
+        <div class="game-line__home-team">
+          <p class="game-line__home-team__name" title="Magny, Neil">Magny, Neil</p>
+        </div>
+        <div class="game-line__visitor-team">
+          <p class="game-line__visitor-team__name" title="Brahimaj, Ramiz">Brahimaj, Ramiz</p>
+        </div>
+        <button class="lines-odds" data-markettype="to" data-odd="104" data-points="2.5"
+                data-gameid="2">O 2.5 +104</button>
+        <button class="lines-odds" data-markettype="to" data-odd="-138" data-points="2.5"
+                data-gameid="2">U 2.5 -138</button>
+      </div>
+    </div>
+    """
+    soup = BeautifulSoup(html, "lxml")
+    props = _parse_totals_props(soup)
+    by_key = {(p["prop_key"], p["selection"], float(p["point"])) for p in props}
+    assert ("over_4_5_rounds", "Over 4.5", 4.5) in by_key
+    assert ("under_4_5_rounds", "Under 4.5", 4.5) in by_key
+    assert ("over_2_5_rounds", "Over 2.5", 2.5) in by_key
+    assert ("under_2_5_rounds", "Under 2.5", 2.5) in by_key
+    assert not any(p["prop_key"] == "over_1_5_rounds" for p in props)
 
 
 def test_fetch_mybookie_disabled_raises(monkeypatch):
@@ -92,7 +140,10 @@ def test_map_method_prop_description():
     assert mapped == ("fighter_ko", "Diego Lopes")
     mapped = _map_method_prop_description("Garcia, Steve by submission")
     assert mapped == ("fighter_sub", "Steve Garcia")
-    assert _map_method_prop_description("Lopes, Diego by decision") is None
+    assert _map_method_prop_description("Lopes, Diego by decision") == (
+        "fighter_decision",
+        "Diego Lopes",
+    )
     assert _map_method_prop_description("Draw") is None
 
 
@@ -130,7 +181,12 @@ def test_live_prop_scrape_returns_method_lines(monkeypatch):
         pytest.skip(f"MyBookie live prop scrape unavailable: {exc}")
     if df is None or df.empty:
         pytest.skip("MyBookie live prop scrape returned no rows")
-    assert "fighter_ko" in set(df["prop_key"])
+    keys = set(df["prop_key"].astype(str))
+    if "fighter_ko" not in keys:
+        pytest.skip(
+            "MyBookie live scrape returned totals only (method prop pages unavailable)"
+        )
+    assert "fighter_ko" in keys
 
 
 def test_live_scrape_returns_rows(monkeypatch):

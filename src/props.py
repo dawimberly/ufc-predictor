@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from itertools import combinations
 from typing import Any
@@ -21,9 +22,25 @@ PROP_MARKET_LABELS: dict[str, str] = {
     "round_1_finish": "Round 1 Finish",
     "over_1_5_rounds": "Over 1.5 Rounds",
     "under_1_5_rounds": "Under 1.5 Rounds",
+    "over_2_5_rounds": "Over 2.5 Rounds",
+    "under_2_5_rounds": "Under 2.5 Rounds",
+    "over_3_5_rounds": "Over 3.5 Rounds",
+    "under_3_5_rounds": "Under 3.5 Rounds",
+    "over_4_5_rounds": "Over 4.5 Rounds",
+    "under_4_5_rounds": "Under 4.5 Rounds",
     "fighter_ko": "Fighter Wins by KO/TKO",
     "fighter_sub": "Fighter Wins by Submission",
+    "fighter_decision": "Fighter Wins by Decision",
 }
+
+_FIGHTER_METHOD_KEYS = frozenset({"fighter_ko", "fighter_sub", "fighter_decision"})
+_METHOD_KEY_TO_SIDE = {
+    "fighter_ko": "ko",
+    "fighter_sub": "sub",
+    "fighter_decision": "dec",
+}
+
+_OVER_UNDER_POINT_RE = re.compile(r"^(over|under)_(\d+)_(\d+)_rounds$")
 
 
 def method_flags(method: Any) -> tuple[int, int, int]:
@@ -41,6 +58,25 @@ def _clip_prob(p: float, lo: float = 0.03, hi: float = 0.97) -> float:
     if not np.isfinite(p):
         return lo
     return float(np.clip(p, lo, hi))
+
+
+def _over_line_from_anchors(
+    p_over_15: float,
+    p_dec: float,
+    *,
+    point: float,
+    max_line: float,
+) -> float:
+    """P(Over point) between Over 1.5 and go-the-distance (decision)."""
+    if point <= 1.5 + 1e-9:
+        return _clip_prob(p_over_15, 0.20, 0.95)
+    if max_line <= 1.5 + 1e-9 or point >= max_line - 1e-9:
+        return _clip_prob(p_dec, 0.10, 0.95)
+    t = (point - 1.5) / (max_line - 1.5)
+    t = float(np.clip(t, 0.0, 1.0))
+    # Keep deeper overs from exceeding shallower when models disagree
+    p_deep = min(float(p_over_15), float(p_dec))
+    return _clip_prob(float(p_over_15) * (1.0 - t) + p_deep * t, 0.10, 0.95)
 
 
 def _fighter_rate(row: pd.Series, prefix: str, key: str, default: float) -> float:
@@ -74,14 +110,35 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     """
     Estimate fight-level method probabilities from rolling fighter stats.
 
-    Prefers L5 finish / R1 / decision-profile fields when present (props-only;
-    not LightGBM FEATURE_COLUMNS). Returns keys: ko, sub, dec, round_1_finish,
-    over_1_5_rounds, fighter_ko, fighter_sub (conditional on model pick).
+    Prefers L5 pathway method win/loss + finish / R1 / decision-profile fields when
+    present (props-only; not LightGBM FEATURE_COLUMNS). Returns keys: ko, sub, dec,
+    round_1_finish, over_1_5_rounds, fighter_ko, fighter_sub (conditional on model pick).
     """
-    f1_ko = _clip_prob(_fighter_rate(row, "f1", "ko_rate", 0.18), 0.05, 0.55)
-    f2_ko = _clip_prob(_fighter_rate(row, "f2", "ko_rate", 0.18), 0.05, 0.55)
-    f1_sub = _clip_prob(_fighter_rate(row, "f1", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
-    f2_sub = _clip_prob(_fighter_rate(row, "f2", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
+    # Prefer pathway L5 method win rates; fall back to legacy ko_rate / sub_avg.
+    f1_ko = _fighter_rate_first(
+        row, "f1", ("ko_win_rate_l5", "ko_win_rate_career", "ko_rate"), None
+    )
+    f2_ko = _fighter_rate_first(
+        row, "f2", ("ko_win_rate_l5", "ko_win_rate_career", "ko_rate"), None
+    )
+    f1_ko = _clip_prob(float(f1_ko if f1_ko is not None else 0.18), 0.05, 0.55)
+    f2_ko = _clip_prob(float(f2_ko if f2_ko is not None else 0.18), 0.05, 0.55)
+
+    f1_sub_raw = _fighter_rate_first(
+        row, "f1", ("sub_win_rate_l5", "sub_win_rate_career"), None
+    )
+    f2_sub_raw = _fighter_rate_first(
+        row, "f2", ("sub_win_rate_l5", "sub_win_rate_career"), None
+    )
+    if f1_sub_raw is None:
+        f1_sub = _clip_prob(_fighter_rate(row, "f1", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
+    else:
+        f1_sub = _clip_prob(float(f1_sub_raw), 0.03, 0.40)
+    if f2_sub_raw is None:
+        f2_sub = _clip_prob(_fighter_rate(row, "f2", "sub_avg", 0.35) / 2.5, 0.03, 0.40)
+    else:
+        f2_sub = _clip_prob(float(f2_sub_raw), 0.03, 0.40)
+
     f1_finish = _clip_prob(
         float(
             _fighter_rate_first(row, "f1", ("finish_rate_l5", "finish_rate"), 0.45) or 0.45
@@ -98,7 +155,17 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     )
 
     ko_diff = float(row.get("ko_rate_diff", 0) or 0)
+    if "ko_win_rate_l5_diff" in row.index and pd.notna(row.get("ko_win_rate_l5_diff")):
+        try:
+            ko_diff = float(row["ko_win_rate_l5_diff"])
+        except (TypeError, ValueError):
+            pass
     sub_diff = float(row.get("sub_avg_diff", 0) or 0)
+    if "sub_win_rate_l5_diff" in row.index and pd.notna(row.get("sub_win_rate_l5_diff")):
+        try:
+            sub_diff = float(row["sub_win_rate_l5_diff"])
+        except (TypeError, ValueError):
+            pass
     striker_diff = float(row.get("striker_score_diff", 0) or 0)
 
     p_ko = _clip_prob(0.5 * (f1_ko + f2_ko) + 0.15 * ko_diff + 0.08 * striker_diff, 0.08, 0.62)
@@ -116,6 +183,8 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     f2_dec_w = _fighter_rate_first(row, "f2", ("dec_win_rate_l5", "dec_win_rate_career"), None)
     f1_dec_l = _fighter_rate_first(row, "f1", ("dec_loss_rate_l5", "dec_loss_rate_career"), None)
     f2_dec_l = _fighter_rate_first(row, "f2", ("dec_loss_rate_l5", "dec_loss_rate_career"), None)
+    f1_dist = _fighter_rate_first(row, "f1", ("distance_rate_l5", "distance_rate_career"), None)
+    f2_dist = _fighter_rate_first(row, "f2", ("distance_rate_l5", "distance_rate_career"), None)
 
     dec_tilt = 0.0
     share_vals = [v for v in (f1_share, f2_share) if v is not None]
@@ -129,6 +198,9 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     if dec_l_vals:
         # Fighters who often lose on cards also push fights deep
         dec_tilt += 0.06 * (float(np.mean(dec_l_vals)) - 0.25)
+    dist_vals = [v for v in (f1_dist, f2_dist) if v is not None]
+    if dist_vals:
+        dec_tilt += 0.12 * (float(np.mean(dist_vals)) - 0.45)
     if abs(dec_tilt) > 1e-9:
         p_dec = _clip_prob(p_dec + dec_tilt, 0.12, 0.78)
         finish_mass = max(1e-6, p_ko + p_sub)
@@ -164,6 +236,17 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     p_over_15 = _clip_prob(1.0 - p_r1, 0.25, 0.92)
     p_finish = _clip_prob(p_ko + p_sub, 0.15, 0.88)
 
+    try:
+        scheduled = int(float(row.get("scheduled_rounds", 3) or 3))
+    except (TypeError, ValueError):
+        scheduled = 3
+    scheduled = 5 if scheduled >= 5 else 3
+    # Deeper overs interpolate toward decision (go-the-distance ≈ Over (N-0.5))
+    max_line = float(scheduled) - 0.5
+    p_over_25 = _over_line_from_anchors(p_over_15, p_dec, point=2.5, max_line=max_line)
+    p_over_35 = _over_line_from_anchors(p_over_15, p_dec, point=3.5, max_line=max_line)
+    p_over_45 = _over_line_from_anchors(p_over_15, p_dec, point=4.5, max_line=max_line)
+
     p1 = float(row.get("prob_f1_win", row.get("predicted_prob", 0.5)) or 0.5)
     if pd.notna(row.get("prob_f2_win")):
         p2 = float(row["prob_f2_win"])
@@ -177,10 +260,19 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
     pick_total = pick_ko + pick_sub + pick_dec
     pick_ko /= pick_total
     pick_sub /= pick_total
+    pick_dec /= pick_total
 
     f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
     f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
     pick_name = f1 if pick_side == "f1" else f2
+
+    def _cond(ko_r: float, sub_r: float) -> tuple[float, float]:
+        dec_r = max(0.05, 1.0 - ko_r - sub_r)
+        tot = ko_r + sub_r + dec_r
+        return ko_r / tot, sub_r / tot
+
+    f1_ko_c, f1_sub_c = _cond(f1_ko, f1_sub)
+    f2_ko_c, f2_sub_c = _cond(f2_ko, f2_sub)
 
     return {
         "ko": p_ko,
@@ -190,12 +282,89 @@ def method_probs_from_row(row: pd.Series) -> dict[str, float]:
         "round_1_finish": p_r1,
         "over_1_5_rounds": p_over_15,
         "under_1_5_rounds": _clip_prob(1.0 - p_over_15, 0.08, 0.75),
+        "over_2_5_rounds": p_over_25,
+        "under_2_5_rounds": _clip_prob(1.0 - p_over_25, 0.05, 0.90),
+        "over_3_5_rounds": p_over_35,
+        "under_3_5_rounds": _clip_prob(1.0 - p_over_35, 0.05, 0.90),
+        "over_4_5_rounds": p_over_45,
+        "under_4_5_rounds": _clip_prob(1.0 - p_over_45, 0.05, 0.90),
         "fighter_ko": _clip_prob(pick_prob * pick_ko, 0.03, 0.55),
         "fighter_sub": _clip_prob(pick_prob * pick_sub, 0.02, 0.40),
+        "fighter_decision": _clip_prob(pick_prob * pick_dec, 0.05, 0.70),
         "pick_side": pick_side,
         "pick_name": pick_name,
         "pick_prob": pick_prob,
+        "f1_name": f1,
+        "f2_name": f2,
+        "f1_ko_cond": f1_ko_c,
+        "f1_sub_cond": f1_sub_c,
+        "f2_ko_cond": f2_ko_c,
+        "f2_sub_cond": f2_sub_c,
+        "p1": p1,
+        "p2": p2,
     }
+
+
+def side_method_joint_probs(row: pd.Series, probs: dict[str, float] | None = None) -> dict[str, dict[str, float]]:
+    """P(fighter wins by ko/sub/dec) for both sides (research / live method lines)."""
+    p = probs or method_probs_from_row(row)
+    f1 = str(p.get("f1_name") or row.get("fighter_1", row.get("fighter1", ""))).strip()
+    f2 = str(p.get("f2_name") or row.get("fighter_2", row.get("fighter2", ""))).strip()
+    p1 = float(p.get("p1", row.get("prob_f1_win", row.get("predicted_prob", 0.5)) or 0.5))
+    p2 = float(p.get("p2", 1.0 - p1))
+    out: dict[str, dict[str, float]] = {}
+    for name, win_p, ko_c, sub_c in (
+        (f1, p1, float(p.get("f1_ko_cond", 0.33)), float(p.get("f1_sub_cond", 0.2))),
+        (f2, p2, float(p.get("f2_ko_cond", 0.33)), float(p.get("f2_sub_cond", 0.2))),
+    ):
+        if not name:
+            continue
+        dec_c = max(0.05, 1.0 - ko_c - sub_c)
+        total = ko_c + sub_c + dec_c
+        ko_c, sub_c, dec_c = ko_c / total, sub_c / total, dec_c / total
+        out[name] = {
+            "ko": _clip_prob(win_p * ko_c, 0.01, 0.70),
+            "sub": _clip_prob(win_p * sub_c, 0.005, 0.55),
+            "dec": _clip_prob(win_p * dec_c, 0.02, 0.75),
+            "win": win_p,
+        }
+    return out
+
+
+def selection_fighter_name(selection: str) -> str:
+    """Parse fighter from MyBookie-style selection ('Islam Makhachev Yes')."""
+    text = " ".join(str(selection or "").split()).strip()
+    if not text:
+        return ""
+    if text.lower().endswith(" yes"):
+        text = text[: -4].strip()
+    for suffix in (" by ko/tko", " by ko", " by submission", " by decision"):
+        if text.lower().endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    return text
+
+
+def fighter_method_model_prob(
+    prop_key: str,
+    row: pd.Series,
+    fighter_name: str,
+    *,
+    probs: dict[str, float] | None = None,
+) -> float:
+    """Joint model prob for a named fighter method market."""
+    side = _METHOD_KEY_TO_SIDE.get(str(prop_key))
+    if not side:
+        return prop_model_prob(prop_key, row, probs)
+    joints = side_method_joint_probs(row, probs)
+    from src.predictor import _names_match
+
+    for name, vals in joints.items():
+        if _names_match(fighter_name, name) or fighter_name.lower() in name.lower():
+            return float(vals[side])
+    # Fall back to model-pick joint if name unresolved
+    p = probs or method_probs_from_row(row)
+    return float(p.get(prop_key, 0.0) or 0.0)
 
 
 def prop_model_prob(prop_key: str, row: pd.Series, probs: dict[str, float] | None = None) -> float:
@@ -209,10 +378,35 @@ def prop_model_prob(prop_key: str, row: pd.Series, probs: dict[str, float] | Non
         "round_1_finish": p["round_1_finish"],
         "over_1_5_rounds": p["over_1_5_rounds"],
         "under_1_5_rounds": p.get("under_1_5_rounds", 1.0 - float(p["over_1_5_rounds"])),
+        "over_2_5_rounds": p["over_2_5_rounds"],
+        "under_2_5_rounds": p["under_2_5_rounds"],
+        "over_3_5_rounds": p["over_3_5_rounds"],
+        "under_3_5_rounds": p["under_3_5_rounds"],
+        "over_4_5_rounds": p["over_4_5_rounds"],
+        "under_4_5_rounds": p["under_4_5_rounds"],
         "fighter_ko": p["fighter_ko"],
         "fighter_sub": p["fighter_sub"],
+        "fighter_decision": p.get("fighter_decision", p["pick_prob"] * max(0.05, 1.0 - float(p.get("f1_ko_cond", 0.3)) - float(p.get("f1_sub_cond", 0.2)))),
     }
-    return float(mapping.get(prop_key, 0.0))
+    if prop_key in mapping:
+        return float(mapping[prop_key])
+    m = _OVER_UNDER_POINT_RE.match(str(prop_key))
+    if m:
+        side, whole, frac = m.group(1), m.group(2), m.group(3)
+        point = float(f"{whole}.{frac}")
+        try:
+            scheduled = int(float(row.get("scheduled_rounds", 3) or 3))
+        except (TypeError, ValueError):
+            scheduled = 3
+        scheduled = 5 if scheduled >= 5 else 3
+        over_p = _over_line_from_anchors(
+            float(p["over_1_5_rounds"]),
+            float(p["dec"]),
+            point=point,
+            max_line=float(scheduled) - 0.5,
+        )
+        return float(over_p if side == "over" else 1.0 - over_p)
+    return 0.0
 
 
 def synthetic_market_odds(model_prob: float, *, vig: float | None = None) -> float:
@@ -282,6 +476,7 @@ def resolve_prop_quote(
     book: str,
     prop_odds: pd.DataFrame | None = None,
     probs: dict[str, float] | None = None,
+    fighter_name: str | None = None,
 ) -> dict[str, Any]:
     """
     Resolve market quote for a prop: prefer live book line, else synthetic.
@@ -290,14 +485,25 @@ def resolve_prop_quote(
     """
     from src.odds_providers.prop_odds_common import lookup_prop_odds_row
 
-    model_p = prop_model_prob(prop_key, row, probs)
     p = probs or method_probs_from_row(row)
+    named = str(fighter_name or "").strip()
+    if named and prop_key in _FIGHTER_METHOD_KEYS:
+        model_p = fighter_method_model_prob(prop_key, row, named, probs=p)
+    else:
+        model_p = prop_model_prob(prop_key, row, p)
     f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
     f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
 
     live_row = None
     if prop_odds is not None and not prop_odds.empty:
-        live_row = lookup_prop_odds_row(f1, f2, prop_key, prop_odds)
+        sel_fighter = named or (str(p.get("pick_name", "")) if prop_key in _FIGHTER_METHOD_KEYS else "")
+        live_row = lookup_prop_odds_row(
+            f1,
+            f2,
+            prop_key,
+            prop_odds,
+            fighter_name=sel_fighter or None,
+        )
 
     if live_row is not None and float(live_row.get("decimal_odds", 0) or 0) > 1:
         decimal = float(live_row["decimal_odds"])
@@ -333,25 +539,46 @@ def resolve_prop_quote(
     }
 
 
-def prop_short_label(prop_key: str, row: pd.Series, probs: dict[str, float] | None = None) -> str:
-    """Compact prop title for dashboard tables (e.g. 'Pereira by KO/TKO')."""
-    p = probs or method_probs_from_row(row)
+def _method_short_label(prop_key: str, fighter: str) -> str:
     if prop_key == "fighter_ko":
-        return f"{p['pick_name']} by KO/TKO"
+        return f"{fighter} by KO/TKO"
     if prop_key == "fighter_sub":
-        return f"{p['pick_name']} by Submission"
+        return f"{fighter} by Submission"
     if prop_key == "fighter_decision":
-        return f"{p['pick_name']} by Decision"
+        return f"{fighter} by Decision"
     return PROP_MARKET_LABELS.get(prop_key, prop_key.replace("_", " ").title())
 
 
-def prop_display_label(prop_key: str, row: pd.Series, probs: dict[str, float] | None = None) -> str:
+def prop_short_label(
+    prop_key: str,
+    row: pd.Series,
+    probs: dict[str, float] | None = None,
+    *,
+    fighter_name: str | None = None,
+) -> str:
+    """Compact prop title for dashboard tables (e.g. 'Pereira by KO/TKO')."""
+    if prop_key in _FIGHTER_METHOD_KEYS:
+        named = str(fighter_name or "").strip()
+        if not named:
+            p = probs or method_probs_from_row(row)
+            named = str(p.get("pick_name", "")).strip()
+        if named:
+            return _method_short_label(prop_key, named)
+    return PROP_MARKET_LABELS.get(prop_key, prop_key.replace("_", " ").title())
+
+
+def prop_display_label(
+    prop_key: str,
+    row: pd.Series,
+    probs: dict[str, float] | None = None,
+    *,
+    fighter_name: str | None = None,
+) -> str:
     """Full prop label for slips and parlay legs."""
-    p = probs or method_probs_from_row(row)
     f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
     f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
     fight = f"{f1} vs {f2}"
-    return f"{prop_short_label(prop_key, row, p)} ({fight})"
+    return f"{prop_short_label(prop_key, row, probs, fighter_name=fighter_name)} ({fight})"
 
 
 def settle_prop(prop_key: str, row: pd.Series) -> bool | None:
@@ -397,6 +624,13 @@ def settle_prop(prop_key: str, row: pd.Series) -> bool | None:
     if prop_key == "under_1_5_rounds":
         # Fight ends in round 1 (does not go past 1.5)
         return round_num == 1
+    m = _OVER_UNDER_POINT_RE.match(str(prop_key))
+    if m:
+        side, whole, frac = m.group(1), m.group(2), m.group(3)
+        point = float(f"{whole}.{frac}")
+        # Over X.5 wins when the fight reaches round (floor(X)+1), i.e. round_num > int(X)
+        went_over = round_num > int(point)
+        return bool(went_over if side == "over" else not went_over)
     if prop_key == "fighter_ko":
         pick_won = (pick_side == "f1" and int(actual_f1_win or 0) == 1) or (
             pick_side == "f2" and int(actual_f1_win or 0) == 0
@@ -407,6 +641,11 @@ def settle_prop(prop_key: str, row: pd.Series) -> bool | None:
             pick_side == "f2" and int(actual_f1_win or 0) == 0
         )
         return bool(pick_won and sub)
+    if prop_key == "fighter_decision":
+        pick_won = (pick_side == "f1" and int(actual_f1_win or 0) == 1) or (
+            pick_side == "f2" and int(actual_f1_win or 0) == 0
+        )
+        return bool(pick_won and dec)
     return None
 
 
@@ -493,11 +732,14 @@ def extract_prop_candidate(
     odds = float(quote["decimal_odds"])
     odds_source = str(quote.get("odds_source", "synthetic"))
 
-    # Betting path: require live / Odds API odds + model floor + live edge
+    from src.strategy import edge_is_actionable
+
+    # Betting path: require live / Odds API odds + model floor + live edge + not a bogus scrape
     qualifies_live = (
         is_live_prop_odds_source(odds_source)
         and model_p >= model_floor
         and edge >= edge_floor
+        and edge_is_actionable(edge, decimal_odds=odds, model_prob=model_p)
     )
     # Display-only synthetic (research browse) — Over 1.5 only via ALLOWED_PROP_KEYS
     qualifies_synth = (
@@ -521,6 +763,16 @@ def extract_prop_candidate(
                 fight=fight_lbl,
                 prop_key=prop_key,
                 detail=f"prob={model_p:.3f}<{model_floor:.3f}",
+            )
+        elif is_live_prop_odds_source(odds_source) and not edge_is_actionable(
+            edge, decimal_odds=odds, model_prob=model_p
+        ):
+            log_strategy_block(
+                "prop_suspect_edge",
+                context="prop",
+                fight=fight_lbl,
+                prop_key=prop_key,
+                detail=f"edge={edge:.3f}",
             )
         elif is_live_prop_odds_source(odds_source) and edge < edge_floor:
             log_strategy_block(
@@ -601,8 +853,25 @@ def enrich_predictions_with_props(
         return df
     from src.odds_providers.prop_odds_common import attach_prop_odds_to_predictions
 
+    out = df
+    # Props-only pathway/decision rates when missing (does not enable ML flags).
+    if "f1_r1_finish_rate_l5" not in out.columns or out["f1_r1_finish_rate_l5"].isna().all():
+        try:
+            from src.pathway_features import attach_pathway_rates_for_props
+
+            out = attach_pathway_rates_for_props(out)
+        except Exception:
+            pass
+    if "f1_decision_finish_share_l5" not in out.columns:
+        try:
+            from src.decision_profile import attach_decision_profile_to_wide
+
+            out = attach_decision_profile_to_wide(out)
+        except Exception:
+            pass
+
     odds_df = prop_odds if prop_odds is not None else pd.DataFrame()
-    out = attach_prop_odds_to_predictions(df, odds_df)
+    out = attach_prop_odds_to_predictions(out, odds_df)
     for key in config.PROP_MARKETS:
         col = f"prop_prob_{key}"
         out[col] = out.apply(lambda r: prop_model_prob(key, r), axis=1)
@@ -619,9 +888,34 @@ def enrich_predictions_with_props(
     return out
 
 
-def _prop_fighter_name(prop_key: str, row: pd.Series, probs: dict[str, float] | None = None) -> str:
+def event_from_record(obj: Any) -> str:
+    """Event title from a prediction row, prop dict, or ticket."""
+    if obj is None:
+        return ""
+    if isinstance(obj, pd.Series):
+        return str(obj.get("event_name") or obj.get("event") or obj.get("event_key") or "").strip()
+    if isinstance(obj, dict):
+        return str(
+            obj.get("event")
+            or obj.get("event_name")
+            or obj.get("event_key")
+            or ""
+        ).strip()
+    return str(obj).strip()
+
+
+def _prop_fighter_name(
+    prop_key: str,
+    row: pd.Series,
+    probs: dict[str, float] | None = None,
+    *,
+    fighter_name: str | None = None,
+) -> str:
     """Fighter column for prop table — pick name for fighter-specific markets."""
-    if prop_key in ("fighter_ko", "fighter_sub", "fighter_decision"):
+    if prop_key in _FIGHTER_METHOD_KEYS:
+        named = str(fighter_name or "").strip()
+        if named:
+            return named
         p = probs or method_probs_from_row(row)
         return str(p.get("pick_name", "-"))
     return "-"
@@ -639,16 +933,22 @@ def _prop_row_dict(
     odds_source = getattr(cand, "odds_source", "synthetic")
     edge_pct = cand.edge * 100.0 if is_live_prop_odds_source(odds_source) else None
     prop_key = cand.prop_key
-    short = prop_short_label(prop_key, row, probs)
+    fighter_override = str(getattr(cand, "prop_fighter", "") or "").strip()
+    short = prop_short_label(prop_key, row, probs, fighter_name=fighter_override or None)
+    event = event_from_record(row) or str(getattr(cand, "event_key", "") or "").strip()
     return {
         "rank": rank,
         "book": book,
         "fight_id": cand.fight_id,
         "fight": f"{cand.fighter1_name} vs {cand.fighter2_name}",
+        "event": event,
+        "event_name": event,
         "prop_key": prop_key,
         "prop_type": short,
         "prop_short": short,
-        "fighter": _prop_fighter_name(prop_key, row, probs),
+        "fighter": _prop_fighter_name(
+            prop_key, row, probs, fighter_name=fighter_override or None
+        ),
         "label": cand.display_label or cand.pick_name,
         "prob": cand.prob,
         "odds": cand.decimal_odds,
@@ -664,7 +964,103 @@ def _prop_row_dict(
         ),
         "strict_qualified": strict_qualified,
         "parlay_allowed": config.BOOK_PROP_RULES.get(book, {}).get("allow_prop_parlays", False),
+        "suggested_stake": 0.0 if not strict_qualified else None,
     }
+
+
+def _collect_live_method_display(
+    rows: pd.DataFrame,
+    *,
+    book: str,
+    prop_odds: pd.DataFrame | None,
+    seen: set[str],
+) -> list[tuple[BetCandidate, pd.Series, dict[str, float], bool]]:
+    """Research-only: surface live fighter KO/sub/decision lines with model edge."""
+    from src.predictor import _names_match
+
+    out: list[tuple[BetCandidate, pd.Series, dict[str, float], bool]] = []
+    if prop_odds is None or prop_odds.empty or rows.empty:
+        return out
+
+    method_odds = prop_odds[prop_odds["prop_key"].astype(str).isin(_FIGHTER_METHOD_KEYS)]
+    if method_odds.empty:
+        return out
+
+    for _, live in method_odds.iterrows():
+        prop_key = str(live.get("prop_key", "")).strip()
+        if prop_key not in _FIGHTER_METHOD_KEYS:
+            continue
+        lf1 = str(live.get("fighter_1", "")).strip()
+        lf2 = str(live.get("fighter_2", "")).strip()
+        fighter = selection_fighter_name(str(live.get("selection", "")))
+        if not fighter:
+            continue
+        decimal = float(live.get("decimal_odds", 0) or 0)
+        if decimal <= 1:
+            continue
+        implied = float(live.get("implied_prob") or (1.0 / decimal))
+        src = str(live.get("odds_source") or "live")
+        if not is_live_prop_odds_source(src):
+            src = "live"
+
+        pred_row: pd.Series | None = None
+        for _, row in rows.iterrows():
+            f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
+            f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
+            aligned = _names_match(f1, lf1) and _names_match(f2, lf2)
+            swapped = _names_match(f1, lf2) and _names_match(f2, lf1)
+            if aligned or swapped:
+                pred_row = row
+                break
+        if pred_row is None:
+            # Orphan live line (fight not on scored card) — still show for research
+            pred_row = pd.Series(
+                {
+                    "fight_id": f"live|{lf1}|{lf2}",
+                    "event_name": "",
+                    "event": "",
+                    "fighter_1": lf1,
+                    "fighter_2": lf2,
+                    "prob_f1_win": 0.5,
+                    "prob_f2_win": 0.5,
+                }
+            )
+
+        probs = method_probs_from_row(pred_row)
+        model_p = fighter_method_model_prob(prop_key, pred_row, fighter, probs=probs)
+        # No model signal for orphan 50/50 stubs beyond method priors already in probs
+        edge = model_p - implied
+        f1 = str(pred_row.get("fighter_1", lf1)).strip()
+        f2 = str(pred_row.get("fighter_2", lf2)).strip()
+        short = _method_short_label(prop_key, fighter)
+        label = f"{short} ({f1} vs {f2})"
+        dedupe = f"{pred_row.get('fight_id', '')}|{prop_key}|{fighter.lower()}"
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+
+        cand = BetCandidate(
+            fight_id=str(pred_row.get("fight_id", "")),
+            event_key=str(pred_row.get("event_name", pred_row.get("event", ""))),
+            bet_side=probs.get("pick_side", "f1"),
+            prob=model_p,
+            decimal_odds=decimal,
+            edge=edge,
+            kelly_full=0.0,
+            expected_value=bet_expected_value(model_p, decimal),
+            fighter1_name=f1,
+            fighter2_name=f2,
+            pick_name=short,
+            winner_name=fighter,
+            market_type="prop",
+            prop_key=prop_key,
+            display_label=label,
+        )
+        cand.odds_source = src
+        cand.prop_fighter = fighter  # type: ignore[attr-defined]
+        # strict_qualified=False → research only, never HA-sized / Blue
+        out.append((cand, pred_row, probs, False))
+    return out
 
 
 def _collect_prop_candidates(
@@ -695,16 +1091,56 @@ def _collect_prop_candidates(
                 for_display=True,
             )
             if cand is not None:
+                from src.strategy import edge_is_actionable
+
+                src = str(getattr(cand, "odds_source", "") or "")
+                strict = is_live_prop_odds_source(src) and edge_is_actionable(
+                    float(cand.edge),
+                    decimal_odds=float(cand.decimal_odds or 0) or None,
+                    model_prob=float(cand.prob),
+                )
                 dedupe = f"{cand.fight_id}|{key}"
                 if dedupe not in seen:
                     seen.add(dedupe)
-                    collected.append((cand, row, probs, True))
+                    collected.append((cand, row, probs, strict))
                 continue
             if not include_relaxed:
                 continue
             quote = resolve_prop_quote(row, key, book=book, prop_odds=prop_odds, probs=probs)
             model_p = prop_model_prob(key, row, probs)
-            if str(quote.get("odds_source", "synthetic")) != "synthetic":
+            src = str(quote.get("odds_source", "synthetic"))
+            # Live line that missed HA (suspect 26% scrape, low prob, etc.) — show $0
+            if is_live_prop_odds_source(src):
+                if model_p < config.PROP_SHOW_ALL_MIN_PROB:
+                    continue
+                dedupe = f"{row.get('fight_id', '')}|{key}"
+                if dedupe in seen:
+                    continue
+                seen.add(dedupe)
+                f1 = str(row.get("fighter_1", row.get("fighter1", ""))).strip()
+                f2 = str(row.get("fighter_2", row.get("fighter2", ""))).strip()
+                label = prop_display_label(key, row, probs)
+                relaxed = BetCandidate(
+                    fight_id=str(row.get("fight_id", "")),
+                    event_key=str(row.get("event_name", row.get("event", ""))),
+                    bet_side=probs.get("pick_side", "f1"),
+                    prob=model_p,
+                    decimal_odds=float(quote["decimal_odds"]),
+                    edge=float(quote["edge"]),
+                    kelly_full=0.0,
+                    expected_value=bet_expected_value(model_p, float(quote["decimal_odds"])),
+                    fighter1_name=f1,
+                    fighter2_name=f2,
+                    pick_name=label,
+                    winner_name=label,
+                    market_type="prop",
+                    prop_key=key,
+                    display_label=label,
+                )
+                relaxed.odds_source = src
+                collected.append((relaxed, row, probs, False))
+                continue
+            if src != "synthetic":
                 continue
             if model_p < config.PROP_SHOW_ALL_MIN_PROB:
                 continue
@@ -735,6 +1171,11 @@ def _collect_prop_candidates(
             relaxed.odds_source = "synthetic"
             collected.append((relaxed, row, probs, False))
 
+    # Live method markets (KO / sub / decision) — display + edge only, never HA-sized
+    collected.extend(
+        _collect_live_method_display(rows, book=book, prop_odds=prop_odds, seen=seen)
+    )
+
     return collected, seen
 
 
@@ -756,7 +1197,7 @@ def rank_prop_singles(
     if not config.ENABLE_PROPS or rows.empty:
         return [], empty_meta
 
-    cap = max_results if max_results is not None else config.PROP_MAX_RESULTS
+    base_cap = max_results if max_results is not None else config.PROP_MAX_RESULTS
     collected, _ = _collect_prop_candidates(
         rows,
         book=book,
@@ -775,6 +1216,9 @@ def rank_prop_singles(
     collected.sort(key=_rank_key, reverse=True)
     strict_count = sum(1 for *_, strict in collected if strict)
     total_found = len(collected)
+    # Raise display cap when live method research lines are present so the board isn't truncated
+    has_method = any(c.prop_key in _FIGHTER_METHOD_KEYS for c, *_ in collected)
+    cap = max(base_cap, min(120, total_found)) if has_method else base_cap
 
     ranked: list[dict[str, Any]] = []
     for i, (cand, row, probs, strict) in enumerate(collected[:cap], 1):

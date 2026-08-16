@@ -13,6 +13,7 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
+from src.odds_providers.odds_reliability import cache_freshness_meta, log_book_status
 from src.predictor import OddsAPIError, _implied_probs, _names_match, _to_decimal_odds
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ DK_UNAVAILABLE_MSG = "DraftKings unavailable - check THE_ODDS_API_KEY"
 
 # Set when returning consensus / cache fallback so the dashboard can show a warning.
 LAST_WARNING: str = ""
+LAST_SOURCE_MODE: str = ""  # live | cache | consensus | scraper | empty
 
 
 def _cache_fresh(path: Path) -> bool:
@@ -81,18 +83,34 @@ def _fallback_odds(*, force_refresh: bool, reason: str) -> pd.DataFrame:
     Soft recovery: stale DK cache → Odds API consensus → BetNow → MyBookie.
     Never raises — empty DataFrame when nothing usable remains.
     """
-    global LAST_WARNING
+    global LAST_WARNING, LAST_SOURCE_MODE
 
     stale = _read_cache(DK_CACHE_PATH)
     if stale is not None:
+        LAST_SOURCE_MODE = "cache"
         LAST_WARNING = f"{DK_UNAVAILABLE_MSG} Using cached DraftKings lines ({reason})."
+        meta = cache_freshness_meta(DK_CACHE_PATH)
+        log_book_status(
+            "DraftKings",
+            mode="cache",
+            matched=len(stale),
+            warning=LAST_WARNING,
+            detail=f"age_min={meta.get('age_min'):.1f}" if meta.get("age_min") is not None else reason,
+        )
         logger.warning(LAST_WARNING)
         return stale
 
     try:
         consensus = _consensus_odds(force_refresh=force_refresh)
+        LAST_SOURCE_MODE = "consensus"
         LAST_WARNING = (
             f"{DK_UNAVAILABLE_MSG} Showing consensus odds from other books ({reason})."
+        )
+        log_book_status(
+            "DraftKings",
+            mode="consensus",
+            matched=len(consensus),
+            warning=LAST_WARNING,
         )
         logger.warning(LAST_WARNING)
         return consensus
@@ -106,15 +124,24 @@ def _fallback_odds(*, force_refresh: bool, reason: str) -> pd.DataFrame:
         scraped = fetch_book_scraper_odds(force_refresh=force_refresh)
         if scraped is not None and not scraped.empty:
             src = str(LAST_ODDS_META.get("source") or "book scraper")
+            LAST_SOURCE_MODE = "scraper"
             LAST_WARNING = (
                 f"{DK_UNAVAILABLE_MSG} Using {src} odds instead ({reason})."
+            )
+            log_book_status(
+                "DraftKings",
+                mode="scraper",
+                matched=len(scraped),
+                warning=LAST_WARNING,
             )
             logger.warning(LAST_WARNING)
             return scraped
     except Exception as scrape_exc:
         logger.warning("Book scraper fallback after DraftKings failed: %s", scrape_exc)
 
+    LAST_SOURCE_MODE = "empty"
     LAST_WARNING = DK_UNAVAILABLE_MSG
+    log_book_status("DraftKings", mode="empty", matched=0, warning=LAST_WARNING)
     return pd.DataFrame()
 
 
@@ -129,8 +156,9 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     books. Returns an empty frame (with LAST_WARNING set) when no fallback works so
     the dashboard never crashes.
     """
-    global LAST_WARNING
+    global LAST_WARNING, LAST_SOURCE_MODE
     LAST_WARNING = ""
+    LAST_SOURCE_MODE = ""
     ensure_data_dirs()
 
     if not config.ODDS_API_KEY:
@@ -139,6 +167,14 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if not force_refresh and _cache_fresh(DK_CACHE_PATH):
         cached = _read_cache(DK_CACHE_PATH)
         if cached is not None:
+            LAST_SOURCE_MODE = "cache"
+            meta = cache_freshness_meta(DK_CACHE_PATH)
+            log_book_status(
+                "DraftKings",
+                mode="cache",
+                matched=len(cached),
+                detail=f"age_min={meta.get('age_min'):.1f}" if meta.get("age_min") is not None else "",
+            )
             logger.info("Using cached DraftKings odds (%s rows)", len(cached))
             return cached
 
@@ -170,16 +206,19 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     try:
         response = requests.get(url, params=params, timeout=config.REQUEST_TIMEOUT_SEC)
         if response.status_code == 401:
+            logger.warning("DraftKings Odds API 401 Unauthorized — soft-failing")
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
         response.raise_for_status()
         payload = response.json()
     except requests.HTTPError as exc:
         if _is_unauthorized(exc, response):
+            logger.warning("DraftKings Odds API 401 Unauthorized — soft-failing")
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
         logger.warning("DraftKings odds HTTP error: %s", exc)
         return _fallback_odds(force_refresh=False, reason=str(exc))
     except requests.RequestException as exc:
         if _is_unauthorized(exc, response):
+            logger.warning("DraftKings Odds API 401 Unauthorized — soft-failing")
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
         logger.warning("DraftKings odds request failed: %s", exc)
         return _fallback_odds(force_refresh=False, reason=str(exc))
@@ -190,6 +229,10 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if not isinstance(payload, list):
         logger.warning("Unexpected DraftKings response: %s", type(payload))
         return _fallback_odds(force_refresh=False, reason="unexpected response")
+
+    if len(payload) == 0:
+        logger.warning("DraftKings Odds API returned empty event list")
+        return _fallback_odds(force_refresh=False, reason="empty API response")
 
     rows: list[dict[str, Any]] = []
     for event in payload:
@@ -247,5 +290,7 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         odds_df["commence_time"] = pd.to_datetime(odds_df["commence_time"], errors="coerce")
 
     odds_df.to_csv(DK_CACHE_PATH, index=False)
+    LAST_SOURCE_MODE = "live"
+    log_book_status("DraftKings", mode="live", matched=len(odds_df))
     logger.info("Fetched %s DraftKings odds lines", len(odds_df))
     return odds_df

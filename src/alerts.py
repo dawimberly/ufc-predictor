@@ -261,6 +261,24 @@ def generate_alerts(
                 logger.debug("skip scorecard log failed: %s", exc)
 
     for _, row in predictions_df.iterrows():
+        # Soft-fail: no book line → no ticket for this book (edge stays blank upstream)
+        if "odds_matched" in row.index and not bool(row.get("odds_matched")):
+            f1, f2 = _fighter_names(row)
+            pick = str(row.get("predicted_winner", "") or "")
+            _append_skip(row=row, f1=f1, f2=f2, pick=pick, reason="no_odds", edge=None)
+            continue
+        if bool(row.get("edge_suspect")):
+            f1, f2 = _fighter_names(row)
+            edge, pick = _pick_edge(row)
+            _append_skip(
+                row=row,
+                f1=f1,
+                f2=f2,
+                pick=pick or "",
+                reason="suspect_edge",
+                edge=edge,
+            )
+            continue
         edge, pick = _pick_edge(row)
         f1, f2 = _fighter_names(row)
         from src.strategy import decimal_odds_for_pick, edge_is_actionable
@@ -355,7 +373,12 @@ def generate_alerts(
         if dec is None:
             _append_skip(row=row, f1=f1, f2=f2, pick=pick, reason="no_odds", edge=edge)
             continue
-        if not edge_is_actionable(float(edge), decimal_odds=dec, model_prob=prob_f):
+        if not edge_is_actionable(
+            float(edge),
+            decimal_odds=dec,
+            model_prob=prob_f,
+            edge_suspect=bool(row.get("edge_suspect")),
+        ):
             _append_skip(
                 row=row, f1=f1, f2=f2, pick=pick, reason="edge_not_actionable", edge=edge
             )

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.controversy import (
     build_and_save_catalog,
     is_controversial_method,
@@ -20,6 +22,10 @@ def test_method_kinds_split_dq_doctor():
 
 
 def test_referee_stats_and_catalog_smoke():
+    from src.controversy import GRECO_RESULTS
+
+    if not GRECO_RESULTS.is_file():
+        pytest.skip(f"missing Greco results: {GRECO_RESULTS}")
     stats = referee_controversy_stats(min_bouts=40)
     assert not stats.empty
     assert "z_vs_league" in stats.columns

@@ -1220,13 +1220,22 @@ def _discover_ufc_upcoming_event_paths() -> list[dict[str, str]]:
         if not href or href in seen:
             continue
         seen.add(href)
-        name_el = card.select_one(".c-event-tile__title, .c-card-event__title")
-        date_el = card.select_one(".c-event-tile__date, .c-card-event__date")
+        name_el = card.select_one(
+            ".c-event-tile__title, .c-card-event__title, .c-card-event--result__headline a, h3 a"
+        )
+        # Main-card date only — ticket/presale nodes also have *date* classes.
+        date_el = card.select_one(".c-card-event--result__date")
+        if date_el is None:
+            date_el = card.select_one(".c-event-tile__date, .c-card-event__date")
+        date_text = date_el.get_text(strip=True) if date_el else ""
+        # UFC.com: "Sat, Aug 15 / 9:00 PM EDT / Main Card"
+        if date_text and "/" in date_text:
+            date_text = date_text.split("/")[0].strip()
         events.append(
             {
                 "event_path": href,
                 "event_name": name_el.get_text(strip=True) if name_el else "",
-                "event_date": date_el.get_text(strip=True) if date_el else "",
+                "event_date": date_text,
             }
         )
 
@@ -1351,7 +1360,7 @@ def _fetch_espn_historical(*, since: pd.Timestamp | None = None) -> pd.DataFrame
         )
         try:
             df = _fetch_espn_scoreboard_url(url, completed_only=True)
-        except DataLoaderError as exc:
+        except (DataLoaderError, requests.RequestException) as exc:
             logger.debug("ESPN year %s skipped: %s", year, exc)
             continue
         if since is not None:
@@ -1986,7 +1995,7 @@ def load_historical_data(
             espn_df = _fetch_espn_historical(since=since if incremental else None)
             if not espn_df.empty:
                 frames.append(espn_df)
-        except DataLoaderError as exc:
+        except (DataLoaderError, requests.RequestException, OSError) as exc:
             errors.append(f"espn: {exc}")
 
     if not frames:
@@ -2128,6 +2137,94 @@ def label_from_event_path(event_path: str) -> str:
     return "UFC " + " ".join(p.title() if p.isalpha() else p for p in parts)
 
 
+_MONTH_SLUGS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def event_date_iso_from_path(event_path: str) -> str:
+    """Parse ``.../ufc-fight-night-august-22-2026`` → ``2026-08-22`` (empty if unknown)."""
+    slug = event_path_key(event_path).split("/event/")[-1].lower()
+    if not slug:
+        return ""
+    m = re.search(
+        r"(january|february|march|april|may|june|july|august|september|october|november|december)"
+        r"-(\d{1,2})-(\d{4})",
+        slug,
+    )
+    if not m:
+        return ""
+    month = _MONTH_SLUGS.get(m.group(1))
+    if not month:
+        return ""
+    try:
+        day = int(m.group(2))
+        year = int(m.group(3))
+        return f"{year:04d}-{month:02d}-{day:02d}"
+    except ValueError:
+        return ""
+
+
+def enrich_event_dates(events: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Fill ISO ``event_date`` from URL slug or tile text; drop completed events."""
+    today = datetime.now(timezone.utc).date()
+    out: list[dict[str, str]] = []
+    for raw in events:
+        ev = dict(raw)
+        path = str(ev.get("event_path") or "")
+        # Slug year is authoritative when present (august-22-2026).
+        iso = event_date_iso_from_path(path)
+        if not iso:
+            parsed = clean_date(ev.get("event_date") or ev.get("date"))
+            if pd.notna(parsed):
+                try:
+                    ts = pd.Timestamp(parsed)
+                    if int(ts.year) < 1990:
+                        # "Sat, Aug 15" often parses without a real year.
+                        candidate = today.replace(month=int(ts.month), day=int(ts.day))
+                        if candidate < today:
+                            try:
+                                candidate = candidate.replace(year=today.year + 1)
+                            except ValueError:
+                                candidate = today
+                        iso = candidate.isoformat()
+                    else:
+                        iso = ts.date().isoformat()
+                except Exception:
+                    iso = ""
+        if iso:
+            ev["event_date"] = iso
+            try:
+                if datetime.fromisoformat(iso).date() < today:
+                    logger.info(
+                        "Skipping past upcoming event %r (%s)",
+                        ev.get("event_name"),
+                        iso,
+                    )
+                    continue
+            except ValueError:
+                pass
+        out.append(ev)
+    out.sort(
+        key=lambda e: (
+            str(e.get("event_date") or "9999-12-31"),
+            str(e.get("event_name") or ""),
+        )
+    )
+    return out
+
+
 def canonical_event_label(event: dict[str, str]) -> str:
     """Prefer slug-derived label when UFC.com title is empty or generic."""
     name = str(event.get("event_name") or "").strip()
@@ -2186,7 +2283,7 @@ def list_upcoming_events(*, force_refresh: bool = False) -> list[dict[str, str]]
     try:
         events = _discover_ufc_upcoming_event_paths()
         if events:
-            out = dedupe_upcoming_events(events)
+            out = enrich_event_dates(dedupe_upcoming_events(events))
             logger.info(
                 "list_upcoming_events: live UFC.com returned %d event(s): %s",
                 len(out),
@@ -2202,7 +2299,7 @@ def list_upcoming_events(*, force_refresh: bool = False) -> list[dict[str, str]]
             len(cached),
             [e.get("event_name") for e in cached[:4]],
         )
-        return dedupe_upcoming_events(cached)
+        return enrich_event_dates(dedupe_upcoming_events(cached))
     return []
 
 
