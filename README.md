@@ -6,6 +6,7 @@ Standalone UFC fight prediction and high-accuracy (HA) betting-signal pipeline. 
 
 ## Recent changes
 
+- **2026-08-16** — Fighter-photo desk: local Ollama vision reads cached stills; both-finisher look fades Over 1.5 to caution (not BET THIS). Camp strip flags shared-gym / camp-switch underdogs.
 - **2026-08-15** — MyBookie Over 1.5 with bogus edges (e.g. +26%) is no longer BET THIS Blue — HA caps actionable edge at 25%.
 - **2026-08-15** — Land unmerged dashboard work on master: empty-book odds restore, fetch-once slate locks, instant fight-stats chat, MyBookie KO/sub/decision props with model edges, totals label fix, and no false Blue on research lines.
 - **2026-08-14** — Show MyBookie method props (KO/sub/decision) on Props with model edges, fix totals labels, and stop false Blue on research lines.
@@ -26,6 +27,7 @@ UFC-Predictor/
 │   ├── strategy.py            HA sizing + auto 2/3-leg parlay recs
 │   ├── uncertainty_gates.py   Conformal CI gates + Paper wide override
 │   ├── fight_context.py       Display-only context strip
+│   ├── photo_analysis.py      Local vision read of fighter stills (research)
 │   ├── weigh_in.py            Weigh-in photos / missed-weight notes
 │   ├── fighter_flags.py       Integrity skip / badge flags
 │   └── ufc_dashboard.py       CustomTkinter GUI
@@ -142,7 +144,7 @@ Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `X
 
 ### Context strip (display only)
 
-Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Always-on strip lines: market implied + Disagree; decision profile / judges when known. DROP research blocks (pathway, market, home, local, judge-geo, decision-profile, overseas, controversy) stay out of production features — see `data/reports/research_keep_drop.md`.
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`), a local **photo desk** (`photo_analysis` — physique / both-finishers / Over 1.5 fade when a vision model is installed), camp/gym notes including shared-gym camp-switch cautions (`gym_data`), and integrity flags (`fighter_flags`) — **context only**, not model features. Always-on strip lines: market implied + Disagree; decision profile / judges when known. DROP research blocks (pathway, market, home, local, judge-geo, decision-profile, overseas, controversy) stay out of production features — see `data/reports/research_keep_drop.md`.
 
 ## Odds sources
 
@@ -191,7 +193,7 @@ Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Bl
 
 **KEEP:** HV (+ gates). **DROP (flags default false):** pathway, market, home-country, local advantage, judge-geo (model), decision-profile, overseas travel, controversy. Do not flip `ADD_*` / `ENABLE_PATHWAY_*` / `ENABLE_MARKET_*` unless you re-run the A/B and the keep rule passes. Preflight warns (Live fails) if DROP flags are on.
 
-**Display-only extras** (not model features): fight context strip (market implied, Disagree, decision profile / judges when known), weigh-in photos, integrity badges, overseas notes, Ollama/Grok narrative, FUN ONLY greens.
+**Display-only extras** (not model features): fight context strip (market implied, Disagree, decision profile / judges when known), weigh-in photos + digital photo desk, camp/gym notes, integrity badges, overseas notes, Ollama/Grok narrative, FUN ONLY greens.
 
 ### Soft Update (canonical odds path)
 
@@ -299,6 +301,8 @@ Copy `.env.example` → `.env`. Important keys:
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
+| `OLLAMA_VISION_MODEL` | (auto) | Photo desk; `ollama pull llava` or qwen2.5vl |
+| `PHOTO_ANALYSIS_ENABLED` | true | Digital stills analysis (not a model feature) |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |
 
 ## Ops artifacts
@@ -317,7 +321,7 @@ Copy `.env.example` → `.env`. Important keys:
 python -m pytest tests/ -q
 ```
 
-Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, fighter flags, weigh-in context, and Ollama props wiring.
+Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top recommended dedupe, Paper wide override, auto parlays, HV features, fighter flags, weigh-in context, photo desk, and Ollama props wiring.
 
 ## Design notes
 

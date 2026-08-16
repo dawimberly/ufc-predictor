@@ -1346,8 +1346,19 @@ def _render_grouped_fight_tables(
     photo_f1.pack(side="left", padx=(0, 8))
     photo_f2 = ctk.CTkLabel(photo_row, text="", width=72, height=72)
     photo_f2.pack(side="left", padx=(0, 12))
+    photo_caption = ctk.CTkLabel(
+        photo_row,
+        text="",
+        anchor="w",
+        justify="left",
+        font=ctk.CTkFont(size=11),
+        text_color="#cbd5e1",
+        wraplength=820,
+    )
+    photo_caption.pack(side="left", fill="x", expand=True)
     photo_row.pack_forget()  # show only when images load
     _photo_refs: list[Any] = []  # keep CTkImage refs alive
+    _photo_gen = {"n": 0}
 
     context_box = ctk.CTkLabel(
         context_wrap,
@@ -1361,9 +1372,12 @@ def _render_grouped_fight_tables(
     context_box.pack(fill="x")
 
     def _set_photos(f1: str, f2: str) -> None:
+        _photo_gen["n"] += 1
+        gen = _photo_gen["n"]
         photo_row.pack_forget()
         photo_f1.configure(image=None, text="")
         photo_f2.configure(image=None, text="")
+        photo_caption.configure(text="")
         _photo_refs.clear()
         if not f1 and not f2:
             return
@@ -1384,7 +1398,52 @@ def _render_grouped_fight_tables(
                 label.configure(image=cimg, text="")
                 imgs.append(cimg)
             if imgs:
+                try:
+                    from src.photo_analysis import format_photo_analysis_line
+
+                    cached_line = format_photo_analysis_line(f1, f2, fetch_vision=False)
+                except Exception:
+                    cached_line = ""
+                photo_caption.configure(text=_ascii_ui(cached_line))
                 photo_row.pack(fill="x", pady=(0, 2), before=context_box)
+
+                def _vision_worker() -> None:
+                    try:
+                        from src.photo_analysis import analyze_pair
+
+                        analysis = analyze_pair(
+                            f1, f2, fetch_images=False, use_vision=True
+                        )
+                        line = analysis.line() or (
+                            analysis.summary
+                            if analysis.reason == "no_vision_model"
+                            else ""
+                        )
+                    except Exception as exc:
+                        _debug_log(f"photo vision skipped: {exc}")
+                        return
+                    if not line:
+                        return
+
+                    def _apply() -> None:
+                        if gen != _photo_gen["n"]:
+                            return
+                        try:
+                            photo_caption.configure(text=_ascii_ui(line))
+                            current = str(context_box.cget("text") or "")
+                            if "Photos:" not in current:
+                                context_box.configure(
+                                    text=_ascii_ui(current + "\n" + line)
+                                )
+                        except Exception:
+                            pass
+
+                    try:
+                        parent.after(0, _apply)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_vision_worker, daemon=True).start()
         except Exception as exc:
             _debug_log(f"weigh-in photos skipped: {exc}")
 

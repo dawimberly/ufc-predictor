@@ -1683,6 +1683,13 @@ def prop_may_receive_ha_stake(prop: dict[str, Any]) -> bool:
             return False
     if ticket_edge_exceeds_actionable_cap(prop):
         return False
+    try:
+        from src.photo_analysis import photo_over_15_blocks
+
+        if photo_over_15_blocks(prop):
+            return False
+    except Exception:
+        pass
     edge_f = ticket_max_edge_fraction(prop)
     if edge_f is None:
         return False
@@ -1742,11 +1749,19 @@ def attach_prop_stakes(
         row = dict(s)
         row["market_type"] = "prop"
         row["is_parlay"] = False
+        try:
+            from src.photo_analysis import attach_photo_notes
+
+            attach_photo_notes(row)
+        except Exception:
+            pass
         if not prop_may_receive_ha_stake(row):
             row["suggested_stake"] = 0.0
             row["stake_usd"] = 0.0
             row["stake_pct"] = 0.0
             row["advisory"] = True
+            if row.get("photo_over_15_caution"):
+                row["tier_reason"] = "photo_finishers"
             zeroed.append(row)
             continue
         tickets.append(row)

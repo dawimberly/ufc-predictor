@@ -450,8 +450,21 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
             f"- id={t.get('id')} | {ev_bit}ACTION={action} | {t.get('side')} | {t.get('market')} | "
             f"book={t.get('book') or 'n/a'} | stake={t.get('stake_pct')}%/${t.get('stake_usd')} | "
             f"prob={t.get('prob')} | edge={t.get('edge_pct')}% | conf={t.get('confidence')}"
+            + (f" | gym={t.get('gym_note')}" if t.get("gym_note") else "")
+            + (f" | photo={t.get('photo_note')}" if t.get("photo_note") else "")
+            + (" | PHOTO_FADE_OVER_15" if t.get("photo_over_15_caution") else "")
         )
     tickets_block = "\n".join(ticket_lines) if ticket_lines else "- (none — NO BET / sized $0)"
+
+    photo_notes = str(inputs.get("photo_notes") or "").strip()
+    if not photo_notes:
+        try:
+            from src.photo_analysis import card_photo_notes
+
+            photo_notes = card_photo_notes(tickets)
+        except Exception:
+            photo_notes = ""
+    photo_block = f"\nPhoto desk (stills only, not HA):\n{photo_notes}\n" if photo_notes else ""
 
     parlay_lines: list[str] = []
     for p in parlays:
@@ -490,7 +503,7 @@ Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars);
 
 Tickets ({n_act} BET THIS / {n_adv} FUN ONLY):
 {tickets_block}
-BET THIS totals: {total_pct}% / ${total_usd}
+{photo_block}BET THIS totals: {total_pct}% / ${total_usd}
 
 Auto parlays (narrate as FUN ONLY research — do not invent legs):
 {parlays_block}
@@ -618,6 +631,9 @@ def _ticket_to_slip_row(
         "bet_tier": bet_tier or None,
         "fun_bet": bool(ticket.get("fun_bet")),
         "tier_reason": ticket.get("tier_reason") or "",
+        "gym_note": str(ticket.get("gym_note") or "")[:220],
+        "photo_note": str(ticket.get("photo_note") or "")[:220],
+        "photo_over_15_caution": bool(ticket.get("photo_over_15_caution")),
     }
 
 
@@ -694,6 +710,7 @@ def collect_card_analysis_inputs(
         TIER_SKY_BLUE,
         TIER_YELLOW,
         demote_suspect_edge_ticket,
+        demote_photo_caution_ticket,
         is_sky_blue_ticket,
         singles_cleared_keys,
     )
@@ -997,6 +1014,7 @@ def collect_card_analysis_inputs(
             t["stake_pct"] = 0.0
 
     raw_candidates = [demote_suspect_edge_ticket(t) or t for t in raw_candidates]
+    raw_candidates = [demote_photo_caution_ticket(t) or t for t in raw_candidates]
 
     tickets = dedupe_rank_top_tickets(
         raw_candidates,
@@ -1026,6 +1044,13 @@ def collect_card_analysis_inputs(
     ]
     n_actionable = len(actionable_only)
     n_advisory = sum(1 for t in tickets if t.get("advisory") or t.get("fun_bet"))
+    photo_notes = ""
+    try:
+        from src.photo_analysis import card_photo_notes
+
+        photo_notes = card_photo_notes(tickets)
+    except Exception:
+        photo_notes = ""
 
     recommended_parlays: list[dict[str, Any]] = []
     try:
@@ -1079,6 +1104,7 @@ def collect_card_analysis_inputs(
         "top_n": top_n,
         "top_n_shown": len(tickets),
         "recommended_parlays": recommended_parlays,
+        "photo_notes": photo_notes,
     }
 
 

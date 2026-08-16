@@ -138,11 +138,36 @@ def demote_suspect_edge_ticket(ticket: dict[str, Any] | None) -> dict[str, Any] 
     return ticket
 
 
+def demote_photo_caution_ticket(ticket: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Zero HA stake when cached stills say both fighters look like early finishers."""
+    if not isinstance(ticket, dict):
+        return ticket
+    try:
+        from src.photo_analysis import attach_photo_notes, photo_over_15_blocks
+
+        attach_photo_notes(ticket)
+        if not photo_over_15_blocks(ticket):
+            return ticket
+    except Exception:
+        if not ticket.get("photo_over_15_caution"):
+            return ticket
+    ticket["bet_tier"] = TIER_YELLOW
+    ticket["tier"] = TIER_YELLOW
+    ticket["tier_reason"] = "photo_finishers"
+    ticket["fun_bet"] = True
+    ticket["advisory"] = True
+    ticket["suggested_stake"] = 0.0
+    ticket["stake_usd"] = 0.0
+    ticket["stake_pct"] = 0.0
+    return ticket
+
+
 def sanitize_bet_for_display(ticket: dict[str, Any] | None) -> dict[str, Any] | None:
     """Last-mile: a printed +26.3% line can never stay BET THIS Blue."""
     if not isinstance(ticket, dict):
         return ticket
-    return demote_suspect_edge_ticket(dict(ticket))
+    out = demote_suspect_edge_ticket(dict(ticket))
+    return demote_photo_caution_ticket(out)
 
 
 _SOFT_UNCERTAINTY_SKIP = frozenset(
@@ -552,6 +577,24 @@ def classify_bet_tier(
             suspect_edge = True
     if suspect_edge:
         tier, reason = TIER_YELLOW, "suspect_edge"
+        _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
+        return tier, reason
+
+    # Visual both-finishers (cached photo analysis) — caution, never BET THIS.
+    photo_skip = (
+        skip_reason in {"photo_finishers", "photo_over_15", "photo_finish"}
+        or "photo_finish" in status_s.lower()
+        or "photo_over_15" in status_s.lower()
+    )
+    if not photo_skip and row is not None:
+        try:
+            from src.photo_analysis import photo_over_15_blocks
+
+            photo_skip = photo_over_15_blocks(row if isinstance(row, dict) else dict(row))
+        except Exception:
+            photo_skip = False
+    if photo_skip:
+        tier, reason = TIER_YELLOW, "photo_finishers"
         _log_color(pick, prob_f, edge_f, status_s, stake_pct_f, stake_usd_f, tier, reason, debug)
         return tier, reason
 
@@ -974,6 +1017,13 @@ def prop_status_for_tier(prop: dict[str, Any]) -> str:
     # HA actionable props are Over 1.5 only
     if key and key not in {"over_1_5_rounds", "under_1_5_rounds", "round_1_finish"}:
         return "SKIP:prop_gate"
+    try:
+        from src.photo_analysis import photo_over_15_blocks
+
+        if photo_over_15_blocks(prop):
+            return "SKIP:photo_finishers"
+    except Exception:
+        pass
 
     edge = _safe_float(prop.get("edge"))
     edge_pct = _safe_float(prop.get("edge_pct"))
