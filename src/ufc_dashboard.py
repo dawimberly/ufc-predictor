@@ -2051,16 +2051,15 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
         from src.bet_tiers import format_top_pick_line
 
         line, color = format_top_pick_line(bet, rank)
+        odds = self._odds_line(bet)
+        if odds and odds not in line:
+            line = f"{line}  ·  {odds}"
         return _ascii_ui(line), color
 
     def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
         """All top picks in a single bubble (colored lines, not separate cards)."""
         from src.bet_slip import dedupe_rank_top_tickets, top_recommended_label
-        from src.bet_tiers import (
-            format_pick_price_stats,
-            format_tier_legend,
-            format_what_to_do_header,
-        )
+        from src.bet_tiers import format_tier_legend, format_what_to_do_header
 
         bets = dedupe_rank_top_tickets(list(bets or []), limit=5)
         bubble = ctk.CTkFrame(
@@ -2099,20 +2098,7 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
                 anchor="w",
                 justify="left",
                 wraplength=900,
-            ).pack(fill="x", padx=14, pady=(0, 2))
-            odds = self._odds_line(bet)
-            stats = format_pick_price_stats(bet)
-            extra = "  ·  ".join(p for p in (odds, stats) if p)
-            if extra:
-                ctk.CTkLabel(
-                    bubble,
-                    text=_ascii_ui(extra),
-                    font=ctk.CTkFont(size=12, weight="bold"),
-                    text_color=color,
-                    anchor="w",
-                    justify="left",
-                    wraplength=900,
-                ).pack(fill="x", padx=14, pady=(0, 4))
+            ).pack(fill="x", padx=14, pady=(0, 4))
 
         ctk.CTkLabel(
             bubble,
@@ -2913,15 +2899,6 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 bubble,
                 text=_ascii_ui(line),
                 font=ctk.CTkFont(size=13, weight="bold"),
-                text_color=color,
-                anchor="w",
-                justify="left",
-                wraplength=980,
-            ).pack(fill="x", padx=12, pady=(0, 2))
-            ctk.CTkLabel(
-                bubble,
-                text=_ascii_ui(odds if not stats else f"{odds}  ·  {stats}"),
-                font=ctk.CTkFont(size=12, weight="bold"),
                 text_color=color,
                 anchor="w",
                 justify="left",

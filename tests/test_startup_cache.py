@@ -134,6 +134,7 @@ def test_dashboard_startup_never_auto_refreshes() -> None:
     assert "not auto-running Refresh Next Two" in src
     leftover = src.replace("not auto-running Refresh Next Two", "")
     assert "auto-running Refresh Next Two" not in leftover
+    assert "_snapshot_matches_live_events" not in src
 
 
 def test_dashboard_pick_line_includes_odds() -> None:
@@ -162,7 +163,6 @@ def test_dashboard_pick_line_includes_odds() -> None:
     assert "def _pick_line_text" in dash
     assert "format_top_pick_line" in dash
     assert "self._odds_line(bet)" in dash
-    assert "_snapshot_matches_live_events" not in dash
 
 
 def test_nightly_scripts_are_5am_full_and_logon_auto() -> None:
