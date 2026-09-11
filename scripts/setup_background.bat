@@ -1,7 +1,7 @@
 @echo off
 REM Register Windows Task Scheduler jobs for UFC background processing.
-REM   UFC Bot Nightly  — full Next Two Cards run daily at 4:00 AM
-REM   UFC Bot Startup  — auto run on user logon (full if stale, else odds-only)
+REM   UFC Bot Nightly  — full Next Two Cards run daily at 5:00 AM (local)
+REM   UFC Bot Startup  — auto run on user logon (cache if fresh; full only if stale)
 
 setlocal EnableDelayedExpansion
 cd /d "%~dp0\.."
@@ -23,10 +23,18 @@ if not exist "%ROOT%\models\ensemble_winner.joblib" (
     )
 )
 
+set "HIDDEN=%ROOT%\scripts\run_background_hidden.vbs"
 set "RUNNER=%ROOT%\scripts\run_background.bat"
-if not exist "%RUNNER%" (
-    echo [FAIL] scripts\run_background.bat missing.
-    exit /b 1
+if exist "%HIDDEN%" (
+    set "NIGHTLY_CMD=wscript.exe \"%HIDDEN%\" full scheduled"
+    set "STARTUP_CMD=wscript.exe \"%HIDDEN%\" auto startup"
+) else (
+    if not exist "%RUNNER%" (
+        echo [FAIL] scripts\run_background.bat missing.
+        exit /b 1
+    )
+    set "NIGHTLY_CMD=cmd /c \"%RUNNER%\" full scheduled"
+    set "STARTUP_CMD=cmd /c \"%RUNNER%\" auto startup"
 )
 
 where schtasks >nul 2>&1
@@ -35,21 +43,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-set "NIGHTLY_CMD=cmd /c \"%RUNNER%\" full scheduled"
-set "STARTUP_CMD=cmd /c \"%RUNNER%\" auto startup"
-
-echo Removing legacy tasks (if present)...
+echo Removing legacy / overlapping tasks (if present)...
 schtasks /Delete /TN "UFC Bot Midnight" /F >nul 2>&1
 schtasks /Delete /TN "UFC Bot Sunday" /F >nul 2>&1
 
-echo Creating task: UFC Bot Nightly (daily 4:00 AM)...
-schtasks /Create /TN "UFC Bot Nightly" /TR "%NIGHTLY_CMD%" /SC DAILY /ST 04:00 /RL LIMITED /F
+echo Creating task: UFC Bot Nightly (daily 5:00 AM, one full run)...
+schtasks /Create /TN "UFC Bot Nightly" /TR "%NIGHTLY_CMD%" /SC DAILY /ST 05:00 /RL LIMITED /F
 if errorlevel 1 (
     echo [FAIL] Could not create UFC Bot Nightly task — try Run as Administrator.
     exit /b 1
 )
 
-echo Creating task: UFC Bot Startup (on user logon)...
+echo Creating task: UFC Bot Startup (on user logon, auto/cache — not a second full scrape)...
 schtasks /Create /TN "UFC Bot Startup" /TR "%STARTUP_CMD%" /SC ONLOGON /RL LIMITED /IT /F
 if errorlevel 1 (
     echo [WARN] ONLOGON task denied — installing Startup folder shortcut instead...
@@ -69,10 +74,15 @@ if errorlevel 1 (
 echo.
 echo === Setup complete ===
 echo   Tasks registered for: %ROOT%
+echo   Nightly: 5:00 AM local, mode=full (writes the snapshot morning open uses)
+echo   Logon:   mode=auto (cache if fresh; does not block the GUI)
 echo.
 echo   Verify:
 echo     schtasks /Query /TN "UFC Bot Nightly" /V /FO LIST
 echo     schtasks /Query /TN "UFC Bot Startup"
+echo.
+echo   Re-register (same as this script):
+echo     scripts\register_background_tasks.ps1
 echo.
 echo   Manual test:
 echo     scripts\run_background.bat full manual

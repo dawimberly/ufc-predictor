@@ -80,12 +80,16 @@ BetNow / DraftKings (and their Props tabs) appear only when those scrapers are e
 
 ### Toolbar
 
-**Profile** (Paper/Live) · **Event** · **Refresh** · **Soft Update** · **Restart** · **Full** · **Bankroll $**
+**Profile** (Paper/Live) · **Event** · **Refresh Next Two** · **Soft Update** · **Quick Odds + Props** · **Restart** · **Full** · **Bankroll $**
+
+Opening the GUI loads the last overnight snapshot (fights + odds + recommended bets with book/American/decimal). It does **not** auto-run Refresh Next Two.
 
 | Control | Behavior |
 |---------|----------|
-| **Refresh** | Load UFC.com next-two cards + predictions; reuses odds cache when `ODDS_FETCH_ONCE=true` |
-| **Soft Update** | Reload `.env` (config) + attach book lines/props from cache — no extra Odds API burn when fetch-once is on |
+| **Open GUI** | Disk snapshot → fights, books, recommended with odds (seconds). Stale (24–72h) shows `STALE CACHE — Refresh Next Two if the card changed`. Empty cache → `Ready — click Refresh Next Two`. |
+| **Refresh Next Two** | User-initiated: UFC.com cards + predictions; reuses odds cache when `ODDS_FETCH_ONCE=true` |
+| **Soft Update** | Re-attach **cached** book lines/props — no Odds API burn |
+| **Quick Odds + Props** | User-initiated live pull |
 | **Restart** | Quit and relaunch so `.env` / code load cleanly (needed after code changes; Soft Update does not reload modules) |
 | **Full** | Toggle fullscreen |
 | **Bankroll $** | Persisted roll; card budget = bankroll × profile risk % |
@@ -224,11 +228,21 @@ data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LG
 
 ## Background runner
 
+Nightly **UFC Bot Nightly** at **5:00 AM local** (`mode=full`) writes `data/cache/background/` — that is what morning open uses. Logon **UFC Bot Startup** is `mode=auto` (cache if the snapshot is fresh; not a second full card scrape).
+
 ```bash
 python src/background_runner.py --mode auto --trigger startup
+python src/background_runner.py --mode full --trigger scheduled
 ```
 
-Scheduled tasks run full analysis with **cache-first odds** when `ODDS_FETCH_ONCE=true`. Snapshots under `data/cache/background/`.
+Re-register Windows tasks after a time change:
+
+```bat
+scripts\register_background_tasks.ps1
+schtasks /Query /TN "UFC Bot Nightly"
+```
+
+Scheduled full runs stay **cache-first on odds** when `ODDS_FETCH_ONCE=true`. Do not add a second overlapping full analysis.
 
 ## EXE builds (optional)
 
