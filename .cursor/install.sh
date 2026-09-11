@@ -34,7 +34,7 @@ if [ ! -f "models/ensemble_winner.joblib" ]; then
   echo "[install] seeding historical fight data (public HuggingFace/GitHub CSV)"
   if python -c "from src.data_loader import load_historical_data as l; l(source='huggingface', incremental=False)"; then
     echo "[install] building features + training ensemble model"
-    python scripts/rebuild_features_train.py || echo "[install] model training skipped (non-fatal)"
+    PYTHONPATH="$PWD" python scripts/rebuild_features_train.py || echo "[install] model training skipped (non-fatal)"
   else
     echo "[install] dataset download failed (non-fatal) — GUI and tests still work"
   fi
