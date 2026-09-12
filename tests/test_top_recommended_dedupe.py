@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from src.bet_slip import (
+    annotate_paper_wide_override,
     dedupe_rank_top_tickets,
     ticket_dedupe_key,
     ticket_is_better,
+    ticket_is_sky_blue,
     top_recommended_label,
 )
 
@@ -218,3 +220,84 @@ def test_fight_id_pipe_vs_label_collapses() -> None:
     assert float(ha_rows[0].get("stake_usd") or 0) == 5.0
     # Fun MyBookie must not duplicate HA Odds API key
     assert ("odds api" not in ticket_dedupe_key(fun)[3] or True)
+
+
+def _sky_blue_override_ticket(name: str = "Chairez") -> dict:
+    """A paper_wide_override single as it can reach the slip with a *stale*
+    FUN ONLY stamp: green tier, fun_bet True, zeroed stake_pct — but the Kelly
+    status string still carries the '1.00% paper_wide_override' override."""
+    return {
+        "fight_id": f"{name.lower()}-fight",
+        "fight": f"{name} vs Elliott",
+        "market_type": "moneyline",
+        "market": "moneyline",
+        "pick": name,
+        "side": f"{name} over Elliott",
+        "display_label": f"{name} ML",
+        "book": "Odds API",
+        "edge": 0.105,
+        "edge_pct": 10.5,
+        "stake_usd": 0.0,
+        "suggested_stake": 0.0,
+        "stake_pct": 0.0,
+        "status": "1.00% paper_wide_override",
+        "uncertainty_reason": "paper_wide_override",
+        "bet_tier": "green",
+        "fun_bet": True,
+        "advisory": True,
+    }
+
+
+def test_paper_wide_override_minted_sky_blue_not_fun_only(monkeypatch) -> None:
+    """Regression: Overview shows Sky Blue, so the Top 5 must too — not FUN ONLY $0."""
+    import config
+
+    monkeypatch.setattr(config, "is_paper_profile", lambda: True)
+
+    t = _sky_blue_override_ticket()
+    assert ticket_is_sky_blue(t) is True
+    annotate_paper_wide_override(t)
+    assert t["bet_tier"] == "sky_blue"
+    assert t["fun_bet"] is False
+    assert t["advisory"] is False
+
+    # In the ranked Top 5 it must sit above green FUN, tagged Sky Blue.
+    green_fun = _ml("GreenGuy", edge=0.15, stake=0.0, tier="green")
+    green_fun["fun_bet"] = True
+    green_fun["advisory"] = True
+    shown = dedupe_rank_top_tickets(
+        [green_fun, _sky_blue_override_ticket()], limit=5, event="UFC Test"
+    )
+    tiers = [str(x.get("bet_tier")) for x in shown]
+    assert tiers[0] == "sky_blue", tiers
+    assert shown[0].get("rank") == 1
+
+
+def test_live_profile_cannot_mint_sky_blue(monkeypatch) -> None:
+    """Live stays fail-closed: a wide-CI override never becomes Sky Blue."""
+    import config
+
+    monkeypatch.setattr(config, "is_paper_profile", lambda: False)
+
+    t = _sky_blue_override_ticket()
+    assert ticket_is_sky_blue(t) is False
+    annotate_paper_wide_override(t)
+    assert t["bet_tier"] == "green"  # untouched
+    assert t["fun_bet"] is True
+
+
+def test_bare_skip_wide_stays_green(monkeypatch) -> None:
+    """Blaydes/Rahiki pattern: bare SKIP:wide (no override %) is not Sky Blue."""
+    import config
+
+    monkeypatch.setattr(config, "is_paper_profile", lambda: True)
+
+    t = _ml("Blaydes", edge=0.20, stake=0.0, tier="green")
+    t["fun_bet"] = True
+    t["advisory"] = True
+    t["stake_pct"] = 0.0
+    t["status"] = "SKIP:wide"
+    t["uncertainty_reason"] = "wide_interval"
+    assert ticket_is_sky_blue(t) is False
+    annotate_paper_wide_override(t)
+    assert t["bet_tier"] == "green"

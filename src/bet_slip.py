@@ -359,6 +359,55 @@ def ticket_clears_gates(ticket: dict[str, Any]) -> bool:
     return False
 
 
+def ticket_is_sky_blue(ticket: dict[str, Any]) -> bool:
+    """True when a slip ticket is a Paper sky-blue (paper_wide_override) pick.
+
+    Mirrors Overview's ``bet_tiers.is_sky_blue_ticket`` so the Top 5 agrees with
+    the Overview color. A stale FUN ONLY stamp can zero ``stake_pct``; when that
+    happens we treat the pct as *missing* (not a hard zero) so the Kelly status
+    string (e.g. ``"1.00% paper_wide_override"``) can still mint Sky Blue. Live
+    profile can never mint Sky Blue (enforced inside ``is_sky_blue_ticket``).
+    """
+    try:
+        from src.bet_tiers import is_sky_blue_ticket
+    except Exception:
+        return False
+    stake_pct: Any = ticket.get("stake_pct")
+    if _safe_float(stake_pct) <= 0 and (ticket.get("fun_bet") or ticket.get("advisory")):
+        stake_pct = None
+    status = (
+        ticket.get("status")
+        or ticket.get("kelly_status")
+        or ticket.get("kelly")
+        or ""
+    )
+    return bool(
+        is_sky_blue_ticket(
+            stake_pct=stake_pct,
+            stake_usd=ticket.get("stake_usd") or ticket.get("suggested_stake"),
+            uncertainty_reason=ticket.get("uncertainty_reason"),
+            status=status,
+        )
+    )
+
+
+def annotate_paper_wide_override(ticket: dict[str, Any]) -> dict[str, Any]:
+    """Stamp a Paper sky-blue override ticket so the Top 5 ranks/labels it as
+    Sky Blue (TINY PAPER BET) instead of dropping it to FUN ONLY $0.
+
+    No-op for non-override tickets, so a bare ``SKIP:wide`` / ``wide_interval``
+    (with no override %) stays Green.
+    """
+    if not isinstance(ticket, dict):
+        return ticket
+    if ticket_is_sky_blue(ticket):
+        ticket["bet_tier"] = "sky_blue"
+        ticket["tier"] = "sky_blue"
+        ticket["fun_bet"] = False
+        ticket["advisory"] = False
+    return ticket
+
+
 def _ticket_edge(ticket: dict[str, Any]) -> float:
     edge = ticket.get("edge")
     if edge is not None:
@@ -402,6 +451,10 @@ def _rank_bucket(ticket: dict[str, Any]) -> int:
         tier = "yellow"
     if tier in {"sky", "skyblue", "light_blue", "lightblue"}:
         tier = "sky_blue"
+    # A paper_wide_override single can arrive with a stale green/fun stamp;
+    # detect true Sky Blue before trusting a green/yellow/red tier.
+    if tier != "blue" and ticket_is_sky_blue(ticket):
+        return 1
     order = {"blue": 0, "sky_blue": 1, "green": 2, "yellow": 3, "red": 4}
     if tier in order:
         return order[tier]
@@ -457,7 +510,11 @@ def dedupe_rank_top_tickets(
     import logging
 
     logger = log or logging.getLogger(__name__)
-    raw = [dict(t) for t in (tickets or []) if isinstance(t, dict)]
+    raw = [
+        annotate_paper_wide_override(dict(t))
+        for t in (tickets or [])
+        if isinstance(t, dict)
+    ]
     raw_n = len(raw)
 
     # Pass 1: exact ticket_dedupe_key collapse (fight, market, selection, book)
