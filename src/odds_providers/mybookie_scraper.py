@@ -17,6 +17,7 @@ from src.odds_providers.prop_odds_common import (
     empty_prop_odds_df,
     parse_american_odds,
     prop_row,
+    totals_prop_key,
 )
 from src.predictor import OddsAPIError, _implied_probs
 
@@ -186,12 +187,13 @@ def _parse_totals_props(soup) -> list[dict[str, Any]]:
                 game_id = str(btn.get("data-gameid", "")).strip()
             american = parse_american_odds(str(btn.get("data-odd", "")))
             if re.search(r"\bO\b|over", text, re.I):
+                pk, sel = totals_prop_key(point, "over")
                 props.append(
                     prop_row(
                         fighter_1=f1_name,
                         fighter_2=f2_name,
-                        prop_key="over_1_5_rounds",
-                        selection="Over 1.5",
+                        prop_key=pk,
+                        selection=sel,
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",
@@ -202,12 +204,13 @@ def _parse_totals_props(soup) -> list[dict[str, Any]]:
                     )
                 )
             elif re.search(r"\bU\b|under", text, re.I):
+                pk, sel = totals_prop_key(point, "under")
                 props.append(
                     prop_row(
                         fighter_1=f1_name,
                         fighter_2=f2_name,
-                        prop_key="round_1_finish",
-                        selection="Under 1.5",
+                        prop_key=pk,
+                        selection=sel,
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",
@@ -302,12 +305,13 @@ def _parse_prop_buttons(soup, *, f1_default: str = "", f2_default: str = "", gam
                 point = 1.5
             american = parse_american_odds(str(btn.get("data-odd", "")))
             if re.search(r"\bO\b|over", text, re.I):
+                pk, sel = totals_prop_key(point, "over")
                 props.append(
                     prop_row(
                         fighter_1=fight_f1,
                         fighter_2=fight_f2,
-                        prop_key="over_1_5_rounds",
-                        selection="Over 1.5",
+                        prop_key=pk,
+                        selection=sel,
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",
@@ -318,12 +322,13 @@ def _parse_prop_buttons(soup, *, f1_default: str = "", f2_default: str = "", gam
                     )
                 )
             elif re.search(r"\bU\b|under", text, re.I):
+                pk, sel = totals_prop_key(point, "under")
                 props.append(
                     prop_row(
                         fighter_1=fight_f1,
                         fighter_2=fight_f2,
-                        prop_key="round_1_finish",
-                        selection="Under 1.5",
+                        prop_key=pk,
+                        selection=sel,
                         decimal_odds=odd,
                         bookmaker="MyBookie",
                         odds_source="live",

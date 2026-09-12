@@ -94,6 +94,27 @@ def prop_row(
     }
 
 
+def totals_prop_key(point: float | None, side: str) -> tuple[str, str]:
+    """Map a round-total (point) + side to (prop_key, selection).
+
+    Only a 1.5 line is HA-actionable — it maps to ``over_1_5_rounds`` /
+    ``round_1_finish``. Any other total (e.g. 2.5) keeps its real point in the
+    key/label so it is NOT treated as an Over 1.5 bet by HA sizing
+    (ALLOWED_PROP_KEYS = {"over_1_5_rounds"}). A 2.5 total is a different bet.
+    """
+    try:
+        pt = float(point) if point is not None else 1.5
+    except (TypeError, ValueError):
+        pt = 1.5
+    is_over = str(side).strip().lower().startswith("o")
+    if abs(pt - 1.5) <= 0.05:
+        return ("over_1_5_rounds", "Over 1.5") if is_over else ("round_1_finish", "Under 1.5")
+    label = f"{pt:g}"
+    if is_over:
+        return (f"over_{label}_rounds", f"Over {label}")
+    return (f"under_{label}_rounds", f"Under {label}")
+
+
 def empty_prop_odds_df() -> pd.DataFrame:
     return pd.DataFrame(columns=PROP_ODDS_COLUMNS)
 
