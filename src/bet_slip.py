@@ -13,4 +13,5 @@ def short_name(fighter: str) -> str:
     parts = text.split()
     if len(parts) == 1:
         return parts[0]
+    # Keep hyphenated last names; drop common suffixes already attached.
     return parts[-1]
