@@ -705,6 +705,15 @@ class FightPredictor:
                 out,
                 force_refresh=force_refresh_odds,
             )
+            # Execution-book overlay (DraftKings / MyBookie) for CLV / "what I
+            # can actually click" — never changes pick, prob, edge, or HA tier.
+            if getattr(config, "DRAFTKINGS_ENABLED", False) or getattr(
+                config, "MYBOOKIE_ENABLED", False
+            ):
+                try:
+                    out = attach_execution_book_odds(out, force_refresh=force_refresh_odds)
+                except Exception as exc:  # pragma: no cover - provider/network
+                    logger.warning("Execution-book overlay skipped: %s", exc)
         from src.gym_data import attach_gym_features
 
         # Re-attach after cache so gym CSV edits apply without invalidating predictions.
@@ -1208,6 +1217,85 @@ def merge_predictions_with_odds(
             matched_n,
             len(out),
         )
+    return out
+
+
+def attach_execution_book_odds(
+    preds: pd.DataFrame,
+    *,
+    dk_odds: pd.DataFrame | None = None,
+    mybookie_odds: pd.DataFrame | None = None,
+    fetch_if_missing: bool = True,
+    force_refresh: bool = False,
+) -> pd.DataFrame:
+    """Overlay execution-book prices/edges next to the Odds API consensus.
+
+    For each fight row, attaches the pick-side decimal price and EV edge
+    (``p_model * o_book - 1``) for the consensus, DraftKings, and MyBookie:
+    ``odds_api``/``edge_api``, ``odds_dk``/``edge_dk``, ``odds_mb``/``edge_mb``.
+
+    These are for CLV / "what I can actually click" only. The model pick, model
+    probability, consensus edge, and HA tier are never changed here. A missing
+    book/side is left blank; the row is not fail-closed as long as consensus
+    odds exist (``odds_matched``).
+    """
+    out = preds.copy()
+    if out.empty:
+        return out
+
+    for col in ("odds_api", "edge_api", "odds_dk", "edge_dk", "odds_mb", "edge_mb"):
+        if col not in out.columns:
+            out[col] = np.nan
+
+    # Execution books are opt-in and cache-first (honor ODDS_FETCH_ONCE via the
+    # providers' own ensure_live_odds_api_allowed). Never poll.
+    if dk_odds is None and fetch_if_missing and getattr(config, "DRAFTKINGS_ENABLED", False):
+        try:
+            from src.odds_providers.draftkings import fetch_draftkings_odds
+
+            dk_odds = fetch_draftkings_odds(force_refresh=force_refresh)
+        except Exception as exc:  # pragma: no cover - provider/network
+            logger.warning("DraftKings execution odds unavailable: %s", exc)
+    if mybookie_odds is None and fetch_if_missing and getattr(config, "MYBOOKIE_ENABLED", False):
+        try:
+            from src.odds_providers.mybookie_scraper import fetch_mybookie_odds
+
+            mybookie_odds = fetch_mybookie_odds(force_refresh=force_refresh)
+        except Exception as exc:  # pragma: no cover - provider/network
+            logger.warning("MyBookie execution odds unavailable: %s", exc)
+
+    def _pick_side_odds(match: pd.Series | None, pick_f1: bool) -> float | None:
+        if match is None:
+            return None
+        try:
+            val = float(match["f1_odds"] if pick_f1 else match["f2_odds"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        return val if val and val > 1.0 else None
+
+    for idx, row in out.iterrows():
+        model_p1 = float(row.get("prob_f1_win", 0.5) or 0.5)
+        model_p2 = float(row.get("prob_f2_win", 1.0 - model_p1) or (1.0 - model_p1))
+        pick_f1 = model_p1 >= model_p2
+        p_pick = model_p1 if pick_f1 else model_p2
+
+        o_api = _pick_side_odds(row, pick_f1)
+        if o_api is not None:
+            out.at[idx, "odds_api"] = round(o_api, 3)
+            out.at[idx, "edge_api"] = round(p_pick * o_api - 1.0, 4)
+
+        f1 = _fighter_name(row, 1)
+        f2 = _fighter_name(row, 2)
+        for book_df, o_col, e_col in (
+            (dk_odds, "odds_dk", "edge_dk"),
+            (mybookie_odds, "odds_mb", "edge_mb"),
+        ):
+            if book_df is None or getattr(book_df, "empty", True):
+                continue
+            o_book = _pick_side_odds(_lookup_odds_row(f1, f2, book_df), pick_f1)
+            if o_book is not None:
+                out.at[idx, o_col] = round(o_book, 3)
+                out.at[idx, e_col] = round(p_pick * o_book - 1.0, 4)
     return out
 
 
