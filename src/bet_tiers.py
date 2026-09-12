@@ -725,6 +725,132 @@ def format_tier_legend() -> str:
     )
 
 
+def _decimal_odds_value(bet: dict[str, Any] | None) -> float | None:
+    b = bet or {}
+    for key in ("decimal_odds", "combined_odds"):
+        raw = b.get(key)
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if val > 1.0:
+            return val
+    display = str(b.get("odds_display") or "").strip()
+    if display and display not in ("-", "None", "nan"):
+        try:
+            val = float(display)
+        except ValueError:
+            return None
+        if val > 1.0:
+            return val
+    return None
+
+
+def _american_odds_text(bet: dict[str, Any] | None) -> str:
+    b = bet or {}
+    am = str(b.get("american_odds") or "").strip()
+    if am and am not in ("-", "None", "nan"):
+        return am
+    dec = _decimal_odds_value(b)
+    if dec is None:
+        return "-"
+    if dec >= 2.0:
+        return f"+{int(round((dec - 1.0) * 100))}"
+    denom = dec - 1.0
+    if denom <= 0:
+        return "-"
+    return str(int(round(-100.0 / denom)))
+
+
+def _decimal_odds_text(bet: dict[str, Any] | None) -> str:
+    b = bet or {}
+    display = str(b.get("odds_display") or "").strip()
+    if display and display not in ("-", "None", "nan"):
+        return display
+    dec = _decimal_odds_value(b)
+    if dec is None:
+        return "-"
+    return f"{dec:.2f}"
+
+
+def format_odds_line(bet: dict[str, Any] | None) -> str:
+    """Book + American + decimal, e.g. 'Odds API  -145 (1.69)'."""
+    b = bet or {}
+    book = str(b.get("book") or "-").strip() or "-"
+    return f"{book}  {_american_odds_text(b)} ({_decimal_odds_text(b)})"
+
+
+def _prob_as_fraction(raw: Any) -> float | None:
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if val != val:  # NaN
+        return None
+    if val > 1.0:
+        val = val / 100.0
+    if val <= 0.0 or val > 1.0:
+        return None
+    return val
+
+
+def format_pick_price_stats(bet: dict[str, Any] | None) -> str:
+    """Model % / implied % / edge extras when those fields exist."""
+    b = bet or {}
+    parts: list[str] = []
+    model = _prob_as_fraction(b.get("prob") if b.get("prob") is not None else b.get("model_prob"))
+    if model is not None:
+        parts.append(f"model {model:.0%}")
+    implied = _prob_as_fraction(b.get("implied_prob") if b.get("implied_prob") is not None else b.get("mkt_implied_prob"))
+    if implied is None:
+        dec = _decimal_odds_value(b)
+        if dec is not None:
+            implied = 1.0 / dec
+    if implied is not None:
+        parts.append(f"implied {implied:.0%}")
+    edge = b.get("edge_pct")
+    if edge is None and b.get("edge") is not None:
+        try:
+            edge = float(b["edge"]) * 100.0
+        except (TypeError, ValueError):
+            edge = None
+    if edge is not None:
+        try:
+            parts.append(f"edge {float(edge):+.1f}%")
+        except (TypeError, ValueError):
+            pass
+    return "  ·  ".join(parts)
+
+
+def format_top_pick_line(bet: dict[str, Any], rank: int) -> tuple[str, str]:
+    """Overview Top recommended line: rank, action, pick, odds, stats, edge."""
+    # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
+    tier = str(bet.get("bet_tier") or "").strip().lower()
+    if tier not in TIER_COLORS:
+        if bet.get("fun_bet") or bet.get("advisory"):
+            tier = TIER_GREEN
+        else:
+            stake = _safe_float(bet.get("suggested_stake"))
+            if stake is None:
+                stake = _safe_float(bet.get("stake_usd"))
+            tier = TIER_BLUE if stake is not None and stake > 0 else TIER_YELLOW
+    color = TIER_COLORS.get(tier, "#e2e8f0")
+    label = str(
+        bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
+    )
+    edge_pct = float(bet.get("edge_pct") or 0)
+    action = action_label_for_bet({**bet, "bet_tier": tier})
+    odds = format_odds_line(bet)
+    stats = format_pick_price_stats(bet)
+    bits = [f"#{rank}", action, label, odds]
+    if stats:
+        bits.append(stats)
+    else:
+        bits.append(f"{edge_pct:+.1f}%")
+    line = "  ·  ".join(bits)
+    return line, color
+
+
 def action_label_for_bet(bet: dict[str, Any] | None) -> str:
     """Return plain action for UI/prompt: BET THIS / FUN ONLY / DO NOT BET."""
     b = bet or {}
@@ -1132,7 +1258,10 @@ def _line(b: dict[str, Any], rank: int, *, fun: bool = False) -> str:
     prob_s = f"{float(prob):.0%}" if prob is not None else "n/a"
     action = action_label_for_bet({**b, "fun_bet": fun or b.get("fun_bet")})
     fight_s = f" | {fight}" if fight and fight not in side else ""
+    odds = format_odds_line(b)
+    stats = format_pick_price_stats(b)
+    extra = stats if stats else f"edge {edge_s} · prob {prob_s}"
     return (
-        f"{rank}. {action} · [{market}] {side}{fight_s} · edge {edge_s} · "
-        f"prob {prob_s} · {reason}"
+        f"{rank}. {action} · [{market}] {side}{fight_s} · {odds} · "
+        f"{extra} · {reason}"
     )

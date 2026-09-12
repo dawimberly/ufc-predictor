@@ -2042,33 +2042,18 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
 
     @staticmethod
     def _odds_line(bet: dict[str, Any]) -> str:
-        book = str(bet.get("book") or "-")
-        am = str(bet.get("american_odds") or "-")
-        dec = str(bet.get("odds_display") or "-")
-        return f"{book}  {am} ({dec})"
+        from src.bet_tiers import format_odds_line
+
+        return format_odds_line(bet)
 
     def _pick_line_text(self, bet: dict[str, Any], rank: int) -> tuple[str, str]:
         """Return (display line, tier color) for one pick inside the shared bubble."""
-        from src.bet_tiers import TIER_COLORS, action_label_for_bet
+        from src.bet_tiers import format_top_pick_line
 
-        # Prefer bet_tier only — bet["tier"] is often actionable/advisory, not a color.
-        tier = str(bet.get("bet_tier") or "").strip().lower()
-        if tier not in TIER_COLORS:
-            if bet.get("fun_bet") or bet.get("advisory"):
-                tier = "green"
-            else:
-                tier = (
-                    "blue"
-                    if float(bet.get("suggested_stake") or bet.get("stake_usd") or 0) > 0
-                    else "yellow"
-                )
-        color = TIER_COLORS.get(tier, "#e2e8f0")
-        label = str(
-            bet.get("display_label") or bet.get("pick_line") or bet.get("pick") or "-"
-        )
-        edge_pct = float(bet.get("edge_pct") or 0)
-        action = action_label_for_bet({**bet, "bet_tier": tier})
-        line = f"#{rank}  {action}  ·  {label}  ·  {edge_pct:+.1f}%"
+        line, color = format_top_pick_line(bet, rank)
+        odds = self._odds_line(bet)
+        if odds and odds not in line:
+            line = f"{line}  ·  {odds}"
         return _ascii_ui(line), color
 
     def _render_picks_bubble(self, bets: list[dict[str, Any]]) -> None:
@@ -2113,7 +2098,7 @@ class TopRecommendedBetsPanel(_CTK_FRAME):
                 anchor="w",
                 justify="left",
                 wraplength=900,
-            ).pack(fill="x", padx=14, pady=(0, 2))
+            ).pack(fill="x", padx=14, pady=(0, 4))
 
         ctk.CTkLabel(
             bubble,
@@ -2837,6 +2822,8 @@ class GrokAnalysisPanel(_CTK_FRAME):
             TIER_COLORS,
             TIER_LABELS,
             action_label_for_bet,
+            format_odds_line,
+            format_pick_price_stats,
             format_tier_legend,
             format_what_to_do_header,
         )
@@ -2901,8 +2888,12 @@ class GrokAnalysisPanel(_CTK_FRAME):
             color = TIER_COLORS.get(bet_tier, "#e2e8f0")
             action = action_label_for_bet({**bet, "bet_tier": bet_tier})
             edge_s = f"{float(edge):+.1f}%" if edge is not None else "n/a"
+            odds = format_odds_line(bet)
+            stats = format_pick_price_stats(bet)
+            extra = stats if stats else f"edge {edge_s}"
             line = (
-                f"#{rank}  {action}  ·  {side}  ·  {market} @ {book}  ·  edge {edge_s}"
+                f"#{rank}  {action}  ·  {side}  ·  {market} @ {book}  ·  "
+                f"{odds}  ·  {extra}"
             )
             ctk.CTkLabel(
                 bubble,
@@ -5018,57 +5009,44 @@ class UFCDashboardApp(_CTK_BASE):
         _dashboard_heartbeat("dashboard controls enabled (mainloop alive)")
 
     def _load_background_cache_on_startup(self) -> None:
-        """Load background snapshot on startup only if it matches live upcoming events."""
+        """Open = disk snapshot only. Never auto-run Refresh Next Two."""
         if self._busy or self._payload is not None:
             return
 
         def worker() -> None:
             try:
-                from src.background_runner import load_background_snapshot
-                from src.dashboard_service import _snapshot_matches_live_events
+                from src.background_runner import load_startup_background_snapshot
 
-                data = load_background_snapshot(max_age_hours=24)
+                data, meta = load_startup_background_snapshot()
+                status = str(meta.get("status") or "Ready — click Refresh Next Two")
                 if data is None:
-                    data = load_background_snapshot(max_age_hours=72)
-                    if data:
-                        _debug_log("Startup: considering stale background cache (24-72h)")
-                if data is not None and not _snapshot_matches_live_events(data):
-                    _debug_log(
-                        "Startup: skipping background cache - events do not match live slate "
-                        f"({data.get('event_label')!r})"
-                    )
-                    data = None
-                if data is None:
-                    self.after(
-                        0,
-                        lambda: self._set_status(
-                            'Ready - click "Refresh Next Two" (no background cache).'
-                        ),
-                    )
-                    self.after(800, self._auto_refresh_if_empty)
+                    _debug_log("Startup: no background snapshot — waiting for user Refresh Next Two")
+                    self.after(0, lambda s=status: self._set_status(s))
                     return
 
                 payload = _result_to_payload(data)
                 manifest = data.get("_manifest") or {}
                 full_ts = self._iso_to_epoch(manifest.get("full_run_at") or manifest.get("saved_at"))
                 odds_ts = self._iso_to_epoch(manifest.get("odds_updated_at"))
+                stale = bool(meta.get("stale") or meta.get("past_event"))
+                if stale:
+                    _debug_log(f"Startup: using stale background cache — {status}")
+                else:
+                    _debug_log(f"Startup: loaded overnight snapshot — {status}")
 
                 def apply() -> None:
                     if self._payload is not None or self._busy:
                         return
                     self.event_var.set("Next Two Cards")
+                    self._sync_profile_menu(payload.profile)
+                    self._log_loaded_fights("overnight snapshot", payload)
+                    # Do not pass full_refresh=True — that would stamp "just refreshed" as now.
+                    self._apply_payload(payload, full_refresh=False, odds_refresh=False)
                     if full_ts is not None:
                         self._last_full_refresh_ts = full_ts
                     if odds_ts is not None:
                         self._last_odds_ts = odds_ts
-                    trigger = manifest.get("trigger", "background")
-                    run_type = manifest.get("run_type", "full")
-                    self._sync_profile_menu(payload.profile)
-                    self._log_loaded_fights("background cache", payload)
-                    self._apply_payload(payload, full_refresh=bool(full_ts), odds_refresh=bool(odds_ts))
-                    self._set_status(
-                        f"Loaded background cache ({run_type}/{trigger}) - {payload.event_label}"
-                    )
+                    self._set_status(status)
 
                 self.after(0, apply)
             except Exception as exc:
@@ -5076,20 +5054,18 @@ class UFCDashboardApp(_CTK_BASE):
                 self.after(
                     0,
                     lambda: self._set_status(
-                        f"Ready - click Refresh Next Two (cache load failed: {exc})."
+                        f"Ready — click Refresh Next Two (cache load failed: {exc})."
                     ),
                 )
-                self.after(800, self._auto_refresh_if_empty)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _auto_refresh_if_empty(self) -> None:
-        """First launch with no cache: run Next Two Cards refresh automatically."""
+        """Disabled: GUI open must not start Refresh Next Two by itself."""
         if self._payload is not None or self._busy:
             return
-        _debug_log("No payload on startup - auto-running Refresh Next Two")
-        self.event_var.set("Next Two Cards")
-        self._on_refresh()
+        _debug_log("No payload on startup - not auto-running Refresh Next Two")
+        self._set_status("Ready — click Refresh Next Two")
 
     @staticmethod
     def _iso_to_epoch(ts: str | None) -> float | None:
