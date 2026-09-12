@@ -5546,6 +5546,112 @@ class UFCDashboardApp(_CTK_BASE):
             self.top_bets_panel.render(
                 items, pool_status=status, empty_reason=empty_reason
             )
+            if hasattr(self, "bets_only_panel"):
+                money = [
+                    b
+                    for b in items
+                    if str(b.get("bet_tier") or "").lower() in {"blue", "sky_blue"}
+                    and not b.get("fun_bet")
+                    and float(b.get("suggested_stake") or 0) > 0
+                ]
+                self.bets_only_panel.render(
+                    money,
+                    pool_status=status,
+                    empty_reason=(
+                        empty_reason
+                        or "No BET THIS / TINY PAPER BET tickets — nothing cleared HA gates."
+                    ),
+                )
+            if hasattr(self, "paper_summary_label"):
+                self._refresh_paper_book()
+
+    def _build_paper_book_tab(self) -> None:
+        """Theoretical paper-betting account: balance, ROI, positions, equity."""
+        self.tab_paper.grid_columnconfigure(0, weight=1)
+        self.tab_paper.grid_rowconfigure(1, weight=1)
+        header = ctk.CTkFrame(self.tab_paper, fg_color="transparent")
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 4))
+        self.paper_summary_label = ctk.CTkLabel(
+            header,
+            text="Paper book: no bets yet.",
+            anchor="w",
+            justify="left",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#bfdbfe",
+        )
+        self.paper_summary_label.pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            header, text="Refresh", width=90, command=self._refresh_paper_book
+        ).pack(side="right")
+        self.paper_scroll = ctk.CTkScrollableFrame(
+            self.tab_paper, fg_color="#0f172a", label_text="Positions (open + settled)"
+        )
+        self.paper_scroll.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        self._refresh_paper_book()
+
+    def _refresh_paper_book(self) -> None:
+        try:
+            from src.paper_book import (
+                open_positions,
+                paper_book_summary,
+                settled_positions,
+            )
+
+            summary = paper_book_summary()
+            opens = open_positions()
+            setts = settled_positions()
+        except Exception as exc:  # pragma: no cover - defensive UI
+            if hasattr(self, "paper_summary_label"):
+                self.paper_summary_label.configure(
+                    text=_ascii_ui(f"Paper book unavailable: {exc}")
+                )
+            return
+
+        txt = (
+            f"Balance ${summary['balance']:,.2f}  "
+            f"(start ${summary['start_bankroll']:,.0f} · "
+            f"P&L ${summary['realized_pnl']:+,.2f} · ROI {summary['roi_pct']:+.1f}%)     "
+            f"Settled {summary['settled_count']} · Win {summary['hit_rate_pct']:.0f}%     "
+            f"Open {summary['open_count']} (${summary['open_exposure']:,.2f} at risk)"
+        )
+        self.paper_summary_label.configure(text=_ascii_ui(txt))
+
+        for w in self.paper_scroll.winfo_children():
+            w.destroy()
+
+        def _row(text: str, color: str) -> None:
+            ctk.CTkLabel(
+                self.paper_scroll,
+                text=_ascii_ui(text),
+                anchor="w",
+                justify="left",
+                font=ctk.CTkFont(size=12),
+                text_color=color,
+            ).pack(fill="x", padx=10, pady=1)
+
+        if not opens and not setts:
+            _row("No paper bets yet — run Refresh Next Two to auto-place this card's tickets.", "#94a3b8")
+            return
+
+        if opens:
+            _row(f"OPEN ({len(opens)}):", "#57B9FF")
+            for r in opens:
+                _row(
+                    f"  {r.get('fight','')} · {r.get('pick','')} @ {r.get('odds','')} "
+                    f"· ${r.get('stake','')} · {str(r.get('tier','')).upper()}",
+                    "#bfdbfe",
+                )
+        if setts:
+            _row(f"SETTLED ({len(setts)}):", "#cbd5e1")
+            for r in sorted(setts, key=lambda x: str(x.get("settled_at") or "")):
+                pnl = r.get("pnl", "")
+                won = str(r.get("correct")) == "1"
+                _row(
+                    f"  {r.get('fight','')} · {r.get('pick','')} @ {r.get('odds','')} "
+                    f"· ${r.get('stake','')} → {'WIN' if won else 'LOSS'} "
+                    f"P&L ${pnl} · bal ${r.get('balance_after','')}",
+                    "#4ade80" if won else "#f87171",
+                )
 
     def _build_control_header(self) -> None:
         """Slim top bar: Profile · Event · actions · Bankroll."""
@@ -5664,6 +5770,8 @@ class UFCDashboardApp(_CTK_BASE):
     def _build_tabs(self) -> None:
         self.tabs = ctk.CTkTabview(self)
 
+        # "Bets" first so it is the default view — just which bets to make.
+        self.tab_bets = self.tabs.add("Bets")
         self.tab_overview = self.tabs.add("Overview")
         self.tab_odds_api = self.tabs.add("Odds API")
         # Optional scraper books — only when enabled in .env
@@ -5690,6 +5798,7 @@ class UFCDashboardApp(_CTK_BASE):
             self.tab_props_mybookie = self.tabs.add("Props - MyBookie")
         self.tab_risk = self.tabs.add("Risk Analysis")
         self.tab_grok = self.tabs.add("Ollama Analysis")
+        self.tab_paper = self.tabs.add("Paper Book")
 
         # Overview: one full-page scroll hosts fights + top bets (no clipped bottom panel).
         self.tab_overview.grid_columnconfigure(0, weight=1)
@@ -5737,6 +5846,19 @@ class UFCDashboardApp(_CTK_BASE):
         self.top_bets_panel.pack(fill="x", padx=8, pady=(2, 6))
         self.gane_foul_panel = GaneFoulScenarioPanel(self.overview_page)
         self.gane_foul_panel.pack_forget()
+
+        # Bets tab — only which bets to make (BET THIS / TINY PAPER BET).
+        self.tab_bets.grid_columnconfigure(0, weight=1)
+        self.tab_bets.grid_rowconfigure(0, weight=1)
+        self.bets_page = ctk.CTkScrollableFrame(
+            self.tab_bets, fg_color="transparent", label_text="Bets to make"
+        )
+        self.bets_page.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
+        self.bets_only_panel = TopRecommendedBetsPanel(self.bets_page)
+        self.bets_only_panel.pack(fill="x", padx=8, pady=(6, 6))
+
+        # Paper Book tab — theoretical auto-betting account (Odds API priced).
+        self._build_paper_book_tab()
 
         self.grok_panel = GrokAnalysisPanel(
             self.tab_grok,
