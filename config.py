@@ -561,6 +561,19 @@ PREDICTION_LESSONS_JSON = DATA_DIR / "prediction_lessons.json"
 PREDICTION_BANK_THINK_MODEL = os.getenv("PREDICTION_BANK_THINK_MODEL", "deepseek-r1:8b")
 PREDICTION_BANK_THINK_TIMEOUT_SEC = int(os.getenv("PREDICTION_BANK_THINK_TIMEOUT_SEC", "600"))
 PREDICTION_BANK_AUTO_LOG = env_bool("PREDICTION_BANK_AUTO_LOG", "true")
+
+# --- Paper book (automated theoretical paper-betting account, Odds API priced) ---
+# A self-contained paper account that auto-places the model's money tickets
+# (Deep Blue / Sky Blue), prices and settles them off The Odds API odds, and
+# tracks a running balance + equity curve. Independent of the manual bankroll
+# and of any real book you bet on yourself. Reads cached odds only — never
+# spends Odds API credits.
+PAPER_BOOK_ENABLED = env_bool("PAPER_BOOK_ENABLED", "true")
+PAPER_BOOK_CSV = DATA_DIR / "paper_book.csv"
+PAPER_BOOK_STATE_JSON = DATA_DIR / "paper_book_state.json"
+PAPER_BOOK_START_BANKROLL = float(os.getenv("PAPER_BOOK_START_BANKROLL", "1000"))
+# Only price/settle off these books (The Odds API + the Overview default).
+PAPER_BOOK_ALLOWED_BOOKS = ("odds api", "")
 NARRATIVE_TILT_LOG = LOG_DIR / "narrative_tilts.jsonl"
 HEARTBEAT_PATH = CACHE_DIR / "heartbeat.json"
 CIRCUIT_BREAKER_STATE_PATH = CACHE_DIR / "circuit_breaker_state.json"

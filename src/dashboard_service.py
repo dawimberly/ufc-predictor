@@ -1392,6 +1392,18 @@ def run_full_analysis(
         except Exception as exc:
             logger.warning("Prediction bank update failed: %s", exc)
 
+    # Auto-place the card's money tickets into the theoretical paper book, then
+    # settle any finished ones (fail-soft; Odds-API priced; 0 API credits).
+    if bool(getattr(config, "PAPER_BOOK_ENABLED", True)):
+        try:
+            from src.paper_book import auto_run_from_result
+
+            result["paper_book"] = auto_run_from_result(
+                result, event=str(result.get("event_name") or "")
+            )
+        except Exception as exc:
+            logger.warning("Paper book update failed: %s", exc)
+
     _log(progress, "Complete.", 1.0)
     if result["combined"].empty and not result.get("books"):
         fallback = _background_analysis_fallback(profile=profile)
