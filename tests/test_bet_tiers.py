@@ -183,3 +183,76 @@ def test_action_label_fun_vs_bet() -> None:
     assert "NONE" in header
     assert "FUN ONLY" in header
     assert "Diego Ferreira" in header
+
+
+def test_format_odds_line_book_american_decimal() -> None:
+    from src.bet_tiers import format_odds_line, format_pick_price_stats, format_top_pick_line
+
+    bet = {
+        "bet_tier": "blue",
+        "display_label": "Islam ML",
+        "pick": "Islam Makhachev",
+        "book": "Odds API",
+        "american_odds": "-145",
+        "odds_display": "1.69",
+        "decimal_odds": 1.69,
+        "prob": 0.72,
+        "implied_prob": 0.592,
+        "edge_pct": 12.8,
+        "suggested_stake": 8.0,
+    }
+    odds = format_odds_line(bet)
+    assert "Odds API" in odds
+    assert "-145" in odds
+    assert "1.69" in odds
+
+    stats = format_pick_price_stats(bet)
+    assert "model 72%" in stats
+    assert "implied 59%" in stats
+    assert "edge +12.8%" in stats
+
+    line, color = format_top_pick_line(bet, 1)
+    assert line.startswith("#1")
+    assert "BET THIS" in line
+    assert "Islam ML" in line
+    assert "Odds API" in line
+    assert "-145" in line
+    assert "1.69" in line
+    assert color.startswith("#")
+
+
+def test_format_odds_line_derives_american_from_decimal() -> None:
+    from src.bet_tiers import format_odds_line
+
+    odds = format_odds_line({"book": "MyBookie", "decimal_odds": 2.50})
+    assert "MyBookie" in odds
+    assert "+150" in odds
+    assert "2.50" in odds
+
+
+def test_tiered_best_bets_include_odds() -> None:
+    from src.bet_tiers import TIER_BLUE, format_tiered_best_bets
+
+    text = format_tiered_best_bets(
+        {
+            TIER_BLUE: [
+                {
+                    "bet_tier": TIER_BLUE,
+                    "pick": "Islam Makhachev",
+                    "book": "DraftKings",
+                    "american_odds": "-130",
+                    "odds_display": "1.77",
+                    "decimal_odds": 1.77,
+                    "prob": 0.70,
+                    "edge_pct": 8.5,
+                    "suggested_stake": 10.0,
+                }
+            ]
+        },
+        event="UFC 300",
+    )
+    assert "DraftKings" in text
+    assert "-130" in text
+    assert "1.77" in text
+    assert "Islam Makhachev" in text
+

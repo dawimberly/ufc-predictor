@@ -1,12 +1,12 @@
 """
 Background UFC bot runner — scheduled full analysis + lightweight odds refresh.
 
-Runs Next Two Cards processing at midnight or on Windows startup, caches results
-for instant dashboard load. During the day, startup can skip full ML and only
-refresh odds when the snapshot is fresh (<24h) but odds are stale.
+Nightly Task Scheduler job (5:00 AM local, mode=full) writes the snapshot the
+dashboard opens from. Windows logon (mode=auto) skips full ML when that snapshot
+is fresh (<24h) and only refreshes odds if they are stale.
 
 CLI:
-    python src/background_runner.py --mode full --trigger midnight
+    python src/background_runner.py --mode full --trigger scheduled
     python src/background_runner.py --mode auto --trigger startup
     python src/background_runner.py --mode lightweight --trigger manual
 """
@@ -313,10 +313,74 @@ def load_background_snapshot(*, max_age_hours: float | None = FULL_STALE_HOURS) 
     }
 
 
+def describe_startup_cache_status(
+    snap: dict[str, Any] | None,
+    *,
+    stale: bool = False,
+    past_event: bool = False,
+) -> str:
+    """Status bar copy for GUI open — cache only, never an auto-refresh."""
+    if not snap:
+        return "Ready — click Refresh Next Two"
+    label = str(snap.get("event_label") or "").strip() or "cached card"
+    if stale or past_event:
+        return f"STALE CACHE — {label} — Refresh Next Two if the card changed"
+    manifest = snap.get("_manifest") or {}
+    run_type = str(manifest.get("run_type") or "full")
+    trigger = str(manifest.get("trigger") or "background")
+    return f"Loaded overnight snapshot ({run_type}/{trigger}) — {label}"
+
+
+def _startup_snapshot_is_past(snap: dict[str, Any]) -> bool:
+    """True when cached card dates are already behind today. Disk only — no live APIs."""
+    today = datetime.now(timezone.utc).date()
+
+    def _frame_past(df: Any) -> bool:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        for col in ("event_date", "date"):
+            if col not in getattr(df, "columns", []):
+                continue
+            series = pd.to_datetime(df[col], errors="coerce").dropna()
+            if series.empty:
+                continue
+            if any(ts.date() < today for ts in series):
+                return True
+        return False
+
+    if _frame_past(snap.get("combined")):
+        return True
+    for card in snap.get("cards") or []:
+        if isinstance(card, dict) and _frame_past(card.get("predictions")):
+            return True
+    return False
+
+
+def load_startup_background_snapshot() -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Load the newest on-disk snapshot for dashboard open.
+
+    Prefer ≤24h; allow ≤72h as stale. Does **not** call live ESPN/UFC.com
+    (name drift must not skip last night's card or trigger a 10-minute rescore).
+    """
+    stale = False
+    data = load_background_snapshot(max_age_hours=24)
+    if data is None:
+        data = load_background_snapshot(max_age_hours=72)
+        if data is not None:
+            stale = True
+    past = bool(data) and _startup_snapshot_is_past(data)
+    status = describe_startup_cache_status(data, stale=stale, past_event=past)
+    return data, {
+        "stale": stale,
+        "past_event": past,
+        "status": status,
+    }
+
+
 def _resolve_mode(mode: str, trigger: str) -> str:
     if mode != "auto":
         return mode
-    if trigger == "midnight":
+    if trigger in ("midnight", "scheduled"):
         return "full"
     if is_full_snapshot_stale():
         return "full"
