@@ -86,7 +86,20 @@ def _event_label(event: dict[str, str]) -> str:
 
 
 def _event_sort_key(event: dict[str, str]) -> str:
-    return str(event.get("event_date", "") or event.get("date", "") or "9999-12-31")
+    raw = str(event.get("event_date", "") or event.get("date", "") or "").strip()
+    if raw:
+        # Prefer ISO YYYY-MM-DD; leave other parseable strings as-is for sort.
+        return raw[:10] if len(raw) >= 10 and raw[4] == "-" else raw
+    # Last resort: date embedded in UFC.com slug (fight-night-august-22-2026).
+    try:
+        from src.data_loader import event_date_iso_from_path
+
+        from_path = event_date_iso_from_path(str(event.get("event_path") or ""))
+        if from_path:
+            return from_path
+    except Exception:
+        pass
+    return "9999-12-31"
 
 
 def _match_event_index(event_query: str, events: list[dict[str, str]]) -> int | None:
@@ -137,7 +150,21 @@ def resolve_event_targets(
     indices: set[int] = set()
 
     if next_two:
-        indices.update(range(min(2, len(events))))
+        # Chronological upcoming only — do not assume scrape order is date order,
+        # and never lock onto past tiles still listed on UFC.com.
+        today = datetime.now(timezone.utc).date().isoformat()
+        ranked = sorted(range(len(events)), key=lambda i: _event_sort_key(events[i]))
+        picked: list[int] = []
+        for i in ranked:
+            key = _event_sort_key(events[i])
+            if key < today:
+                continue
+            picked.append(i)
+            if len(picked) >= 2:
+                break
+        if not picked:
+            picked = ranked[: min(2, len(ranked))]
+        indices.update(picked)
     elif isinstance(event_query, list):
         for q in event_query:
             if not q:

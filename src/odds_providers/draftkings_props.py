@@ -13,7 +13,7 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
-from src.odds_providers.prop_odds_common import empty_prop_odds_df, prop_row
+from src.odds_providers.prop_odds_common import empty_prop_odds_df, map_rounds_total, prop_row
 from src.predictor import OddsAPIError, _names_match, _to_decimal_odds
 
 logger = logging.getLogger(__name__)
@@ -59,14 +59,11 @@ def _totals_to_prop_rows(
         if decimal <= 1:
             continue
         point_f = float(point)
-        selection = name
-        if name.lower() == "over" and abs(point_f - 1.5) < 0.01:
-            prop_key = "over_1_5_rounds"
-        elif name.lower() == "under" and abs(point_f - 1.5) < 0.01:
-            prop_key = "round_1_finish"
-            selection = "Under 1.5"
-        else:
-            prop_key = f"totals_{name.lower()}_{point_f:g}"
+        side = name.lower().strip()
+        mapped = map_rounds_total(side, point_f)
+        if mapped is None:
+            continue
+        prop_key, selection = mapped
         rows.append(
             prop_row(
                 fighter_1=fighter_1,
@@ -80,6 +77,20 @@ def _totals_to_prop_rows(
                 point=point_f,
             )
         )
+        if prop_key == "under_1_5_rounds":
+            rows.append(
+                prop_row(
+                    fighter_1=fighter_1,
+                    fighter_2=fighter_2,
+                    prop_key="round_1_finish",
+                    selection="Under 1.5 / R1 Finish",
+                    decimal_odds=decimal,
+                    bookmaker="DraftKings",
+                    odds_source="live",
+                    market_key="totals",
+                    point=point_f,
+                )
+            )
     return rows
 
 

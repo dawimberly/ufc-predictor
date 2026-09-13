@@ -51,27 +51,43 @@ def _year_mask(df: pd.DataFrame, year: int) -> pd.Series:
     return dts.dt.year == int(year)
 
 
-def _attach_decision_profile_for_props(df: pd.DataFrame) -> pd.DataFrame:
+def _attach_props_engine_fields(df: pd.DataFrame) -> pd.DataFrame:
     """Optional props-only enrichment; never enables FEATURE_COLUMNS flags."""
-    need = any(
-        c not in df.columns
+    out = df
+    need_dec = any(
+        c not in out.columns
         for c in (
             "f1_decision_finish_share_l5",
             "f1_dec_win_rate_l5",
             "f2_decision_finish_share_l5",
         )
     )
-    if not need:
-        return df
-    try:
-        from src.decision_profile import attach_decision_profile_to_wide
+    if need_dec:
+        try:
+            from src.decision_profile import attach_decision_profile_to_wide
 
-        out = attach_decision_profile_to_wide(df)
-        logger.info("Attached decision_profile columns for prop engine (display/backtest only)")
-        return out
-    except Exception as exc:
-        logger.warning("decision_profile attach skipped: %s", exc)
-        return df
+            out = attach_decision_profile_to_wide(out)
+            logger.info("Attached decision_profile columns for prop engine (props-only)")
+        except Exception as exc:
+            logger.warning("decision_profile attach skipped: %s", exc)
+
+    need_path = any(
+        c not in out.columns or out[c].isna().all()
+        for c in ("f1_ko_win_rate_l5", "f1_r1_finish_rate_l5", "f1_sub_win_rate_l5")
+        if True
+    )
+    # Always try pathway attach when r1 missing (common on processed CSV).
+    if "f1_r1_finish_rate_l5" not in out.columns or out["f1_r1_finish_rate_l5"].isna().all():
+        need_path = True
+    if need_path:
+        try:
+            from src.pathway_features import attach_pathway_rates_for_props
+
+            out = attach_pathway_rates_for_props(out)
+            logger.info("Attached pathway L5 rates for prop engine (props-only)")
+        except Exception as exc:
+            logger.warning("pathway props attach skipped: %s", exc)
+    return out
 
 
 def load_prop_holdout(*, year: int = 2025) -> pd.DataFrame:
@@ -81,7 +97,7 @@ def load_prop_holdout(*, year: int = 2025) -> pd.DataFrame:
     feats = load_labeled_prop_frame()
     if feats.empty:
         return feats
-    feats = _attach_decision_profile_for_props(feats)
+    feats = _attach_props_engine_fields(feats)
     mask = _year_mask(feats, year)
     out = feats.loc[mask].copy()
     if out.empty:
@@ -352,12 +368,18 @@ def coverage_decision_fields(features: pd.DataFrame) -> dict[str, float]:
     cols = [
         "f1_finish_rate_l5",
         "f1_r1_finish_rate_l5",
+        "f1_ko_win_rate_l5",
+        "f1_sub_win_rate_l5",
         "f1_dec_win_rate_l5",
         "f1_decision_finish_share_l5",
+        "f1_distance_rate_l5",
         "f2_finish_rate_l5",
         "f2_r1_finish_rate_l5",
+        "f2_ko_win_rate_l5",
+        "f2_sub_win_rate_l5",
         "f2_dec_win_rate_l5",
         "f2_decision_finish_share_l5",
+        "f2_distance_rate_l5",
     ]
     out: dict[str, float] = {}
     n = max(len(features), 1)
@@ -410,8 +432,9 @@ def run_props_accuracy_2025(
         o15_hr = float(o15["pred_hit_rate"].iloc[0]) if len(o15) and o15["pred_hit_rate"].notna().any() else None
         verdict = "tuned_props_engine"
         note = (
-            "Prop engine uses L5 finish/R1 + decision_finish_share / dec_win|loss when present. "
-            "Not added to LightGBM FEATURE_COLUMNS (decision_profile A/B was DROP). "
+            "Prop engine uses pathway L5 method win/loss + R1/distance, finish_rate_l5, "
+            "and decision_finish_share / dec_win|loss when present (props-only attach). "
+            "Not added to LightGBM FEATURE_COLUMNS (decision_profile / pathway A/Bs were DROP). "
             "Live HA still bets Over 1.5 only; correlation adjustment unchanged. "
             "Live tickets keep PROP_PARLAYS_ENABLED=False. "
             "Research parlays: DK/MyBookie 2-leg Over 1.5 (cross-fight); BetNow singles-only."
@@ -422,6 +445,8 @@ def run_props_accuracy_2025(
             "ADD_DECISION_PROFILE_TO_FEATURES": False,
             "ENABLE_PATHWAY_FEATURES": bool(getattr(config, "ENABLE_PATHWAY_FEATURES", False)),
             "ENABLE_MARKET_FEATURES": bool(getattr(config, "ENABLE_MARKET_FEATURES", False)),
+            "ADD_OVERSEAS_FEATURES": bool(getattr(config, "ADD_OVERSEAS_FEATURES", False)),
+            "ADD_HOME_COUNTRY_TO_FEATURES": False,
             "ENABLE_HIGH_VALUE_FEATURES": bool(getattr(config, "ENABLE_HIGH_VALUE_FEATURES", True)),
         }
 
@@ -511,7 +536,7 @@ def _format_md(payload: dict[str, Any]) -> str:
             "",
             "Live HA: `PROP_PARLAYS_ENABLED=false` (no parlays on tickets). BetNow remains singles-only.",
             "",
-            "## Decision-profile coverage (props engine)",
+            "## Props-engine field coverage",
             "",
             "| Column | nonnull% |",
             "|---|---:|",
@@ -524,25 +549,31 @@ def _format_md(payload: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## Flags (unchanged)",
+            "## Flags (must stay off for ML)",
             "",
         ]
     )
     for k, v in (payload.get("flags") or {}).items():
         lines.append(f"- `{k}` = `{v}`")
+    roi = ov.get("roi")
+    o15_rows = [
+        r for r in (payload.get("by_market") or []) if r.get("prop_key") == "over_1_5_rounds"
+    ]
+    o15_roi = o15_rows[0].get("roi") if o15_rows else None
     lines.extend(
         [
             "",
             "## Keep-as-is vs tuned",
             "",
-            "- **Tuned (shipped):** `method_probs_from_row` blends L5 finish, R1 rates when present, "
-            "and decision_finish_share / dec_win|loss for props + display.",
-            "- **Keep out of ML:** decision_profile diffs stay out of FEATURE_COLUMNS (A/B DROP).",
+            "- **Tuned (shipped):** `method_probs_from_row` blends pathway L5 KO/sub/dec win-loss, "
+            "R1/distance rates, finish_rate_l5, and decision_finish_share for props + display.",
+            "- **Keep out of ML:** pathway / decision_profile / home / overseas flags stay off "
+            "(FEATURE_COLUMNS unchanged).",
             "- **Live betting:** Over 1.5 only (HA); live odds first, synthetic second; Source column labeled.",
-            "- **Synthetic ROI caveat:** flat −7.8% overall / −11.3% Over 1.5 under vigged synthetic lines — "
-            "not a live-edge claim. Prefer live book lines for staking.",
-            "- **Rare markets** (fighter KO/sub) show high pred hit mainly from predicting No (majority class); "
-            "few clear ≥78% bets.",
+            f"- **Synthetic ROI caveat:** flat {_pct(roi)} overall / {_pct(o15_roi)} Over 1.5 under "
+            "vigged synthetic lines — not a live-edge claim. Prefer live book lines for staking.",
+            "- **Rare markets** (fighter KO/sub) show high pred hit mainly from predicting No "
+            "(majority class); few clear ≥78% bets.",
             "",
             "## Correlation",
             "",

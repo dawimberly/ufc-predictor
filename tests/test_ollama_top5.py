@@ -10,6 +10,59 @@ from src.grok_analysis import (
 )
 
 
+def test_ticket_to_slip_row_includes_event_and_prop_line():
+    raw = {
+        "fight_id": "f1",
+        "fight": "Islam Makhachev vs Ian Machado Garry",
+        "event_name": "UFC 330",
+        "prop_key": "over_4_5_rounds",
+        "prop_short": "Over 4.5 Rounds",
+        "market_type": "prop",
+        "book": "MyBookie",
+        "edge": 0.12,
+        "prob": 0.71,
+        "decimal_odds": 1.62,
+        "suggested_stake": 0.0,
+        "stake_pct": 0.0,
+    }
+    row = _ticket_to_slip_row(raw, rank=1, tier="advisory")
+    assert row["event"] == "UFC 330"
+    assert row["market"] == "Over 4.5 Rounds"
+
+
+def test_prompt_lists_event_per_ticket():
+    inputs = {
+        "event": "UFC 330 + Fight Night",
+        "profile": "paper",
+        "bankroll": 100,
+        "card_budget": 12,
+        "total_stake_pct": 80,
+        "total_stake_usd": 9.6,
+        "n_actionable": 1,
+        "n_advisory": 0,
+        "top5_warning": TOP5_WARNING,
+        "tickets": [
+            {
+                "id": "a",
+                "event": "UFC 330",
+                "side": "Islam",
+                "market": "moneyline",
+                "book": "Odds API",
+                "stake_pct": 40,
+                "stake_usd": 4.8,
+                "prob": 0.7,
+                "edge_pct": 8,
+                "confidence": "high",
+                "advisory": False,
+            }
+        ],
+        "skipped": [],
+    }
+    prompt = build_grok_prompt(inputs)
+    assert "event=UFC 330" in prompt
+    assert "Name the event on every pick" in prompt
+
+
 def test_ticket_to_slip_row_advisory_zeros_stake():
     raw = {
         "fight_id": "f1",
@@ -94,7 +147,7 @@ def test_prompt_includes_top5_warning_and_tiers():
         "skipped": [],
     }
     prompt = build_grok_prompt(inputs)
-    assert "ADVISORY" in prompt
-    assert "ACTIONABLE" in prompt
-    assert "Top 5" in prompt
-    assert "WARNING" in prompt
+    assert "FUN ONLY" in prompt
+    assert "BET THIS" in prompt
+    assert "Clarity" in prompt
+    assert "event=" in prompt or "Name the event" in prompt

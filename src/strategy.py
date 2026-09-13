@@ -736,6 +736,8 @@ def build_auto_parlay_recommendations(
             continue
         fid = str(row.get("fight_id") or fight).strip()
         conf = str(row.get("confidence_label") or row.get("confidence") or "").strip().lower()
+        from src.props import event_from_record
+
         legs.append(
             {
                 "fight": fight,
@@ -745,6 +747,8 @@ def build_auto_parlay_recommendations(
                 "confidence": conf or "-",
                 "ha_leg": bool(fid in preferred or fight in preferred),
                 "weight_class": str(row.get("weight_class") or ""),
+                "event": event_from_record(row),
+                "event_name": event_from_record(row),
             }
         )
 
@@ -785,6 +789,8 @@ def build_auto_parlay_recommendations(
                             "prob": c["prob"],
                             "confidence": c["confidence"],
                             "ha_leg": c["ha_leg"],
+                            "event": c.get("event") or "",
+                            "event_name": c.get("event_name") or c.get("event") or "",
                         }
                         for c in combo
                     ],
@@ -803,6 +809,8 @@ def build_auto_parlay_recommendations(
                     "stake_pct": 0.0,
                     "ha_legs": ha_count,
                     "ha_qualified": n == 2 and ha_count == n,
+                    "event": next((str(c.get("event") or "") for c in combo if c.get("event")), ""),
+                    "event_name": next((str(c.get("event") or "") for c in combo if c.get("event")), ""),
                     "reason": "",
                     "brief": (
                         f"Auto {n}-leg · combined {combined:.0%}"
@@ -1035,19 +1043,10 @@ def _ticket_confidence_label(ticket: dict[str, Any]) -> str:
 
 
 def _ticket_edge_fraction(ticket: dict[str, Any]) -> float:
-    edge = ticket.get("edge")
-    if edge is None and ticket.get("edge_pct") is not None:
-        try:
-            edge = float(ticket["edge_pct"]) / 100.0
-        except (TypeError, ValueError):
-            edge = 0.0
-    try:
-        e = float(edge or 0.0)
-    except (TypeError, ValueError):
-        e = 0.0
-    if abs(e) > 1.5:  # likely already percent
-        e = e / 100.0
-    return max(0.0, e)
+    frac = ticket_max_edge_fraction(ticket)
+    if frac is None:
+        return 0.0
+    return max(0.0, float(frac))
 
 
 def _ticket_prob(ticket: dict[str, Any]) -> float:
@@ -1217,6 +1216,31 @@ def compute_ticket_strength(ticket: dict[str, Any], *, live: bool) -> dict[str, 
     conf_score = _ticket_confidence_score(ticket)
     prob = _ticket_prob(ticket)
     edge, implied = _ticket_edge_vs_market(ticket)
+    if ticket_edge_exceeds_actionable_cap(ticket) or abs(float(edge or 0)) > MAX_ACTIONABLE_EDGE:
+        return {
+            "strength": 0.0,
+            "strength_score": 0.0,
+            "target_stake_pct": 0.0,
+            "edge": float(edge or 0.0),
+            "confidence": conf_label,
+            "confidence_score": float(conf_score),
+            "model_prob": float(prob),
+            "decimal_odds": odds,
+            "market_implied": implied,
+            "prob_score": 0.0,
+            "edge_score": 0.0,
+            "odds_score": 0.0,
+            "uncertainty_penalty": 0.0,
+            "uncertainty_action": "skip",
+            "type_mult": 1.0,
+            "is_parlay": bool(ticket.get("is_parlay")),
+            "no_inflate": True,
+            "fail_closed_reason": "suspect_edge",
+            "sizing_mode": "conf_odds",
+            "curve_gamma": float(curve["gamma"]),
+            "max_ticket_pct": float(curve["max_ticket_pct"]),
+            "profile": "live" if live else "paper",
+        }
     unc_pen, unc_no_inflate, unc_action = _uncertainty_penalty(
         ticket, live=live, tighten_mult=float(curve["tighten_mult"])
     )
@@ -1465,6 +1489,19 @@ def allocate_card_budget_pct(
     out: list[dict[str, Any]] = []
     for i, (ticket, pct, details) in enumerate(zip(tickets, pcts, details_list), start=1):
         row = ticket if inplace else dict(ticket)
+        if ticket_edge_exceeds_actionable_cap(row) or str(details.get("fail_closed_reason") or "") == "suspect_edge":
+            dollars = 0.0
+            pct = 0.0
+            row["stake_pct"] = 0.0
+            row["suggested_stake"] = 0.0
+            row["stake_usd"] = 0.0
+            row["advisory"] = True
+            row["sizing_no_inflate"] = True
+            row["sizing_fail_closed"] = "suspect_edge"
+            row["card_pool_usd"] = pool
+            row["allocation_rank"] = i
+            out.append(row)
+            continue
         dollars = round(pool * (pct / 100.0), 2) if pool > 0 else 0.0
         row["stake_pct"] = float(pct)
         row["suggested_stake"] = dollars
@@ -1606,7 +1643,7 @@ def allocate_alerts_card_budget_pct(
 
 
 def format_stake_pct_dollars(ticket: dict[str, Any] | float, stake: float | None = None) -> str:
-    """Display '38% · $4.56' for a ticket or (pct, dollars)."""
+    """Display '38% | $4.56' for a ticket or (pct, dollars)."""
     if isinstance(ticket, dict):
         pct = ticket.get("stake_pct")
         dollars = stake if stake is not None else ticket.get("suggested_stake")
@@ -1628,6 +1665,50 @@ def format_stake_pct_dollars(ticket: dict[str, Any] | float, stake: float | None
     pct_txt = f"{pct_f:.0f}%" if abs(pct_f - round(pct_f)) < 0.05 else f"{pct_f:.1f}%"
     # ASCII separator (Windows ttk / code-page safe)
     return f"{pct_txt} | ${dol_f:.2f}"
+
+
+def prop_may_receive_ha_stake(prop: dict[str, Any]) -> bool:
+    """True only for live Over 1.5 that still clears HA edge/odds (not a 26% scrape)."""
+    if str(prop.get("prop_key") or "").strip().lower() != "over_1_5_rounds":
+        return False
+    if prop.get("strict_qualified") is False:
+        return False
+    try:
+        from src.props import is_live_prop_odds_source
+
+        if not is_live_prop_odds_source(str(prop.get("odds_source") or "")):
+            return False
+    except Exception:
+        if str(prop.get("odds_source") or "").strip().lower() not in {"live", "the_odds_api"}:
+            return False
+    if ticket_edge_exceeds_actionable_cap(prop):
+        return False
+    try:
+        from src.photo_analysis import photo_over_15_blocks
+
+        if photo_over_15_blocks(prop):
+            return False
+    except Exception:
+        pass
+    edge_f = ticket_max_edge_fraction(prop)
+    if edge_f is None:
+        return False
+    odds = prop.get("decimal_odds") or prop.get("odds")
+    try:
+        odds_f = float(odds) if odds is not None else None
+    except (TypeError, ValueError):
+        odds_f = None
+    prob = prop.get("prob")
+    try:
+        prob_f = float(prob) if prob is not None else None
+    except (TypeError, ValueError):
+        prob_f = None
+    return edge_is_actionable(
+        edge_f,
+        decimal_odds=odds_f,
+        model_prob=prob_f,
+        edge_suspect=bool(prop.get("edge_suspect")),
+    )
 
 
 def attach_prop_stakes(
@@ -1661,15 +1742,33 @@ def attach_prop_stakes(
                 sum(1 for b in plan.values() if b.get("enabled")),
             )
 
-    # Only Over 1.5 participates under HA strategy; still allocate 100% among shown props
+    # Only Over 1.5 that still pass HA edge/odds gates get card-budget size.
     tickets = []
+    zeroed: list[dict[str, Any]] = []
     for s in singles:
         row = dict(s)
         row["market_type"] = "prop"
         row["is_parlay"] = False
+        try:
+            from src.photo_analysis import attach_photo_notes
+
+            attach_photo_notes(row)
+        except Exception:
+            pass
+        if not prop_may_receive_ha_stake(row):
+            row["suggested_stake"] = 0.0
+            row["stake_usd"] = 0.0
+            row["stake_pct"] = 0.0
+            row["advisory"] = True
+            if row.get("photo_over_15_caution"):
+                row["tier_reason"] = "photo_finishers"
+            zeroed.append(row)
+            continue
         tickets.append(row)
+    if not tickets:
+        return zeroed
     allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
-    return allocated
+    return allocated + zeroed
 
 
 def budget_summary_text(budget_state: dict[str, Any]) -> str:
@@ -2118,6 +2217,102 @@ def sanitize_decimal_odds(val: Any) -> float | None:
 
 
 MAX_ACTIONABLE_EDGE = 0.25  # 25% — filters bogus scraper edges (e.g. MyBookie glitches)
+SUSPECT_EDGE_FLAG = 0.25
+
+
+def _as_edge_fraction(value: Any, *, percent_points: bool = False) -> float | None:
+    """Normalize one edge field to a fraction.
+
+    ``edge`` is a fraction, or percent points when |value| > 1.5.
+    ``edge_pct`` is always percent points (26.3 means 26.3%).
+    """
+    v = _coerce_edge_number(value)
+    if v is None:
+        return None
+    if percent_points:
+        return v / 100.0
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
+
+
+def _coerce_edge_number(value: Any) -> float | None:
+    """Parse edge fields that may be floats or strings like '+26.3%'."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        s = value.strip().replace(",", "").replace("%", "").replace("\uff05", "")
+        if s.startswith("+"):
+            s = s[1:]
+        if not s:
+            return None
+        value = s
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def ticket_max_edge_fraction(
+    ticket: dict[str, Any] | None = None,
+    *,
+    edge: Any = None,
+    edge_pct: Any = None,
+) -> float | None:
+    """Largest |edge| implied by sizing ``edge`` and displayed ``edge_pct``."""
+    blob: dict[str, Any]
+    if isinstance(ticket, dict):
+        blob = ticket
+    elif ticket is not None:
+        try:
+            blob = dict(ticket)
+        except Exception:
+            blob = {}
+    else:
+        blob = {}
+    e = edge if edge is not None else blob.get("edge")
+    ep = edge_pct if edge_pct is not None else blob.get("edge_pct")
+    fracs: list[float] = []
+    ef = _as_edge_fraction(e, percent_points=False)
+    epf = _as_edge_fraction(ep, percent_points=True)
+    if ef is not None:
+        fracs.append(ef)
+    if epf is not None:
+        fracs.append(epf)
+    if not fracs:
+        return None
+    return max(fracs, key=lambda x: abs(x))
+
+
+def ticket_edge_exceeds_actionable_cap(
+    ticket: dict[str, Any] | None = None,
+    *,
+    edge: Any = None,
+    edge_pct: Any = None,
+) -> bool:
+    """True if sizing ``edge`` or displayed ``edge_pct`` is above the 25% HA cap.
+
+    Tickets can store ``edge=0.08`` (passes the cap) and ``edge_pct=26.3``
+    (what Overview/Ollama print). Either field over 25% is a bogus scrape.
+    """
+    frac = ticket_max_edge_fraction(ticket, edge=edge, edge_pct=edge_pct)
+    if frac is not None and abs(frac) > MAX_ACTIONABLE_EDGE:
+        return True
+    blob: dict[str, Any]
+    if isinstance(ticket, dict):
+        blob = ticket
+    elif ticket is not None:
+        try:
+            blob = dict(ticket)
+        except Exception:
+            blob = {}
+    else:
+        blob = {}
+    printed = _coerce_edge_number(edge_pct if edge_pct is not None else blob.get("edge_pct"))
+    return printed is not None and abs(printed) > (MAX_ACTIONABLE_EDGE * 100.0)
 
 
 def edge_is_actionable(
@@ -2125,8 +2320,11 @@ def edge_is_actionable(
     *,
     decimal_odds: float | None = None,
     model_prob: float | None = None,
+    edge_suspect: bool = False,
 ) -> bool:
     """Drop absurd edges that usually mean bad odds merges, not real value."""
+    if edge_suspect:
+        return False
     if edge <= 0 or edge > MAX_ACTIONABLE_EDGE:
         return False
     if decimal_odds is not None and decimal_odds > 1.0 and model_prob is not None:
@@ -2184,7 +2382,13 @@ def aggregate_top_recommended_bets(
             dec = decimal_odds_for_pick(row, pick) if row is not None else None
             prob_val = single.get("prob")
             prob_f = float(prob_val) if prob_val is not None else None
-            if not edge_is_actionable(edge, decimal_odds=dec, model_prob=prob_f):
+            max_edge = ticket_max_edge_fraction(single, edge=edge)
+            if max_edge is None or not edge_is_actionable(
+                max_edge,
+                decimal_odds=dec,
+                model_prob=prob_f,
+                edge_suspect=bool(row.get("edge_suspect")) if row is not None else False,
+            ):
                 continue
             confidence = str(single.get("confidence") or "").strip()
             if not confidence and row is not None:
@@ -2247,6 +2451,18 @@ def aggregate_top_recommended_bets(
                     "f2_gym": str(row.get("f2_gym") or "") if row is not None else "",
                     "f1_gym_strengths": str(row.get("f1_gym_strengths") or "") if row is not None else "",
                     "f2_gym_strengths": str(row.get("f2_gym_strengths") or "") if row is not None else "",
+                    "event": str(
+                        single.get("event")
+                        or single.get("event_name")
+                        or (row.get("event_name") if row is not None else "")
+                        or ""
+                    ),
+                    "event_name": str(
+                        single.get("event_name")
+                        or single.get("event")
+                        or (row.get("event_name") if row is not None else "")
+                        or ""
+                    ),
                 }
             )
 
@@ -2339,6 +2555,8 @@ def _overview_over_15_props(
                     continue
             if p.get("strict_qualified") is False:
                 continue
+            if not prop_may_receive_ha_stake({**p, "prop_key": "over_1_5_rounds"}):
+                continue
             fid = str(p.get("fight_id") or p.get("fight") or "")
             if not fid or fid in seen:
                 continue
@@ -2415,7 +2633,8 @@ def aggregate_overview_recommendations(
             edge = float(s.get("edge") or 0)
             prob = s.get("prob")
             prob_f = float(prob) if prob is not None else None
-            if not edge_is_actionable(edge, model_prob=prob_f):
+            max_edge = ticket_max_edge_fraction(s, edge=edge)
+            if max_edge is None or not edge_is_actionable(max_edge, model_prob=prob_f):
                 continue
             brief = str(s.get("brief") or s.get("reasoning") or "").strip()
             singles.append(
@@ -2438,6 +2657,8 @@ def aggregate_overview_recommendations(
                     "odds_display": "-",
                     "is_parlay": False,
                     "market_type": "moneyline",
+                    "event": str(s.get("event") or s.get("event_name") or ""),
+                    "event_name": str(s.get("event_name") or s.get("event") or ""),
                 }
             )
             seen.add(fid)
@@ -2453,14 +2674,14 @@ def aggregate_overview_recommendations(
 
     cleaned_singles: list[dict[str, Any]] = []
     for item in singles:
-        edge = float(item.get("edge") or 0)
-        if not edge and item.get("edge_pct") is not None:
-            edge = float(item.get("edge_pct")) / 100.0
+        max_edge = ticket_max_edge_fraction(item)
+        if max_edge is None:
+            continue
         prob = item.get("prob")
         prob_f = float(prob) if prob is not None else None
         dec = item.get("decimal_odds")
         dec_f = float(dec) if dec is not None else None
-        if edge_is_actionable(edge, decimal_odds=dec_f, model_prob=prob_f):
+        if edge_is_actionable(max_edge, decimal_odds=dec_f, model_prob=prob_f):
             cleaned_singles.append(item)
     singles = cleaned_singles
 

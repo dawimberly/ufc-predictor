@@ -116,7 +116,11 @@ def build_fight_brief(
         # Mention opponent gym only if very short
         other_prefix = "f2" if prefix == "f1" else "f1"
         og = str(row.get(f"{other_prefix}_gym") or "").strip()
-        if og and len(" · ".join(parts + gym_bits)) < max_len - 40:
+        if gym and og and gym == og:
+            gym_bits.append(
+                "shared gym - underdog often camps elsewhere for this fight"
+            )
+        elif og and len(" · ".join(parts + gym_bits)) < max_len - 40:
             os_ = str(row.get(f"{other_prefix}_gym_strengths") or "").split(",")[0].strip()
             gym_bits.append(f"{other}: {og}" + (f" ({os_})" if os_ else ""))
     except Exception:

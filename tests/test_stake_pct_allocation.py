@@ -101,7 +101,7 @@ def test_alerts_allocator_splits_singles_parlays_props():
 
 def test_format_stake_pct_dollars():
     txt = format_stake_pct_dollars({"stake_pct": 38.0, "suggested_stake": 4.56})
-    assert txt == "38% · $4.56"
+    assert txt == "38% | $4.56"
 
 
 def test_stronger_edge_gets_more_weight():

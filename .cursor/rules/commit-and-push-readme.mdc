@@ -1,0 +1,15 @@
+---
+description: Commit button auto-updates README and pushes both remotes via git hooks
+alwaysApply: true
+---
+
+# Commit = README + both remotes (git hooks)
+
+This repo uses `.githooks` (`core.hooksPath=.githooks`):
+
+1. **prepare-commit-msg** — prepends a **Recent changes** bullet from the commit subject into `README.md` and stages it.
+2. **post-commit** — `git push -u origin HEAD` (origin has two push URLs: personal + Infinite Robots).
+
+Agent commits should still write a clear subject (that becomes the README bullet). Prefer editing README body yourself for big doc changes; the hook only adds the dated bullet.
+
+Escape hatches: `[skip-readme]`, `[no-push]`, `SKIP_README_HOOK=1`, `SKIP_AUTO_PUSH=1`.

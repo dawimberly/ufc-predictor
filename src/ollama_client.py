@@ -335,6 +335,54 @@ def _reorder_after_timeout(remaining: list[str], failed: str) -> list[str]:
     return out
 
 
+def ollama_chat_images(
+    prompt: str,
+    images_b64: list[str],
+    *,
+    model: str,
+    timeout_sec: int = 45,
+    system: str | None = None,
+    json_mode: bool = True,
+    temperature: float = 0.1,
+) -> tuple[str, str]:
+    """One-shot /api/chat with base64 images. No text-model fallback (they cannot see)."""
+    pick = str(model or "").strip()
+    if not pick:
+        raise RuntimeError("Ollama vision model not set")
+    if not images_b64:
+        raise RuntimeError("Ollama vision call missing images")
+    timeout = max(8, int(timeout_sec or 45))
+    messages: list[dict[str, Any]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append(
+        {
+            "role": "user",
+            "content": prompt,
+            "images": list(images_b64),
+        }
+    )
+    body: dict[str, Any] = {
+        "model": pick,
+        "messages": messages,
+        "stream": False,
+        "keep_alive": "10m",
+        "options": {
+            "temperature": temperature,
+            "num_predict": min(320, max(128, int(getattr(config, "OLLAMA_NUM_PREDICT", 512) or 512))),
+            "num_ctx": min(4096, max(2048, int(getattr(config, "OLLAMA_NUM_CTX", 4096) or 4096))),
+        },
+    }
+    if json_mode and bool(getattr(config, "OLLAMA_JSON_FORMAT", True)):
+        body["format"] = "json"
+    raw = _http_post("/api/chat", body, timeout=timeout)
+    merged = {
+        "response": (raw.get("message") or {}).get("content", ""),
+        "thinking": raw.get("thinking", ""),
+    }
+    return pick, _merge_thinking_response(merged)
+
+
 def ollama_complete(
     prompt: str,
     *,

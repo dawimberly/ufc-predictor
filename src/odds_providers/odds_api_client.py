@@ -53,43 +53,89 @@ class OddsApiFetchBlocked(RuntimeError):
     """Raised when ODDS_FETCH_ONCE forbids another live The Odds API call."""
 
 
-def odds_fetch_once_blocks_live() -> bool:
-    """True when ODDS_FETCH_ONCE and a prior odds download already exists on disk."""
+def _cache_file_blocks_once(path: Path | None) -> bool:
+    """True when a cache file/marker should block another live pull of the same kind."""
+    if not path:
+        return False
+    try:
+        if not path.is_file():
+            return False
+        # .once marker is always enough; CSV needs a real payload/header.
+        return path.suffix == ".once" or path.stat().st_size >= 16
+    except OSError:
+        return False
+
+
+def _odds_fetch_context_kind(context: str) -> str:
+    """Classify which fetch-once caches apply to this Odds API call."""
+    ctx = str(context or "").lower()
+    if "draftkings" in ctx:
+        return "draftkings"
+    # Per-event prop odds: /events/{id}/odds — must be checked before plain /odds.
+    if "prop" in ctx or "/events/" in ctx or ctx.rstrip("/").endswith("/events"):
+        return "props"
+    if "/odds" in ctx or "mybookie" in ctx:
+        return "moneylines"
+    return "all"
+
+
+def odds_fetch_once_blocks_live(*, context: str = "") -> bool:
+    """True when ODDS_FETCH_ONCE and a prior download for this endpoint exists."""
     if not bool(getattr(config, "ODDS_FETCH_ONCE", True)):
         return False
     cache_dir = Path(getattr(config, "CACHE_DIR", "") or ".")
-    candidates = [
-        getattr(config, "ODDS_CACHE_PATH", None),
-        cache_dir / "ufc_odds_api.csv",
-        cache_dir / "the_odds_api_prop_odds.csv",
-        cache_dir / "the_odds_api_prop_odds.once",
-        cache_dir / "draftkings_odds.csv",
-        cache_dir / "draftkings_prop_odds.csv",
-    ]
+    kind = _odds_fetch_context_kind(context)
+    if kind == "moneylines":
+        candidates = [
+            getattr(config, "ODDS_CACHE_PATH", None),
+            cache_dir / "ufc_odds_api.csv",
+        ]
+    elif kind == "props":
+        candidates = [
+            cache_dir / "the_odds_api_prop_odds.csv",
+            cache_dir / "the_odds_api_prop_odds.once",
+        ]
+    elif kind == "draftkings":
+        candidates = [
+            cache_dir / "draftkings_odds.csv",
+            cache_dir / "draftkings_prop_odds.csv",
+        ]
+    else:
+        candidates = [
+            getattr(config, "ODDS_CACHE_PATH", None),
+            cache_dir / "ufc_odds_api.csv",
+            cache_dir / "the_odds_api_prop_odds.csv",
+            cache_dir / "the_odds_api_prop_odds.once",
+            cache_dir / "draftkings_odds.csv",
+            cache_dir / "draftkings_prop_odds.csv",
+        ]
     for raw in candidates:
-        if not raw:
-            continue
-        p = Path(raw)
-        try:
-            if not p.is_file():
-                continue
-            # .once marker is always enough; CSV needs a real payload/header.
-            if p.suffix == ".once" or p.stat().st_size >= 16:
-                return True
-        except OSError:
-            continue
+        if _cache_file_blocks_once(Path(raw) if raw else None):
+            return True
     return False
 
 
 def ensure_live_odds_api_allowed(*, context: str = "") -> None:
-    """Hard stop for any live The Odds API HTTP call when fetch-once cache exists."""
-    if not odds_fetch_once_blocks_live():
+    """Hard stop for live The Odds API HTTP when fetch-once cache exists for this path."""
+    if not odds_fetch_once_blocks_live(context=context):
         return
     detail = context or "cached odds already on disk"
-    msg = (
-        f"ODDS_FETCH_ONCE: blocked live Odds API request ({detail}). "
-        "Delete data/cache/ufc_odds_api.csv (and prop/DK caches) to allow a new download."
-    )
+    kind = _odds_fetch_context_kind(context)
+    if kind == "moneylines":
+        hint = "Delete data/cache/ufc_odds_api.csv to allow a new moneyline download."
+    elif kind == "props":
+        hint = (
+            "Delete data/cache/the_odds_api_prop_odds.csv and "
+            "the_odds_api_prop_odds.once to allow a new prop download."
+        )
+    elif kind == "draftkings":
+        hint = "Delete data/cache/draftkings_odds.csv (and prop cache) to re-pull."
+    else:
+        hint = (
+            "Delete data/cache/ufc_odds_api.csv (and prop/DK caches) "
+            "to allow a new download."
+        )
+    msg = f"ODDS_FETCH_ONCE: blocked live Odds API request ({detail}). {hint}"
     logger.warning(msg)
     raise OddsApiFetchBlocked(msg)
 
