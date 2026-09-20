@@ -1225,10 +1225,22 @@ def run_full_analysis(
         result["errors"].append("No trained model in models/.")
         return result
 
-    next_two = event_mode in ("Next Two Cards", "Last Two Cards")
-    event_query = None if event_mode in ("Next Card", "Next Two Cards", "Last Two Cards") else event_mode
+    mode = str(event_mode or "").strip()
+    mode_l = mode.lower()
+    next_two = mode_l in ("next two cards", "last two cards")
+    todays_card = mode_l in (
+        "today's card",
+        "todays card",
+        "today",
+        "current card",
+        "current",
+    )
+    all_available = mode_l in ("all available cards", "all cards", "all available")
+    next_one = mode_l in ("next card",)
+    reserved = next_two or todays_card or all_available or next_one
+    event_query = None if reserved else mode
 
-    if event_mode == "Next Two Cards":
+    if next_two:
         logger.info("DEBUG: run_full_analysis(Next Two Cards) → load_next_two_cards()")
         try:
             targets, cards, combined, all_cached = load_next_two_cards(
@@ -1280,14 +1292,21 @@ def run_full_analysis(
         try:
             targets = resolve_event_targets(
                 event_query,
-                next_two=next_two,
-                include_adjacent_week=not next_two and event_query is not None,
+                next_two=False,
+                todays_card=todays_card,
+                all_available=all_available,
+                include_adjacent_week=bool(event_query) and not todays_card and not all_available,
             )
         except SystemExit as exc:
             result["errors"].append(str(exc) or "Could not resolve events.")
             return result
 
-        result["event_label"] = " + ".join(name for _, name in targets)
+        if todays_card and targets:
+            result["event_label"] = f"Today's Card: {targets[0][1]}"
+        elif all_available:
+            result["event_label"] = " + ".join(name for _, name in targets)
+        else:
+            result["event_label"] = " + ".join(name for _, name in targets)
         fights = load_or_refresh_data(refresh=False)
         n = len(targets)
         all_cached = bool(use_cache)
@@ -1391,6 +1410,18 @@ def run_full_analysis(
                 logger.info("Prediction bank update: %s", result["prediction_bank"])
         except Exception as exc:
             logger.warning("Prediction bank update failed: %s", exc)
+
+    # Auto research parlays across every loaded card (best 2-leg + 3-leg).
+    try:
+        from src.strategy import build_best_parlay_across_cards
+
+        result["recommended_parlays"] = build_best_parlay_across_cards(
+            result.get("cards") or [],
+            combined=result.get("combined"),
+        )
+    except Exception as exc:
+        logger.debug("recommended_parlays skipped: %s", exc)
+        result["recommended_parlays"] = []
 
     _log(progress, "Complete.", 1.0)
     if result["combined"].empty and not result.get("books"):

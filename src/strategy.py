@@ -711,7 +711,8 @@ def build_auto_parlay_recommendations(
     Automatically pick one best 2-leg and one best 3-leg research parlay.
 
     Prefer HA-cleared singles as legs when available; otherwise highest model probs.
-    Advisory only — not Live HA-sized tickets (especially 3-leg).
+    When ``card_rows`` spans multiple ``event_name`` values, legs may cross cards
+    (tagged ``cross_card=True``). Advisory only — not Live HA-sized tickets.
     """
     if card_rows is None or getattr(card_rows, "empty", True):
         return []
@@ -736,6 +737,7 @@ def build_auto_parlay_recommendations(
             continue
         fid = str(row.get("fight_id") or fight).strip()
         conf = str(row.get("confidence_label") or row.get("confidence") or "").strip().lower()
+        event_name = str(row.get("event_name") or row.get("event") or "").strip()
         legs.append(
             {
                 "fight": fight,
@@ -745,13 +747,14 @@ def build_auto_parlay_recommendations(
                 "confidence": conf or "-",
                 "ha_leg": bool(fid in preferred or fight in preferred),
                 "weight_class": str(row.get("weight_class") or ""),
+                "event_name": event_name,
             }
         )
 
     # Prefer HA legs first, then by prob
     legs.sort(key=lambda L: (0 if L["ha_leg"] else 1, -L["prob"]))
     # Cap candidate pool so combinations stay small
-    pool = legs[:10]
+    pool = legs[:12]
     if len(pool) < 2:
         return []
 
@@ -773,7 +776,10 @@ def build_auto_parlay_recommendations(
             key = (float(ha_count), combined, min(c["prob"] for c in combo))
             if key > best_key:
                 best_key = key
+                events = [c["event_name"] for c in combo if c.get("event_name")]
+                cross = len(set(events)) > 1 if events else False
                 picks_txt = " + ".join(f"{c['pick']} ({c['prob']:.0%})" for c in combo)
+                scope = "across cards" if cross else "same card"
                 best = {
                     "id": f"parlay-{n}leg-" + "-".join(sorted(fids))[:80],
                     "n_legs": n,
@@ -785,6 +791,7 @@ def build_auto_parlay_recommendations(
                             "prob": c["prob"],
                             "confidence": c["confidence"],
                             "ha_leg": c["ha_leg"],
+                            "event_name": c.get("event_name") or "",
                         }
                         for c in combo
                     ],
@@ -803,9 +810,11 @@ def build_auto_parlay_recommendations(
                     "stake_pct": 0.0,
                     "ha_legs": ha_count,
                     "ha_qualified": n == 2 and ha_count == n,
+                    "cross_card": cross,
+                    "events": sorted(set(events)),
                     "reason": "",
                     "brief": (
-                        f"Auto {n}-leg · combined {combined:.0%}"
+                        f"Auto {n}-leg · {scope} · combined {combined:.0%}"
                         + (" · HA legs" if ha_count == n else " · research")
                     ),
                 }
@@ -820,6 +829,51 @@ def build_auto_parlay_recommendations(
         if rec is not None:
             out.append(rec)
     return out
+
+
+def build_best_parlay_across_cards(
+    cards: list[dict[str, Any]] | None,
+    *,
+    combined: pd.DataFrame | None = None,
+    ha_singles: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Best research 2-leg + 3-leg parlays over every loaded card.
+
+    Prefer an explicit ``combined`` frame (with ``event_name``); otherwise concat
+    each card's predictions and stamp ``event_name``.
+    """
+    frame = combined
+    if frame is None or getattr(frame, "empty", True):
+        frames: list[pd.DataFrame] = []
+        for card in cards or []:
+            preds = card.get("predictions")
+            if not isinstance(preds, pd.DataFrame) or preds.empty:
+                continue
+            chunk = preds.copy()
+            if "event_name" not in chunk.columns or chunk["event_name"].isna().all():
+                chunk["event_name"] = str(card.get("event_name") or "")
+            frames.append(chunk)
+        if not frames:
+            return []
+        frame = pd.concat(frames, ignore_index=True)
+    elif "event_name" not in frame.columns and cards:
+        # Stamp event_name from per-card rows when combined omitted it
+        by_id: dict[str, str] = {}
+        for card in cards:
+            ev = str(card.get("event_name") or "")
+            preds = card.get("predictions")
+            if not isinstance(preds, pd.DataFrame) or preds.empty or not ev:
+                continue
+            if "fight_id" in preds.columns:
+                for fid in preds["fight_id"].astype(str):
+                    by_id[fid] = ev
+        if by_id:
+            frame = frame.copy()
+            frame["event_name"] = frame.get("fight_id", pd.Series(dtype=str)).astype(str).map(
+                lambda x: by_id.get(x, "")
+            )
+    return build_auto_parlay_recommendations(frame, ha_singles=ha_singles)
 
 
 def compute_equity_metrics(equity: pd.Series) -> dict[str, float]:

@@ -90,22 +90,16 @@ def _event_sort_key(event: dict[str, str]) -> str:
 
 
 def _match_event_index(event_query: str, events: list[dict[str, str]]) -> int | None:
-    query = event_query.strip().lower()
-    if not query:
-        return None
-    query_slug = query.replace(" ", "-")
-    matches = [
-        i
-        for i, e in enumerate(events)
-        if query in str(e.get("event_name", "")).lower()
-        or query in str(e.get("event_path", "")).lower()
-        or query_slug in str(e.get("event_path", "")).lower()
-    ]
-    if not matches:
-        return None
-    if len(matches) > 1:
-        logger.warning("Multiple event matches for %r; using index %s", event_query, matches[0])
-    return matches[0]
+    from src.data_loader import match_event_query_index
+
+    return match_event_query_index(event_query, events)
+
+
+def _match_todays_card_index(events: list[dict[str, str]]) -> int:
+    """Index of today's UFC card if listed; else the soonest upcoming (index 0)."""
+    from src.data_loader import match_todays_card_index
+
+    return match_todays_card_index(events)
 
 
 def resolve_event(event_query: str | None) -> tuple[int, str]:
@@ -120,47 +114,45 @@ def resolve_event_targets(
     next_two: bool = False,
     last_two: bool = False,
     include_adjacent_week: bool = True,
+    todays_card: bool = False,
+    all_available: bool = False,
+    max_all_cards: int = 6,
 ) -> list[tuple[int, str]]:
     """
     Resolve one or more upcoming events for analysis.
 
+    - ``todays_card`` / "Today's Card" / "Current Card": event dated today, else next.
     - ``next_two``: two soonest upcoming cards, chronological (closest first).
+    - ``all_available``: every discovered upcoming card (capped).
     - Single named card + ``include_adjacent_week``: also include the paired
       adjacent card (indices 0 and 1 on the upcoming slate).
     - Multiple queries: each resolved, deduped, sorted chronologically.
     """
+    from src.data_loader import select_upcoming_event_indices
+
     next_two = next_two or last_two
     events = list_upcoming_events()
     if not events:
         raise SystemExit("No upcoming events found. Check network or try again later.")
 
-    indices: set[int] = set()
-
-    if next_two:
-        indices.update(range(min(2, len(events))))
-    elif isinstance(event_query, list):
-        for q in event_query:
-            if not q:
-                continue
-            idx = _match_event_index(q, events)
-            if idx is None:
-                raise SystemExit(f"Event not found: {q}")
-            indices.add(idx)
-    elif event_query:
-        idx = _match_event_index(event_query, events)
-        if idx is None:
-            logger.error("Event not found: %s", event_query)
+    try:
+        ordered = select_upcoming_event_indices(
+            events,
+            event_query,
+            next_two=next_two,
+            include_adjacent_week=include_adjacent_week,
+            todays_card=todays_card,
+            all_available=all_available,
+            max_all_cards=max_all_cards,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("Event not found:"):
+            logger.error("%s", msg)
             logger.info("Use --list-events to see available cards.")
-            raise SystemExit(1)
-        indices.add(idx)
-        if include_adjacent_week and len(events) >= 2 and idx in (0, 1):
-            indices.update({0, 1})
-    else:
-        indices.add(0)
-        if include_adjacent_week and len(events) >= 2:
-            indices.add(1)
+            raise SystemExit(1) from exc
+        raise SystemExit(msg) from exc
 
-    ordered = sorted(indices, key=lambda i: _event_sort_key(events[i]))
     return [(i, _event_label(events[i])) for i in ordered]
 
 

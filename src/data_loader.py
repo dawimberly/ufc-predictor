@@ -2173,6 +2173,127 @@ def card_content_fingerprint(card: pd.DataFrame) -> str:
     return ""
 
 
+def _parse_event_day(event: dict[str, str]):
+    """Best-effort calendar date from event metadata."""
+    raw = str(event.get("event_date") or event.get("date") or "").strip()
+    if not raw:
+        return None
+    try:
+        ts = pd.Timestamp(raw)
+        if pd.isna(ts):
+            return None
+        return ts.date()
+    except Exception:
+        try:
+            return datetime.fromisoformat(raw[:10]).date()
+        except Exception:
+            return None
+
+
+def match_todays_card_index(events: list[dict[str, str]]) -> int:
+    """
+    Index of today's UFC card if listed; else the soonest upcoming (index 0).
+
+    UFC cards often run evening→early morning; we match calendar date in UTC.
+    """
+    if not events:
+        return 0
+    today = datetime.now(timezone.utc).date()
+    for i, event in enumerate(events):
+        day = _parse_event_day(event)
+        if day == today:
+            return i
+    return 0
+
+
+def match_event_query_index(event_query: str, events: list[dict[str, str]]) -> int | None:
+    """Fuzzy match an event name/path against discovered upcoming events."""
+    query = str(event_query or "").strip().lower()
+    if not query:
+        return None
+    query_slug = query.replace(" ", "-")
+    matches = [
+        i
+        for i, e in enumerate(events)
+        if query in str(e.get("event_name", "")).lower()
+        or query in str(e.get("event_path", "")).lower()
+        or query_slug in str(e.get("event_path", "")).lower()
+    ]
+    if not matches:
+        return None
+    return matches[0]
+
+
+def select_upcoming_event_indices(
+    events: list[dict[str, str]],
+    event_query: str | list[str] | None = None,
+    *,
+    next_two: bool = False,
+    include_adjacent_week: bool = True,
+    todays_card: bool = False,
+    all_available: bool = False,
+    max_all_cards: int = 6,
+) -> list[int]:
+    """
+    Choose upcoming event indices for analysis (no I/O).
+
+    Modes: today's/current card, next two, all available, named query, or default next.
+    """
+    if not events:
+        return []
+
+    indices: set[int] = set()
+    query_text = ""
+    if isinstance(event_query, str):
+        query_text = event_query.strip().lower()
+
+    mode_today = todays_card or query_text in {
+        "today's card",
+        "todays card",
+        "today",
+        "current card",
+        "current",
+    }
+    mode_all = all_available or query_text in {
+        "all available cards",
+        "all cards",
+        "all available",
+    }
+
+    if mode_today:
+        indices.add(match_todays_card_index(events))
+    elif mode_all:
+        cap = max(1, min(int(max_all_cards or 6), len(events)))
+        indices.update(range(cap))
+    elif next_two:
+        indices.update(range(min(2, len(events))))
+    elif isinstance(event_query, list):
+        for q in event_query:
+            if not q:
+                continue
+            idx = match_event_query_index(q, events)
+            if idx is None:
+                raise ValueError(f"Event not found: {q}")
+            indices.add(idx)
+    elif event_query and query_text not in {"next card", "next two cards", "last two cards"}:
+        idx = match_event_query_index(event_query, events)
+        if idx is None:
+            raise ValueError(f"Event not found: {event_query}")
+        indices.add(idx)
+        if include_adjacent_week and len(events) >= 2 and idx in (0, 1):
+            indices.update({0, 1})
+    else:
+        indices.add(0)
+        if include_adjacent_week and len(events) >= 2:
+            indices.add(1)
+
+    def _sort_key(i: int) -> str:
+        e = events[i]
+        return str(e.get("event_date", "") or e.get("date", "") or "9999-12-31")
+
+    return sorted(indices, key=_sort_key)
+
+
 def list_upcoming_events(*, force_refresh: bool = False) -> list[dict[str, str]]:
     """
     Return upcoming UFC.com events for dashboard selection.
