@@ -893,6 +893,19 @@ def collect_card_analysis_inputs(
             preds_df,
             ha_singles=_ha_singles_from_books(books),
         )
+        # Prefer multi-card pool when books already carry event_name across cards
+        try:
+            from src.strategy import build_best_parlay_across_cards
+
+            cross = build_best_parlay_across_cards(
+                [],
+                combined=preds_df,
+                ha_singles=_ha_singles_from_books(books),
+            )
+            if cross:
+                recommended_parlays = cross
+        except Exception:
+            pass
         recommended_parlays = merge_ollama_reasons_into_parlays(recommended_parlays, [])
     except Exception as exc:
         logger.debug("auto parlay recommendations skipped: %s", exc)

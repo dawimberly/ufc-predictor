@@ -252,13 +252,17 @@ def format_recommended_parlay_header(p: dict[str, Any]) -> str:
         stake_txt = format_stake_pct_dollars(p)
     except Exception:
         stake_txt = f"${float(p.get('suggested_stake') or 0):.2f}"
+    scope = "across cards" if p.get("cross_card") else "same card"
+    events = p.get("events") or []
+    event_bit = f"  |  {', '.join(str(e) for e in events[:3])}" if events else ""
     return (
-        f"Recommended Parlay #{rank}  |  {p.get('n_legs', 0)}-Team  |  "
+        f"Recommended Parlay #{rank}  |  {p.get('n_legs', 0)}-Team  |  {scope}  |  "
         f"prob {p.get('combined_prob', 0):.0%}  |  "
         f"odds {odds_txt}  |  "
         f"EV {p.get('expected_value', 0):+.0%}  |  "
         f"stake {stake_txt}  |  "
         f"min leg edge {p.get('min_leg_edge', 0):.1%}"
+        f"{event_bit}"
     )
 
 

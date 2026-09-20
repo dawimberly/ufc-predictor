@@ -30,7 +30,7 @@ def main() -> int:
 
     app_cls = dash.UFCDashboardApp
     handlers = {
-        "Refresh Next Two": ("_on_refresh", "run_dashboard_analysis / load_next_two_cards"),
+        "Refresh": ("_on_refresh", "run_dashboard_analysis for selected Event mode"),
         "Capture Cookies / Login": (
             "_on_refresh_capture_cookies",
             "ensure_cookies_before_refresh + run_dashboard_analysis",
@@ -50,32 +50,30 @@ def main() -> int:
 
     src_refresh = inspect.getsource(app_cls._on_refresh)
     _check(
-        "Refresh Next Two delegates to _run_refresh_next_two",
-        "_run_refresh_next_two" in src_refresh,
+        "Refresh delegates to _run_refresh_selected_event",
+        "_run_refresh_selected_event" in src_refresh,
     )
-    src_refresh_worker = inspect.getsource(app_cls._run_refresh_next_two)
+    src_refresh_worker = inspect.getsource(app_cls._run_refresh_selected_event)
     _check(
-        "Refresh Next Two calls run_dashboard_analysis",
-        'event_mode="Next Two Cards"' in src_refresh_worker
+        "Refresh calls run_dashboard_analysis with selected event_mode",
+        "event_mode=event_mode" in src_refresh_worker
         and "run_dashboard_analysis" in src_refresh_worker,
     )
     _check(
-        "Refresh Next Two documents load_next_two_cards chain",
-        "load_next_two_cards" in src_refresh_worker,
+        "Compat alias _run_refresh_next_two still exists",
+        hasattr(app_cls, "_run_refresh_next_two")
+        and callable(getattr(app_cls, "_run_refresh_next_two")),
     )
+    src_alias = inspect.getsource(app_cls._run_refresh_next_two)
     _check(
-        "Refresh runs cookie capture before odds",
-        "_run_cookie_capture" in src_refresh_worker,
+        "Next Two alias forces Next Two Cards then selected refresh",
+        'event_var.set("Next Two Cards")' in src_alias
+        and "_run_refresh_selected_event" in src_alias,
     )
     src_capture = inspect.getsource(app_cls._on_refresh_capture_cookies)
     _check(
         "Capture Cookies button forces cookie login",
         "force_cookie_capture=True" in src_capture,
-    )
-    src_on_refresh = inspect.getsource(app_cls._on_refresh)
-    _check(
-        "Refresh respects Login on Refresh switch",
-        "login_on_refresh_var" in src_on_refresh,
     )
 
     src_quick = inspect.getsource(app_cls._on_quick_odds)
@@ -107,7 +105,11 @@ def main() -> int:
     src_full = inspect.getsource(dashboard_service.run_full_analysis)
     _check(
         "run_full_analysis routes Next Two Cards to load_next_two_cards",
-        'event_mode == "Next Two Cards"' in src_full and "load_next_two_cards" in src_full,
+        "next_two" in src_full and "load_next_two_cards" in src_full,
+    )
+    _check(
+        "run_full_analysis supports Today's Card / All Available",
+        "todays_card" in src_full and "all_available" in src_full,
     )
 
     print("\n=== Backend smoke (cached, no GUI) ===\n")

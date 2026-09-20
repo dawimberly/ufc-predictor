@@ -560,6 +560,7 @@ class DashboardPayload:
         self.from_cache = False
         self.prop_backtest: dict[str, Any] = {}
         self.arb_scan: dict[str, Any] = {}
+        self.recommended_parlays: list[dict[str, Any]] = []
 
     @property
     def all_preds(self) -> pd.DataFrame:
@@ -589,6 +590,8 @@ def _result_to_payload(data: dict[str, Any]) -> DashboardPayload:
     p.from_cache = bool(data.get("from_cache", False))
     p.prop_backtest = data.get("prop_backtest") if isinstance(data.get("prop_backtest"), dict) else {}
     p.arb_scan = data.get("arb_scan") if isinstance(data.get("arb_scan"), dict) else {}
+    parlays = data.get("recommended_parlays")
+    p.recommended_parlays = list(parlays) if isinstance(parlays, list) else []
     # Normalize book prediction frames so tab render never hits ambiguous truth checks.
     for book_data in p.books.values():
         if not isinstance(book_data, dict):
@@ -2751,7 +2754,10 @@ class GrokAnalysisPanel(_CTK_FRAME):
         ).pack(fill="x", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             bubble,
-            text="Auto 2-leg + 3-leg · research $0 (not HA-sized) · Green = stronger legs / Yellow = thinner",
+            text=(
+                "Auto 2-leg + 3-leg · research $0 (not HA-sized) · "
+                "may span cards · Green = stronger legs / Yellow = thinner"
+            ),
             font=ctk.CTkFont(size=11),
             text_color="#94a3b8",
             anchor="w",
@@ -4967,7 +4973,7 @@ class UFCDashboardApp(_CTK_BASE):
 
         self.show_all_props_var = ctk.BooleanVar(value=config.PAPER_PROPS_SHOW_ALL_DEFAULT)
         self.profile_var = ctk.StringVar(value="Paper")
-        self.event_var = ctk.StringVar(value="Next Two Cards")
+        self.event_var = ctk.StringVar(value="Today's Card")
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
@@ -5042,7 +5048,7 @@ class UFCDashboardApp(_CTK_BASE):
                     self.after(
                         0,
                         lambda: self._set_status(
-                            'Ready - click "Refresh Next Two" (no background cache).'
+                            'Ready - click "Refresh" (no background cache).'
                         ),
                     )
                     self.after(800, self._auto_refresh_if_empty)
@@ -5056,7 +5062,7 @@ class UFCDashboardApp(_CTK_BASE):
                 def apply() -> None:
                     if self._payload is not None or self._busy:
                         return
-                    self.event_var.set("Next Two Cards")
+                    self.event_var.set("Today's Card")
                     if full_ts is not None:
                         self._last_full_refresh_ts = full_ts
                     if odds_ts is not None:
@@ -5076,7 +5082,7 @@ class UFCDashboardApp(_CTK_BASE):
                 self.after(
                     0,
                     lambda: self._set_status(
-                        f"Ready - click Refresh Next Two (cache load failed: {exc})."
+                        f"Ready - click Refresh (cache load failed: {exc})."
                     ),
                 )
                 self.after(800, self._auto_refresh_if_empty)
@@ -5084,11 +5090,11 @@ class UFCDashboardApp(_CTK_BASE):
         threading.Thread(target=worker, daemon=True).start()
 
     def _auto_refresh_if_empty(self) -> None:
-        """First launch with no cache: run Next Two Cards refresh automatically."""
+        """First launch with no cache: run Today's Card refresh automatically."""
         if self._payload is not None or self._busy:
             return
-        _debug_log("No payload on startup - auto-running Refresh Next Two")
-        self.event_var.set("Next Two Cards")
+        _debug_log("No payload on startup - auto-running Refresh (Today's Card)")
+        self.event_var.set("Today's Card")
         self._on_refresh()
 
     @staticmethod
@@ -5546,6 +5552,115 @@ class UFCDashboardApp(_CTK_BASE):
             self.top_bets_panel.render(
                 items, pool_status=status, empty_reason=empty_reason
             )
+        self._render_overview_parlay_recs()
+
+    def _overview_recommended_parlays(self) -> list[dict[str, Any]]:
+        """Best 2/3-leg research parlays across every loaded card."""
+        if self._payload is None:
+            return []
+        parlays = list(getattr(self._payload, "recommended_parlays", None) or [])
+        if parlays:
+            return parlays
+        try:
+            from src.strategy import build_best_parlay_across_cards
+
+            return build_best_parlay_across_cards(
+                getattr(self._payload, "cards", None) or [],
+                combined=getattr(self._payload, "combined", None),
+            )
+        except Exception as exc:
+            _debug_log(f"overview parlay build failed: {exc}")
+            return []
+
+    def _render_overview_parlay_recs(self) -> None:
+        if not hasattr(self, "overview_parlay_frame"):
+            return
+        for w in self.overview_parlay_frame.winfo_children():
+            w.destroy()
+        parlays = self._overview_recommended_parlays()
+        if not parlays:
+            return
+        from src.bet_tiers import TIER_COLORS, TIER_GREEN, TIER_YELLOW
+
+        by_n: dict[int, dict[str, Any]] = {}
+        for p in parlays:
+            try:
+                n = int(p.get("n_legs") or 0)
+            except (TypeError, ValueError):
+                continue
+            if n in (2, 3) and n not in by_n:
+                by_n[n] = p
+        ordered = [by_n[n] for n in (2, 3) if n in by_n] or list(parlays)[:2]
+        if not ordered:
+            return
+
+        cross_any = any(bool(p.get("cross_card")) for p in ordered)
+        title = (
+            "Best parlays across loaded cards"
+            if cross_any or len(getattr(self._payload, "cards", None) or []) > 1
+            else "Best parlays (this card)"
+        )
+        bubble = ctk.CTkFrame(
+            self.overview_parlay_frame,
+            fg_color="#0f172a",
+            corner_radius=10,
+            border_width=2,
+            border_color="#475569",
+        )
+        bubble.pack(fill="x", padx=4, pady=2)
+        ctk.CTkLabel(
+            bubble,
+            text=f"{title} ({len(ordered)})",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#f8fafc",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(10, 2))
+        ctk.CTkLabel(
+            bubble,
+            text=(
+                "Research $0 · not HA-sized · legs may span events when multiple cards are loaded"
+            ),
+            font=ctk.CTkFont(size=11),
+            text_color="#94a3b8",
+            anchor="w",
+        ).pack(fill="x", padx=12, pady=(0, 8))
+        for p in ordered:
+            n = int(p.get("n_legs") or 0)
+            color = TIER_COLORS.get(
+                TIER_GREEN if p.get("ha_qualified") else TIER_YELLOW,
+                "#fde68a",
+            )
+            scope = "across cards" if p.get("cross_card") else "same card"
+            header = (
+                f"{n}-leg · {scope} · combined {float(p.get('combined_prob') or 0):.0%} · "
+                f"{p.get('picks') or p.get('pick_line') or ''}"
+            )
+            ctk.CTkLabel(
+                bubble,
+                text=_ascii_ui(header),
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color=color,
+                anchor="w",
+                justify="left",
+                wraplength=900,
+            ).pack(fill="x", padx=12, pady=(0, 2))
+            for i, leg in enumerate(p.get("legs") or [], start=1):
+                ev = str(leg.get("event_name") or "").strip()
+                ev_bit = f"  [{ev}]" if ev else ""
+                line = (
+                    f"  {i}. {leg.get('pick')} ({float(leg.get('prob') or 0):.0%})"
+                    f" — {leg.get('fight')}{ev_bit}"
+                )
+                ctk.CTkLabel(
+                    bubble,
+                    text=_ascii_ui(line),
+                    font=ctk.CTkFont(size=11),
+                    text_color="#cbd5e1",
+                    anchor="w",
+                    justify="left",
+                    wraplength=900,
+                ).pack(fill="x", padx=12, pady=(0, 1))
+        ctk.CTkLabel(bubble, text="", height=6).pack()
 
     def _build_control_header(self) -> None:
         """Slim top bar: Profile · Event · actions · Bankroll."""
@@ -5570,10 +5685,11 @@ class UFCDashboardApp(_CTK_BASE):
         self.event_menu = ctk.CTkOptionMenu(
             top,
             variable=self.event_var,
-            values=["Next Two Cards", "Next Card", "UFC 329"],
-            width=140,
+            values=self._default_event_menu_values(),
+            width=170,
         )
         self.event_menu.pack(side="left", padx=(0, 10))
+        self.after(200, self._refresh_event_menu_options)
 
         # Actions stay on the first row so they never get pushed below the fold.
         self.refresh_btn = ctk.CTkButton(
@@ -5584,12 +5700,12 @@ class UFCDashboardApp(_CTK_BASE):
             state="normal",
             fg_color="#2563eb",
             hover_color="#3b82f6",
-            command=self._wrap_button_click("Refresh Next Two", self._on_refresh),
+            command=self._wrap_button_click("Refresh", self._on_refresh),
         )
         self.refresh_btn.pack(side="left", padx=(0, 4))
         _ToolTip(
             self.refresh_btn,
-            "Refresh Next Two — load UFC.com cards (predictions). Reuses odds cache when ODDS_FETCH_ONCE.",
+            "Refresh the selected Event (Today's Card, Next Two, All Available, or a named card).",
         )
 
         self.soft_update_btn = ctk.CTkButton(
@@ -5735,6 +5851,8 @@ class UFCDashboardApp(_CTK_BASE):
         self.overview_fights_scroll.pack(fill="x", padx=10, pady=(0, 6))
         self.top_bets_panel = TopRecommendedBetsPanel(self.overview_page)
         self.top_bets_panel.pack(fill="x", padx=8, pady=(2, 6))
+        self.overview_parlay_frame = ctk.CTkFrame(self.overview_page, fg_color="transparent")
+        self.overview_parlay_frame.pack(fill="x", padx=8, pady=(0, 6))
         self.gane_foul_panel = GaneFoulScenarioPanel(self.overview_page)
         self.gane_foul_panel.pack_forget()
 
@@ -5974,6 +6092,41 @@ class UFCDashboardApp(_CTK_BASE):
             self._set_status(f"Config reload failed: {exc}")
             self._show_error(f"Reload Config: {exc}")
 
+    def _default_event_menu_values(self) -> list[str]:
+        return [
+            "Today's Card",
+            "Current Card",
+            "Next Card",
+            "Next Two Cards",
+            "All Available Cards",
+        ]
+
+    def _refresh_event_menu_options(self) -> None:
+        """Populate Event menu with modes + live UFC.com event names."""
+        if not hasattr(self, "event_menu"):
+            return
+        modes = self._default_event_menu_values()
+        names: list[str] = []
+        try:
+            from src.data_loader import list_upcoming_events
+
+            for ev in list_upcoming_events(force_refresh=False)[:8]:
+                label = str(ev.get("event_name") or "").strip()
+                if label and label not in modes and label not in names:
+                    names.append(label)
+        except Exception as exc:
+            _debug_log(f"event menu discovery failed: {exc}")
+        values = modes + names
+        current = self.event_var.get() if hasattr(self, "event_var") else modes[0]
+        try:
+            self.event_menu.configure(values=values)
+            if current in values:
+                self.event_var.set(current)
+            elif "Today's Card" in values:
+                self.event_var.set("Today's Card")
+        except Exception as exc:
+            _debug_log(f"event menu configure failed: {exc}")
+
     def _on_soft_update(self) -> None:
         """Reload config + Quick Odds in one click."""
         _debug_log("Soft Update: reload config then Quick Odds")
@@ -6200,26 +6353,25 @@ class UFCDashboardApp(_CTK_BASE):
         )
 
     def _on_refresh(self) -> None:
-        """Load next two cards (predictions); odds reuse cache when ODDS_FETCH_ONCE."""
-        self._run_refresh_next_two()
+        """Load the Event menu selection (Today's Card / Next Two / All / named)."""
+        self._run_refresh_selected_event()
 
-    def _run_refresh_next_two(self) -> None:
-        """Refresh Next Two worker — UFC.com cards + cached Odds API merge."""
+    def _run_refresh_selected_event(self) -> None:
+        """Refresh worker — UFC.com card(s) for the selected Event mode."""
         if self._busy:
-            _button_debug("Refresh Next Two ignored - already busy")
+            _button_debug("Refresh ignored - already busy")
             self._set_status("Already running - wait for the current operation to finish.")
             return
         if run_full_analysis is None:
             self._set_status("Dashboard still loading - wait 5s and try Refresh again.")
             return
         self._set_busy(True)
-        self.event_var.set("Next Two Cards")
-        self._on_progress(
-            "Refresh: next two upcoming cards (predictions + odds)...", 0.02
-        )
+        self._refresh_event_menu_options()
+        event_mode = str(self.event_var.get() or "Today's Card").strip() or "Today's Card"
+        self._on_progress(f"Refresh: {event_mode} (predictions + odds)...", 0.02)
         _button_debug(
-            "Refresh Next Two -> run_dashboard_analysis(event_mode='Next Two Cards') "
-            "-> run_full_analysis() -> load_next_two_cards()"
+            f"Refresh -> run_dashboard_analysis(event_mode={event_mode!r}) "
+            "-> run_full_analysis()"
         )
 
         profile = self._profile_from_menu(self.profile_var.get())
@@ -6236,12 +6388,12 @@ class UFCDashboardApp(_CTK_BASE):
 
                     cleared = clear_stale_upcoming_card_caches(max_age_hours=24.0, force=True)
                     if cleared:
-                        _button_debug(f"Refresh Next Two cleared card caches: {cleared}")
+                        _button_debug(f"Refresh cleared card caches: {cleared}")
                 except Exception as clear_exc:
                     _debug_log(f"Card cache clear skipped: {clear_exc}")
 
                 payload = run_dashboard_analysis(
-                    event_mode="Next Two Cards",
+                    event_mode=event_mode,
                     profile=profile,
                     # ODDS_FETCH_ONCE: reuse first odds download; do not re-pull
                     force_refresh_odds=False,
@@ -6255,17 +6407,17 @@ class UFCDashboardApp(_CTK_BASE):
                     for c in (payload.cards or [])
                     if str(c.get("event_name") or "").strip()
                 ]
-                _button_debug(f"Loading Next Two Cards: {card_names}")
+                _button_debug(f"Loading {event_mode}: {card_names}")
                 if _df_is_empty(getattr(payload, "combined", None)):
                     from src.dashboard_service import _background_analysis_fallback
 
                     fb = _background_analysis_fallback(profile=profile)
                     if fb:
                         payload = _result_to_payload({**fb, "profile": profile})
-                        _button_debug("Refresh Next Two: applied background cache fallback (live empty)")
+                        _button_debug("Refresh: applied background cache fallback (live empty)")
                     else:
                         _button_debug(
-                            "Refresh Next Two: live empty and no matching background cache "
+                            "Refresh: live empty and no matching background cache "
                             "(refusing stale Freedom 250)"
                         )
 
@@ -6273,7 +6425,7 @@ class UFCDashboardApp(_CTK_BASE):
                     n_fights = _df_row_count(getattr(payload, "combined", None))
                     n_cards = _df_row_count(getattr(payload, "cards", None))
                     _button_debug(
-                        f"Refresh Next Two complete -> _apply_payload "
+                        f"Refresh complete -> _apply_payload "
                         f"({n_fights} fights, {n_cards} cards, "
                         f"events={card_names})"
                     )
@@ -6307,6 +6459,11 @@ class UFCDashboardApp(_CTK_BASE):
                 self.after(0, self._finish_busy)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    # Compat alias for older wiring / scripts
+    def _run_refresh_next_two(self) -> None:
+        self.event_var.set("Next Two Cards")
+        self._run_refresh_selected_event()
 
     def _on_process_new_card(self) -> None:
         if self._busy:
