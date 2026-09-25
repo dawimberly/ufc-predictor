@@ -94,7 +94,7 @@ def test_prompt_includes_top5_warning_and_tiers():
         "skipped": [],
     }
     prompt = build_grok_prompt(inputs)
-    assert "ADVISORY" in prompt
-    assert "ACTIONABLE" in prompt
-    assert "Top 5" in prompt
-    assert "WARNING" in prompt
+    assert "BET THIS" in prompt
+    assert "FUN ONLY" in prompt
+    assert "agree with the bot" in prompt.lower()
+    assert TOP5_WARNING.split(".")[0] in prompt

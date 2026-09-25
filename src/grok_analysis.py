@@ -191,6 +191,127 @@ def _llm_asserts_pick_flip(bet: dict[str, Any], item: dict[str, Any]) -> bool:
     return False
 
 
+def _action_bucket_from_text(text: str) -> str | None:
+    """Map a narrative snippet to bet/fun/caution/skip. None when it states no action."""
+    u = str(text or "").upper()
+    if not u.strip():
+        return None
+    if "DO NOT BET" in u:
+        return "skip"
+    if "FUN ONLY" in u:
+        return "fun"
+    if "TINY PAPER" in u:
+        return "bet"
+    if "CAUTION" in u or "SKIP SIZED" in u:
+        return "caution"
+    if "BET THIS" in u:
+        return "bet"
+    if "NO BET" in u:
+        return "skip"
+    return None
+
+
+def _ticket_action_bucket(ticket: dict[str, Any]) -> str:
+    try:
+        from src.bet_tiers import action_label_for_bet
+
+        label = action_label_for_bet(ticket)
+    except Exception:
+        stake = 0.0
+        try:
+            stake = float(ticket.get("stake_usd") or ticket.get("suggested_stake") or 0)
+        except (TypeError, ValueError):
+            stake = 0.0
+        if ticket.get("advisory") or ticket.get("fun_bet"):
+            return "fun"
+        return "bet" if stake > 0 else "caution"
+    return _action_bucket_from_text(label) or "caution"
+
+
+def _other_corner_name(ticket: dict[str, Any]) -> str:
+    side = str(ticket.get("side") or ticket.get("pick_line") or "")
+    parts = re.split(r"\s+over\s+", side, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) == 2 and parts[1].strip():
+        return parts[1].strip()
+    pick = _normalize_name(
+        ticket.get("pick") or ticket.get("side") or ticket.get("predicted_winner")
+    )
+    f1 = str(ticket.get("fighter_1") or ticket.get("fighter1") or "").strip()
+    f2 = str(ticket.get("fighter_2") or ticket.get("fighter2") or "").strip()
+    if f1 and f2 and pick:
+        n1 = _normalize_name(f1)
+        n2 = _normalize_name(f2)
+        if pick == n1 or n1 in pick or pick in n1:
+            return f2
+        if pick == n2 or n2 in pick or pick in n2:
+            return f1
+    return ""
+
+
+def _text_backs_other_corner(text: str, ticket: dict[str, Any]) -> bool:
+    other = _other_corner_name(ticket)
+    if len(other) < 3:
+        return False
+    low = _normalize_name(text)
+    other_n = _normalize_name(other)
+    if other_n not in low:
+        return False
+    cues = (
+        f"bet {other_n}",
+        f"take {other_n}",
+        f"pick {other_n}",
+        f"like {other_n}",
+        f"lean {other_n}",
+        f"{other_n} wins",
+        f"{other_n} to win",
+        f"side with {other_n}",
+        f"rather {other_n}",
+        f"instead {other_n}",
+    )
+    return any(cue in low for cue in cues)
+
+
+def ollama_disagrees_with_ticket(ticket: dict[str, Any], item: dict[str, Any]) -> bool:
+    """True when Ollama names another side or a different action than the bot ticket."""
+    if _llm_asserts_pick_flip(ticket, item):
+        return True
+    bot_sized = _ticket_action_bucket(ticket) == "bet"
+    for key in ("reason", "narrative_edge", "narrative", "side"):
+        blob = str(item.get(key) or "")
+        bucket = _action_bucket_from_text(blob)
+        # Sized vs not-sized is a different opinion. FUN ONLY vs CAUTION vs DO NOT BET
+        # are all $0 and stay with the bot's wording when the side matches.
+        if bucket is not None and (bucket == "bet") != bot_sized:
+            return True
+        if _text_backs_other_corner(blob, ticket):
+            return True
+    return False
+
+
+def summary_conflicts_with_tickets(summary: str, tickets: list[dict[str, Any]]) -> bool:
+    """True when the card summary recommends a different action or corner than the slip."""
+    text = str(summary or "").strip()
+    if not text or not tickets:
+        return False
+    bot_buckets = {_ticket_action_bucket(t) for t in tickets}
+    has_bet = "bet" in bot_buckets
+    text_bucket = _action_bucket_from_text(text)
+    upper = text.upper()
+    if has_bet and text_bucket in {"skip", "fun", "caution"} and "BET THIS" not in upper:
+        return True
+    if (
+        not has_bet
+        and text_bucket == "bet"
+        and "FUN ONLY" not in upper
+        and "NO BET" not in upper
+    ):
+        return True
+    return any(_text_backs_other_corner(text, t) for t in tickets)
+
+
+OPINION_NOTE = "Ollama disagreed with the bot — showing the bot's picks and stakes."
+
+
 def _llm_tries_inflate_edge(item: dict[str, Any]) -> bool:
     for key in _EDGE_INFLATE_KEYS:
         if key not in item:
@@ -266,6 +387,9 @@ def resolve_narrative_tilt(
 
     if _llm_asserts_pick_flip(bet, item):
         return _done(1.0, "rejected", "pick_flip_rejected", conviction, narrative)
+
+    if ollama_disagrees_with_ticket(bet, item):
+        return _done(1.0, "rejected", "opinion_discarded", conviction, "")
 
     if _llm_tries_inflate_edge(item):
         return _done(1.0, "rejected", "edge_inflate_rejected", conviction, narrative)
@@ -475,6 +599,8 @@ def build_grok_prompt(inputs: dict[str, Any]) -> str:
     return f"""UFC desk. JSON only. Profile={profile} Bankroll={br_txt} Card={card_txt}
 {what_to_do}{warning}
 Rules: use ONLY listed tickets/parlays; copy stake_pct/stake_usd exactly; never invent odds/edge/prob;
+Agree with the bot: copy each ticket ACTION and side. Do not name a different fighter or a different ACTION.
+A conflicting opinion is discarded and the bot's ticket is shown instead.
 In summary + each pick reason, lead with ACTION verbs: BET THIS ($), FUN ONLY ($0), CAUTION — SKIP SIZED, or DO NOT BET.
 FUN ONLY / advisory stakes stay 0 — never tell the user to size those as bankroll bets.
 Parlays are research ($0) unless already BET THIS; one-line reason (<=90 chars); empty ACT list => say sized NO BET.
@@ -968,12 +1094,18 @@ def merge_ollama_reasons_into_slip(
     tickets: list[dict[str, Any]],
     ollama_picks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Attach Ollama one-line reasons onto HA-sized tickets (stakes unchanged)."""
+    """Attach Ollama one-line reasons onto HA-sized tickets (stakes unchanged).
+
+    Reasons that name a different side or action than the bot ticket are dropped.
+    """
     by_id = {str(p.get("id") or "").strip(): p for p in ollama_picks if p.get("id")}
     out: list[dict[str, Any]] = []
     for t in tickets:
         row = dict(t)
         match = by_id.get(str(t.get("id") or "").strip())
+        if match and ollama_disagrees_with_ticket(row, match):
+            row["ollama_opinion_discarded"] = True
+            match = None
         if match:
             reason = str(match.get("reason") or match.get("narrative_edge") or "").strip()
             reason = " ".join(reason.replace("\n", " ").split())
@@ -999,6 +1131,41 @@ def merge_ollama_reasons_into_slip(
             row["tier"] = "advisory"
         out.append(row)
     return out
+
+
+def apply_bot_alignment(result: dict[str, Any], tickets: list[dict[str, Any]]) -> dict[str, Any]:
+    """Drop Ollama rows that disagree with the bot and keep the bot's summary."""
+    picks = [p for p in (result.get("picks") or []) if isinstance(p, dict)]
+    kept: list[dict[str, Any]] = []
+    dropped = 0
+    by_id = {str(t.get("id") or "").strip(): t for t in tickets}
+    for pick in picks:
+        pid = str(pick.get("id") or "").strip()
+        ticket = by_id.get(pid)
+        if ticket is None:
+            continue
+        if ollama_disagrees_with_ticket(ticket, pick):
+            dropped += 1
+            continue
+        aligned = dict(pick)
+        aligned["side"] = str(ticket.get("side") or aligned.get("side") or "")
+        kept.append(aligned)
+    result["picks"] = kept
+    result["bet_slip"] = merge_ollama_reasons_into_slip(tickets, kept)
+    summary = str(result.get("summary") or "")
+    if summary_conflicts_with_tickets(summary, tickets):
+        try:
+            from src.bet_tiers import format_what_to_do_header
+
+            summary = format_what_to_do_header(slip=tickets)
+        except Exception:
+            summary = "WHAT TO BET follows the bot's tickets."
+        dropped += 1
+    result["summary"] = summary
+    if dropped:
+        result["opinion_note"] = OPINION_NOTE
+        result["ollama_opinions_dropped"] = dropped
+    return result
 
 
 def merge_ollama_reasons_into_parlays(
@@ -1029,10 +1196,14 @@ def merge_ollama_reasons_into_parlays(
             reason = " ".join(reason.replace("\n", " ").split())
             if len(reason) > 120:
                 reason = reason[:119].rstrip() + "…"
+            # Parlays are research ($0). A "BET THIS" narration is a different opinion.
+            if reason and _action_bucket_from_text(reason) == "bet":
+                reason = ""
+                row["ollama_opinion_discarded"] = True
             if reason:
                 row["reason"] = reason
             conv = str(match.get("conviction") or "").lower()
-            if conv in {"high", "medium", "low"}:
+            if conv in {"high", "medium", "low"} and reason:
                 row["conviction"] = conv
         if not row.get("reason"):
             comb = float(row.get("combined_prob") or 0)
@@ -1056,7 +1227,7 @@ def _predictions_frame_from_books(books: dict[str, dict[str, Any]] | None):
 
     if not books:
         return None
-    preferred = ("Overview", "Odds API", "MyBookie", "Consensus")
+    preferred = ("Overview", "DraftKings", "Odds API", "MyBookie", "Consensus")
     order = list(dict.fromkeys((*preferred, *tuple(books))))
     for book in order:
         data = books.get(book) or {}
@@ -1218,6 +1389,7 @@ def query_ollama(
 
     system = (
         "You are a concise UFC betting analyst. "
+        "Explain the bot's tickets. Do not offer a different fighter or action. "
         "Respond with valid JSON only — no commentary outside the JSON object."
     )
     # Card narrate is short JSON — don't burn the full 600s budget on CPU.
@@ -1410,9 +1582,7 @@ def analyze_card_with_grok(
             out = dict(cached)
             out["from_cache"] = True
             out["ok"] = True
-            out["bet_slip"] = merge_ollama_reasons_into_slip(
-                tickets, out.get("picks") or []
-            )
+            apply_bot_alignment(out, tickets)
             out["recommended_parlays"] = merge_ollama_reasons_into_parlays(
                 list(inputs.get("recommended_parlays") or []),
                 out.get("ollama_parlays") or out.get("parlays") or [],
@@ -1457,7 +1627,7 @@ def analyze_card_with_grok(
         result["source"] = "ollama"
         result["no_bet"] = bool(inputs.get("no_bet"))
         result["no_usable_odds"] = no_odds
-        result["bet_slip"] = merge_ollama_reasons_into_slip(tickets, result.get("picks") or [])
+        apply_bot_alignment(result, tickets)
         result["recommended_parlays"] = merge_ollama_reasons_into_parlays(
             list(inputs.get("recommended_parlays") or []),
             result.get("ollama_parlays") or [],
@@ -1616,6 +1786,22 @@ def _analysis_context_for_chat(result: dict[str, Any] | None) -> str:
     return briefing
 
 
+def _chat_answer_disagrees(answer: str, briefing: str) -> bool:
+    """True when chat text recommends a different action than the bot briefing."""
+    bot_bucket = _action_bucket_from_text(briefing)
+    ans_bucket = _action_bucket_from_text(answer)
+    if not bot_bucket or not ans_bucket or ans_bucket == bot_bucket:
+        return False
+    upper = str(answer or "").upper()
+    if bot_bucket == "bet" and "BET THIS" in upper:
+        return False
+    if bot_bucket == "fun" and "FUN ONLY" in upper:
+        return False
+    if bot_bucket in {"skip", "caution"} and ("DO NOT BET" in upper or "NO BET" in upper):
+        return False
+    return True
+
+
 def answer_ollama_chat(
     question: str,
     *,
@@ -1683,6 +1869,7 @@ def answer_ollama_chat(
     system = (
         "You are a concise UFC betting assistant for this dashboard. "
         "Use ONLY the provided ticket/stats context. "
+        "Agree with the bot. Do not recommend a different fighter or action. "
         "Never invent fights, odds, edges, or stakes. "
         "Always separate BET THIS (sized $) from FUN ONLY ($0 research) and DO NOT BET. "
         "If no BET THIS tickets, say sized NO BET first, then optional FUN ONLY leans. "
@@ -1706,8 +1893,16 @@ def answer_ollama_chat(
             temperature=0.2,
         )
         answer = " ".join(str(text or "").split())
+        source = "ollama_chat"
         if not answer:
             answer = briefing
+            source = "ha_briefing"
+        elif _chat_answer_disagrees(answer, briefing):
+            answer = (
+                f"{briefing}\n\n"
+                "(Ollama disagreed with the bot, so this stays the bot's card.)"
+            )
+            source = "ha_briefing"
         elif best_intent and briefing not in answer:
             # Keep stats visible even when the model paraphrases.
             answer = f"{briefing}\n\n---\n{answer}"
@@ -1715,7 +1910,7 @@ def answer_ollama_chat(
             "ok": True,
             "answer": answer,
             "briefing": briefing,
-            "source": "ollama_chat",
+            "source": source,
             "model": model_used,
         }
     except Exception as exc:
@@ -1787,10 +1982,13 @@ def apply_grok_kelly_adjustments(
         row["grok_kelly_factor"] = factor
         row["narrative_tilt_status"] = decision.status
         row["narrative_tilt_reason"] = decision.reason
-        row["grok_conviction"] = decision.conviction or (item or {}).get("conviction", "")
-        row["grok_narrative"] = decision.narrative
-        if decision.narrative:
-            # Explanation only — keep existing model brief when present
+        dissent = decision.reason in {"pick_flip_rejected", "opinion_discarded"}
+        row["grok_conviction"] = "" if dissent else (
+            decision.conviction or (item or {}).get("conviction", "")
+        )
+        row["grok_narrative"] = "" if dissent else decision.narrative
+        if decision.status == "applied" and decision.narrative and not dissent:
+            # Explanation only — agreeing narrative may fill an empty model brief
             row["reason"] = decision.narrative
             if not row.get("brief"):
                 row["brief"] = decision.narrative

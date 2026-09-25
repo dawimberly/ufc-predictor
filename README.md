@@ -76,7 +76,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
 | **Arb Scanner** | Cross-book arb scan |
 
-BetNow / DraftKings (and their Props tabs) appear only when those scrapers are enabled in `.env` (keep DraftKings off to protect Odds API quota).
+DraftKings (and Props - DraftKings) load by default. BetNow appears only when `BETNOW_ENABLED=true`. MyBookie stays off unless `MYBOOKIE_ENABLED=true`. The first DraftKings pull is one extra Odds API request; `ODDS_FETCH_ONCE` caches it after that.
 
 ### Toolbar
 
@@ -123,7 +123,7 @@ Advisory **2-leg** and **3-leg** research parlays are built from HA singles / hi
 
 ### AI narrative
 
-**Ollama Analysis** is the default narrative tab (local; default model `qwen2.5-coder:7b`). It never invents bets — HA tickets still show if the LLM times out.
+**Ollama Analysis** is the default narrative tab (local; default model `qwen2.5-coder:7b`). It explains the bot's tickets. A different fighter or a different sized-vs-$0 action is discarded, and the bot's pick stays. HA tickets still show if the LLM times out.
 
 Prompts and the Stats / Best bets briefing use the same action verbs (**BET THIS** / **FUN ONLY** / **DO NOT BET**). Ask “best bets” → sized tickets first with `$`, then optional FUN ONLY leans, never treating Green as bankroll.
 
@@ -136,7 +136,7 @@ Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) an
 ## Odds sources
 
 1. **The Odds API** (free tier) — primary moneylines + props when enabled  
-2. **Optional scrapers** — MyBookie / BetNow / DraftKings when toggled on  
+2. **DraftKings** — on by default (moneylines + props). MyBookie / BetNow only when toggled on  
 3. **Fail-closed** — no usable odds → `NO BET — no usable odds (fail-closed)`  
 4. **Quota-safe cache** — `ODDS_FETCH_ONCE=true` reuses the first download until you delete cache files
 
@@ -146,7 +146,8 @@ Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) an
 | `ODDS_FETCH_ONCE` | `true` | Reuse first download until cache deleted |
 | `ODDS_CACHE_TTL_MINUTES` | `20` | Only when fetch-once is off |
 | `MYBOOKIE_ENABLED` | `false` | Optional scraper |
-| `BETNOW_ENABLED` / `DRAFTKINGS_ENABLED` | `false` | Optional; keep DK off for quota |
+| `DRAFTKINGS_ENABLED` | `true` | DraftKings moneylines + props |
+| `BETNOW_ENABLED` | `false` | Optional scraper |
 
 Delete only when you want a fresh live pull:
 
@@ -158,10 +159,10 @@ Delete only when you want a fresh live pull:
 
 | Profile | Use |
 |---------|-----|
-| **Paper** (default) | Simulation / dashboard — looser card %; Sky Blue override allowed |
-| **Live** | Real money — hard USD card cap; wide CI fail-closed |
+| **Live** (default) | DraftKings bankroll — hard USD card cap; wide CI fail-closed |
+| **Paper** | Simulation only — looser card %; Sky Blue override allowed |
 
-Set `UFC_PROFILE=paper` or `live` in `.env`. Legacy `research` → paper.
+Set `UFC_PROFILE=live` (default) or `paper` in `.env`. Legacy `research` → paper. There is no paper sportsbook account — Paper is a simulation profile in the dashboard menu.
 
 Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Blue):
 
@@ -257,7 +258,7 @@ Copy `.env.example` → `.env`. Important keys:
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `UFC_PROFILE` | paper | Paper vs Live risk caps |
+| `UFC_PROFILE` | live | Live DraftKings caps; Paper is simulation only |
 | `INITIAL_BANKROLL` | 75 | Starting bankroll |
 | `THE_ODDS_API_KEY` | — | Odds API key |
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
@@ -270,7 +271,7 @@ Copy `.env.example` → `.env`. Important keys:
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
 | `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
-| `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
+| `DRAFTKINGS_ENABLED` | true | DraftKings lines (cached after first pull) |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |

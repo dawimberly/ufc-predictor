@@ -2595,6 +2595,15 @@ class GrokAnalysisPanel(_CTK_FRAME):
                 color="#fbbf24",
             )
 
+        opinion_note = str(result.get("opinion_note") or "").strip()
+        if opinion_note:
+            self._pack_message(
+                "Aligned with the bot",
+                opinion_note,
+                color="#93c5fd",
+                title_size=12,
+            )
+
         summary = str(result.get("summary") or "").strip()
         summary_is_no_bet = "NO BET" in summary.upper()
         if summary and not summary_is_no_bet:
@@ -4961,12 +4970,15 @@ class UFCDashboardApp(_CTK_BASE):
         self._updating_budget = False
         self._budget_after_id: str | None = None
 
-        config.UFC_PROFILE = "paper"
         config.apply_profile_overrides()
         self._budget_state = config.apply_budget_state()
 
-        self.show_all_props_var = ctk.BooleanVar(value=config.PAPER_PROPS_SHOW_ALL_DEFAULT)
-        self.profile_var = ctk.StringVar(value="Paper")
+        self.show_all_props_var = ctk.BooleanVar(
+            value=bool(config.PAPER_PROPS_SHOW_ALL_DEFAULT) and config.is_paper_profile()
+        )
+        self.profile_var = ctk.StringVar(
+            value="Live" if config.is_live_profile() else "Paper"
+        )
         self.event_var = ctk.StringVar(value="Next Two Cards")
 
         self.grid_columnconfigure(0, weight=1)

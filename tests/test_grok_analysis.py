@@ -121,6 +121,8 @@ def test_build_grok_prompt_includes_constraints():
     assert "A over B" in prompt
     assert "stake=38" in prompt
     assert "never invent" in prompt.lower()
+    assert "agree with the bot" in prompt.lower()
+    assert "different fighter" in prompt.lower()
     assert "Auto parlays" in prompt
     assert "2-leg" in prompt and "3-leg" in prompt
     assert "parlays" in prompt
@@ -145,6 +147,75 @@ def test_merge_ollama_reasons_keeps_ha_stakes():
     assert out[0]["stake_pct"] == 40.0
     assert out[0]["stake_usd"] == 22.0
     assert "grappler" in out[0]["reason"]
+
+
+def test_merge_drops_dissenting_ollama_opinion():
+    from src.grok_analysis import merge_ollama_reasons_into_slip
+
+    tickets = [
+        {
+            "id": "f1",
+            "side": "Jon Jones over Stipe",
+            "pick": "Jon Jones",
+            "fighter_1": "Jon Jones",
+            "fighter_2": "Stipe",
+            "market": "moneyline",
+            "stake_pct": 40.0,
+            "stake_usd": 22.0,
+            "confidence": "high",
+            "edge_pct": 8.0,
+        }
+    ]
+    picks = [
+        {
+            "id": "f1",
+            "side": "Stipe",
+            "pick": "Stipe",
+            "reason": "DO NOT BET Jon Jones — take Stipe to win",
+            "conviction": "high",
+        }
+    ]
+    out = merge_ollama_reasons_into_slip(tickets, picks)
+    assert out[0]["stake_usd"] == 22.0
+    assert out[0]["ollama_opinion_discarded"] is True
+    assert "Stipe" not in out[0]["reason"]
+    assert "8.0" in out[0]["reason"]
+
+
+def test_summary_conflict_uses_bot_header():
+    from src.grok_analysis import apply_bot_alignment
+
+    tickets = [
+        {
+            "id": "f1",
+            "side": "Alice over Bob",
+            "pick": "Alice",
+            "stake_usd": 12.0,
+            "stake_pct": 20.0,
+            "confidence": "high",
+            "edge_pct": 9.0,
+        }
+    ]
+    result = apply_bot_alignment(
+        {
+            "summary": "DO NOT BET this card. I like Bob to win.",
+            "picks": [
+                {
+                    "id": "f1",
+                    "side": "Bob",
+                    "pick": "Bob",
+                    "reason": "DO NOT BET Alice — bet Bob to win",
+                }
+            ],
+        },
+        tickets,
+    )
+    assert result["picks"] == []
+    assert "WHAT TO BET" in result["summary"]
+    assert "Alice" in result["summary"]
+    assert result["opinion_note"]
+    assert result["bet_slip"][0]["stake_usd"] == 12.0
+    assert "Bob" not in result["bet_slip"][0]["reason"]
 
 def test_low_conviction_forces_one(monkeypatch):
     import config
@@ -288,6 +359,53 @@ def test_apply_low_conviction_no_scale(monkeypatch):
     assert out[0]["suggested_stake"] == 8.0
     assert out[0]["grok_kelly_factor"] == 1.0
     assert out[0]["grok_narrative"] == "Thin edge"
+
+
+def test_chat_dissent_detected():
+    from src.grok_analysis import _chat_answer_disagrees
+
+    briefing = "WHAT TO BET (sized): Alice (BET THIS $4.00)"
+    assert _chat_answer_disagrees("DO NOT BET Alice. Take Bob to win.", briefing)
+    assert not _chat_answer_disagrees(
+        "BET THIS Alice at $4. The bot likes the wrestling.",
+        briefing,
+    )
+
+
+def test_pick_flip_does_not_replace_bot_reason(monkeypatch):
+    import config
+
+    monkeypatch.setattr(config, "NARRATIVE_TILT_ENABLED", True)
+    monkeypatch.setattr(config, "UFC_PROFILE", "live")
+    bets = [
+        {
+            "fight_id": "f1",
+            "pick": "Jon Jones",
+            "fighter_1": "Jon Jones",
+            "fighter_2": "Stipe",
+            "edge_pct": 6.0,
+            "suggested_stake": 8.0,
+            "reason": "model likes Jones",
+        }
+    ]
+    grok = {
+        "ok": True,
+        "picks": [
+            {
+                "id": "f1",
+                "pick": "Stipe",
+                "kelly_adjustment": 1.08,
+                "reason": "take Stipe to win",
+                "conviction": "high",
+            }
+        ],
+    }
+    out = apply_grok_kelly_adjustments(bets, grok)
+    assert out[0]["suggested_stake"] == 8.0
+    assert out[0]["pick"] == "Jon Jones"
+    assert out[0]["reason"] == "model likes Jones"
+    assert out[0]["grok_narrative"] == ""
+    assert out[0]["narrative_tilt_reason"] == "pick_flip_rejected"
 
 
 def test_apply_noop_when_failed():

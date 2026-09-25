@@ -516,9 +516,9 @@ ACTION_NETWORK_UFC_URL = os.getenv(
     "https://api.actionnetwork.com/web/v1/scoreboard/ufc",
 )
 
-# Optional book scrapers / DK API pass — OFF by default (free sources only)
+# Optional book scrapers. DraftKings is on (real account). BetNow / MyBookie stay off.
 BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
-DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")
+DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "true")
 BETNOW_PROPS_URL = os.getenv(
     "BETNOW_PROPS_URL",
     "https://www.betnow.eu/sportsbook-info/fighting/ufc/",
@@ -583,8 +583,8 @@ STRATEGY_PERFORMANCE_JSON = DATA_DIR / "strategy_performance.json"
 # --- Profile: paper (simulation) vs live (real money) ---
 
 def normalize_profile(name: str | None) -> str:
-    """Map legacy 'research' → 'paper'; default paper."""
-    n = (name or "paper").strip().lower()
+    """Map legacy 'research' → 'paper'. Unset profile is live (DraftKings bankroll)."""
+    n = (name or "live").strip().lower()
     if n in ("research", "paper", "sim", "simulation"):
         return "paper"
     if n == "live":
@@ -592,7 +592,7 @@ def normalize_profile(name: str | None) -> str:
     return "paper"
 
 
-UFC_PROFILE = normalize_profile(os.getenv("UFC_PROFILE", "paper"))
+UFC_PROFILE = normalize_profile(os.getenv("UFC_PROFILE", "live"))
 
 _PROFILE_PAPER = {
     "max_card_risk_fraction": float(os.getenv("PAPER_MAX_CARD_RISK", "0.55")),
@@ -784,7 +784,7 @@ def refresh_runtime_env() -> None:
         FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(MARKET_FEATURE_COLUMNS)
     MYBOOKIE_ENABLED = env_bool("MYBOOKIE_ENABLED", "false")
     BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
-    DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")
+    DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "true")
     ACTION_NETWORK_ENABLED = env_bool("ACTION_NETWORK_ENABLED", "true")
     ACTION_NETWORK_UFC_URL = os.getenv(
         "ACTION_NETWORK_UFC_URL",
@@ -836,7 +836,7 @@ def refresh_runtime_env() -> None:
         for x in os.getenv("PROP_MARKETS", _DEFAULT_PROP_MARKETS).split(",")
         if x.strip()
     ]
-    UFC_PROFILE = normalize_profile(os.getenv("UFC_PROFILE", "paper"))
+    UFC_PROFILE = normalize_profile(os.getenv("UFC_PROFILE", "live"))
     NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
     GROK_API_KEY = (os.getenv("GROK_API_KEY") or os.getenv("XAI_API_KEY") or "").strip()
     GROK_ENABLED = env_bool("GROK_ENABLED", "false")
