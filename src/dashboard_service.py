@@ -98,14 +98,13 @@ BOOK_LOADERS = {
 
 
 def active_book_loaders() -> dict[str, tuple[str, str]]:
-    """Book loaders: Odds API always on; scrapers only when enabled."""
+    """Book loaders: Odds API and DraftKings always on; other scrapers when enabled."""
     loaders: dict[str, tuple[str, str]] = {
         "Odds API": BOOK_LOADERS["Odds API"],
+        "DraftKings": BOOK_LOADERS["DraftKings"],
     }
     if getattr(config, "BETNOW_ENABLED", False):
         loaders["BetNow.eu"] = BOOK_LOADERS["BetNow.eu"]
-    if getattr(config, "DRAFTKINGS_ENABLED", False):
-        loaders["DraftKings"] = BOOK_LOADERS["DraftKings"]
     if getattr(config, "MYBOOKIE_ENABLED", False):
         loaders["MyBookie"] = BOOK_LOADERS["MyBookie"]
     return loaders
@@ -516,8 +515,6 @@ def refresh_books_props(
             continue
         if book_name == "BetNow.eu" and not getattr(config, "BETNOW_ENABLED", False):
             continue
-        if book_name == "DraftKings" and not getattr(config, "DRAFTKINGS_ENABLED", False):
-            continue
         # Skip books that already built props in _load_book_odds unless forcing a live pull.
         existing = books[book_name].get("props")
         if (
@@ -735,14 +732,11 @@ def run_quick_odds_refresh(
         force_refresh_odds = False
         logger.info("ODDS_FETCH_ONCE: ignoring force_refresh — reusing cached moneylines")
 
-    books_label = "Odds API"
-    quick_filter: set[str] = {"Odds API"}
+    books_label = "Odds API + DraftKings"
+    quick_filter: set[str] = {"Odds API", "DraftKings"}
     if getattr(config, "BETNOW_ENABLED", False):
         books_label += " + BetNow"
         quick_filter.add("BetNow.eu")
-    if getattr(config, "DRAFTKINGS_ENABLED", False):
-        books_label += " + DraftKings"
-        quick_filter.add("DraftKings")
     if config.MYBOOKIE_ENABLED:
         books_label += " + MyBookie"
         quick_filter.add("MyBookie")

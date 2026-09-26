@@ -120,8 +120,6 @@ def collect_moneyline_quotes(
             return False
         if book_name == "BetNow.eu" and not getattr(config, "BETNOW_ENABLED", False):
             return False
-        if book_name == "DraftKings" and not getattr(config, "DRAFTKINGS_ENABLED", False):
-            return False
         return True
 
     if books:
@@ -220,8 +218,6 @@ def collect_totals_quotes(
         if book == "MyBookie" and not config.MYBOOKIE_ENABLED:
             continue
         if book == "BetNow.eu" and not getattr(config, "BETNOW_ENABLED", False):
-            continue
-        if book == "DraftKings" and not getattr(config, "DRAFTKINGS_ENABLED", False):
             continue
         try:
             prop_df = fetch_live_prop_odds(book, force_refresh=force_refresh)

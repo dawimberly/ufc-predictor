@@ -11,6 +11,17 @@ from src.props import is_live_prop_odds_source
 from src.strategy import attach_prop_stakes, budget_aware_alerts
 
 
+def test_live_draftkings_is_the_default():
+    """No paper sportsbook account: Live + DraftKings lines unless .env overrides."""
+    import os
+
+    if os.getenv("UFC_PROFILE") is None:
+        assert config.UFC_PROFILE == "live"
+    if os.getenv("DRAFTKINGS_ENABLED") is None:
+        assert config.DRAFTKINGS_ENABLED is True
+        assert "DraftKings" in active_book_loaders()
+
+
 def test_odds_api_always_in_active_loaders(monkeypatch):
     monkeypatch.setattr(config, "BETNOW_ENABLED", False)
     monkeypatch.setattr(config, "DRAFTKINGS_ENABLED", False)
@@ -18,8 +29,8 @@ def test_odds_api_always_in_active_loaders(monkeypatch):
     loaders = active_book_loaders()
     assert "Odds API" in loaders
     assert loaders["Odds API"] == BOOK_LOADERS["Odds API"]
+    assert loaders["DraftKings"] == BOOK_LOADERS["DraftKings"]
     assert "BetNow.eu" not in loaders
-    assert "DraftKings" not in loaders
     assert "MyBookie" not in loaders
 
 

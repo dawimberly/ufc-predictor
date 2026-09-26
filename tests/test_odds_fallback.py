@@ -92,9 +92,12 @@ def test_fetch_best_available_optional_betnow(monkeypatch):
         "src.odds_providers.betnow_scraper.fetch_betnow_odds", ok_betnow
     )
     monkeypatch.setattr(config, "ACTION_NETWORK_ENABLED", True)
-    monkeypatch.setattr(config, "DRAFTKINGS_ENABLED", False)
     monkeypatch.setattr(config, "BETNOW_ENABLED", True)
     monkeypatch.setattr(config, "MYBOOKIE_ENABLED", False)
+    monkeypatch.setattr(
+        "src.odds_providers.draftkings.fetch_draftkings_odds",
+        lambda **k: pd.DataFrame(),
+    )
 
     df, meta = fetch_best_available_odds(force_refresh=True)
     assert not df.empty
@@ -111,8 +114,11 @@ def test_fail_closed_when_all_empty(monkeypatch):
         "src.odds_providers.action_network.fetch_action_network_odds",
         lambda **k: pd.DataFrame(),
     )
+    monkeypatch.setattr(
+        "src.odds_providers.draftkings.fetch_draftkings_odds",
+        lambda **k: pd.DataFrame(),
+    )
     monkeypatch.setattr(config, "ACTION_NETWORK_ENABLED", True)
-    monkeypatch.setattr(config, "DRAFTKINGS_ENABLED", False)
     monkeypatch.setattr(config, "BETNOW_ENABLED", False)
     monkeypatch.setattr(config, "MYBOOKIE_ENABLED", False)
 
