@@ -5678,26 +5678,22 @@ class UFCDashboardApp(_CTK_BASE):
 
         self.tab_overview = self.tabs.add("Overview")
         self.tab_odds_api = self.tabs.add("Odds API")
-        # Optional scraper books — only when enabled in .env
+        # DraftKings is always on. BetNow / MyBookie only when enabled in .env.
         self.tab_betnow = None
-        self.tab_dk = None
         self.tab_mybookie = None
         if getattr(config, "BETNOW_ENABLED", False):
             self.tab_betnow = self.tabs.add("BetNow.eu")
-        if getattr(config, "DRAFTKINGS_ENABLED", False):
-            self.tab_dk = self.tabs.add("DraftKings")
+        self.tab_dk = self.tabs.add("DraftKings")
         if config.MYBOOKIE_ENABLED:
             self.tab_mybookie = self.tabs.add("MyBookie")
         self.tab_arb = self.tabs.add("Arb Scanner")
         self.tab_next_two = self.tabs.add("Next Two Cards")
         self.tab_props_odds_api = self.tabs.add("Odds API Props")
         self.tab_props_betnow = None
-        self.tab_props_dk = None
         self.tab_props_mybookie = None
         if getattr(config, "BETNOW_ENABLED", False):
             self.tab_props_betnow = self.tabs.add("Props - BetNow")
-        if getattr(config, "DRAFTKINGS_ENABLED", False):
-            self.tab_props_dk = self.tabs.add("Props - DraftKings")
+        self.tab_props_dk = self.tabs.add("Props - DraftKings")
         if config.MYBOOKIE_ENABLED:
             self.tab_props_mybookie = self.tabs.add("Props - MyBookie")
         self.tab_risk = self.tabs.add("Risk Analysis")
@@ -5761,14 +5757,12 @@ class UFCDashboardApp(_CTK_BASE):
         self.odds_api_tab = BookTab(self.tab_odds_api, "Odds API")
         _configure_expandable_page(self.tab_odds_api, self.odds_api_tab)
         self.betnow_tab = None
-        self.dk_tab = None
         self.mybookie_tab = None
         if self.tab_betnow is not None:
             self.betnow_tab = BookTab(self.tab_betnow, "BetNow.eu")
             _configure_expandable_page(self.tab_betnow, self.betnow_tab)
-        if self.tab_dk is not None:
-            self.dk_tab = BookTab(self.tab_dk, "DraftKings")
-            _configure_expandable_page(self.tab_dk, self.dk_tab)
+        self.dk_tab = BookTab(self.tab_dk, "DraftKings")
+        _configure_expandable_page(self.tab_dk, self.dk_tab)
         if self.tab_mybookie is not None:
             self.mybookie_tab = BookTab(self.tab_mybookie, "MyBookie")
             _configure_expandable_page(self.tab_mybookie, self.mybookie_tab)
@@ -5797,7 +5791,6 @@ class UFCDashboardApp(_CTK_BASE):
         )
         _configure_expandable_page(self.tab_props_odds_api, self.props_odds_api_tab)
         self.props_betnow_tab = None
-        self.props_dk_tab = None
         self.props_mybookie_tab = None
         if self.tab_props_betnow is not None:
             self.props_betnow_tab = BookPropsTab(
@@ -5809,16 +5802,15 @@ class UFCDashboardApp(_CTK_BASE):
                 profile_getter=lambda: self._profile_from_menu(self.profile_var.get()),
             )
             _configure_expandable_page(self.tab_props_betnow, self.props_betnow_tab)
-        if self.tab_props_dk is not None:
-            self.props_dk_tab = BookPropsTab(
-                self.tab_props_dk,
-                book_name="DraftKings",
-                book_note="Singles + 2-3 leg prop/mixed parlays (correlation-adjusted)",
-                show_parlays=True,
-                show_all_var=self.show_all_props_var,
-                profile_getter=lambda: self._profile_from_menu(self.profile_var.get()),
-            )
-            _configure_expandable_page(self.tab_props_dk, self.props_dk_tab)
+        self.props_dk_tab = BookPropsTab(
+            self.tab_props_dk,
+            book_name="DraftKings",
+            book_note="Singles + 2-3 leg prop/mixed parlays (correlation-adjusted)",
+            show_parlays=True,
+            show_all_var=self.show_all_props_var,
+            profile_getter=lambda: self._profile_from_menu(self.profile_var.get()),
+        )
+        _configure_expandable_page(self.tab_props_dk, self.props_dk_tab)
         if self.tab_props_mybookie is not None:
             self.props_mybookie_tab = BookPropsTab(
                 self.tab_props_mybookie,
@@ -5928,7 +5920,7 @@ class UFCDashboardApp(_CTK_BASE):
             "action_network": bool(getattr(config, "ACTION_NETWORK_ENABLED", True)),
             "betnow": bool(getattr(config, "BETNOW_ENABLED", False)),
             "mybookie": bool(getattr(config, "MYBOOKIE_ENABLED", False)),
-            "draftkings": bool(getattr(config, "DRAFTKINGS_ENABLED", False)),
+            "draftkings": True,
             "cache_ttl_min": int(getattr(config, "ODDS_CACHE_TTL_MINUTES", 20) or 20),
         }
         _debug_log(
@@ -6490,11 +6482,9 @@ class UFCDashboardApp(_CTK_BASE):
         if self._busy or self._payload is None:
             return
         self._set_busy(True)
-        books_q = "Odds API"
+        books_q = "Odds API + DraftKings"
         if getattr(config, "BETNOW_ENABLED", False):
             books_q += " + BetNow"
-        if getattr(config, "DRAFTKINGS_ENABLED", False):
-            books_q += " + DraftKings"
         if config.MYBOOKIE_ENABLED:
             books_q += " + MyBookie"
         label = "Auto quick odds..." if auto else f"Quick odds refresh ({books_q})..."

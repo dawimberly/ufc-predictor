@@ -672,7 +672,7 @@ DASHBOARD_AUTO_ODDS_MINUTES = int(os.getenv("UFC_DASHBOARD_AUTO_ODDS_MINUTES", "
 DASHBOARD_CARD_CHECK_MINUTES = int(os.getenv("UFC_DASHBOARD_CARD_CHECK_MINUTES", "45"))
 
 # --- Prop betting (method, rounds, decision) ---
-ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
+ENABLE_PROPS = env_bool("ENABLE_PROPS", "true")
 PROP_MIN_EDGE = float(os.getenv("PROP_MIN_EDGE", "0.05"))
 PROP_MIN_MODEL_PROB = float(os.getenv("PROP_MIN_MODEL_PROB", "0.78"))
 PROP_SHOW_ALL_MIN_PROB = float(os.getenv("PROP_SHOW_ALL_MIN_PROB", "0.12"))
@@ -762,7 +762,7 @@ def refresh_runtime_env() -> None:
     global PATHWAY_MARKET_CAL_WIDTH, PATHWAY_MARKET_CAL_SHRINK
     global INTERACTION_DISCOVERY_ENABLED
 
-    ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
+    ENABLE_PROPS = env_bool("ENABLE_PROPS", "true")
     ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
     ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
     ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")

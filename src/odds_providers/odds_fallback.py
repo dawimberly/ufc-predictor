@@ -259,8 +259,8 @@ def fetch_best_available_odds(
         except Exception as exc:
             errors.append(str(exc))
 
-    # 3) DraftKings (optional — off by default; shares Odds API quota when used)
-    if getattr(config, "DRAFTKINGS_ENABLED", False) and _want("draftkings"):
+    # 3) DraftKings (always — user account; shares Odds API quota, then cache)
+    if _want("draftkings"):
         tried.append("DraftKings")
         try:
             from src.odds_providers.draftkings import fetch_draftkings_odds

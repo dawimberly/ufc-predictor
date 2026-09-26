@@ -23,6 +23,21 @@ def enable_props(monkeypatch):
     monkeypatch.setattr(config, "ENABLE_PROPS", True)
 
 
+def test_draftkings_props_load_when_flag_off(monkeypatch):
+    """DraftKings props stay installed even if an old .env set the flag false."""
+    monkeypatch.setattr(config, "DRAFTKINGS_ENABLED", False)
+    monkeypatch.setattr(config, "ENABLE_PROPS", True)
+    sentinel = pd.DataFrame({"prop_key": ["over_1_5_rounds"], "bookmaker": ["DraftKings"]})
+    monkeypatch.setattr(
+        "src.odds_providers.draftkings_props.fetch_draftkings_prop_odds",
+        lambda **k: sentinel,
+    )
+    from src.props import fetch_live_prop_odds
+
+    out = fetch_live_prop_odds("DraftKings", force_refresh=False)
+    assert list(out["bookmaker"]) == ["DraftKings"]
+
+
 def test_env_bool_parsing(monkeypatch):
     monkeypatch.setenv("ENABLE_PROPS", "true")
     assert config.env_bool("ENABLE_PROPS") is True

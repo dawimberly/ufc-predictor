@@ -76,7 +76,7 @@ Working directory must be the project root so `.env` and `data/` resolve correct
 | **Ollama Analysis** | Local LLM narrative over HA Top 5 — leads with **WHAT TO BET (sized)** vs **FUN ONLY ($0)** |
 | **Arb Scanner** | Cross-book arb scan |
 
-DraftKings (and Props - DraftKings) load by default. BetNow appears only when `BETNOW_ENABLED=true`. MyBookie stays off unless `MYBOOKIE_ENABLED=true`. The first DraftKings pull is one extra Odds API request; `ODDS_FETCH_ONCE` caches it after that.
+**DraftKings** and **Props - DraftKings** are always in the dashboard. BetNow appears only when `BETNOW_ENABLED=true`. MyBookie stays off unless `MYBOOKIE_ENABLED=true`. The first DraftKings pull is one extra Odds API request; `ODDS_FETCH_ONCE` caches it after that.
 
 ### Toolbar
 
@@ -262,7 +262,7 @@ Copy `.env.example` → `.env`. Important keys:
 | `INITIAL_BANKROLL` | 75 | Starting bankroll |
 | `THE_ODDS_API_KEY` | — | Odds API key |
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
-| `ENABLE_PROPS` | false | Prop tabs (Over 1.5 HA when on) |
+| `ENABLE_PROPS` | true | Prop tabs, including Props - DraftKings |
 | `ENABLE_HIGH_VALUE_FEATURES` | true | Phase-1 HV feature block |
 | `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper sky-blue tiny stakes on wide CI |
 | `PAPER_WIDE_OVERRIDE_MIN_EDGE` | 0.08 | Min edge for override |
@@ -271,7 +271,7 @@ Copy `.env.example` → `.env`. Important keys:
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
 | `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
-| `DRAFTKINGS_ENABLED` | true | DraftKings lines (cached after first pull) |
+| `DRAFTKINGS_ENABLED` | true | DraftKings moneylines and props always load |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |

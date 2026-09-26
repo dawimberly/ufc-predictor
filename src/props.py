@@ -245,11 +245,6 @@ def fetch_live_prop_odds(
         from src.odds_providers.prop_odds_common import empty_prop_odds_df
 
         return empty_prop_odds_df()
-    if book == "DraftKings" and not getattr(config, "DRAFTKINGS_ENABLED", False):
-        # Do not hit The Odds API for DK props when DK is disabled (huge credit burn).
-        from src.odds_providers.prop_odds_common import empty_prop_odds_df
-
-        return empty_prop_odds_df()
     try:
         if book in ("Odds API", "the_odds_api", "OddsAPI"):
             from src.odds_providers.the_odds_api import fetch_the_odds_api_prop_odds
