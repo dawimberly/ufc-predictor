@@ -86,31 +86,15 @@ def _inv_logit(x: float) -> float:
 
 def compute_style_matchup_bonus(row: pd.Series | dict[str, Any]) -> float:
     """
-    Rule-based log-odds bonus for F1 from style matchup features.
+    Rule-based log-odds bonus for fighter 1.
 
-    Complements learned model features (striker vs grappler, southpaw edge).
+    Style clash and southpaw stay, plus camp, physical, chin, age, and form
+    rules from ``programmed_rules``. Total is clipped to ``STYLE_BONUS_MAX``.
+    Complements the learned model; does not retrain it.
     """
-    if isinstance(row, dict):
-        row = pd.Series(row)
+    from src.programmed_rules import compute_programmed_bonus
 
-    bonus = 0.0
-    max_bonus = config.STYLE_BONUS_MAX
-
-    striker_diff = float(row.get("striker_score_diff", 0) or 0)
-    grappler_diff = float(row.get("grappler_score_diff", 0) or 0)
-    southpaw_adv = float(row.get("southpaw_advantage", 0) or 0)
-    style_clash = float(row.get("style_clash", 0) or 0)
-    striker_vs_grappler = float(row.get("striker_vs_grappler", 0) or 0)
-
-    if striker_vs_grappler >= 0.5:
-        bonus += 0.04 * np.sign(striker_diff)
-    if style_clash >= 0.5:
-        bonus += 0.02 * np.sign(grappler_diff)
-    bonus += southpaw_adv * 0.5
-    if float(row.get("stance_matchup", 0) or 0) >= 0.5:
-        bonus += 0.01
-
-    return float(np.clip(bonus, -max_bonus, max_bonus))
+    return compute_programmed_bonus(row)
 
 
 def apply_style_calibration(
@@ -610,9 +594,12 @@ class FightPredictor:
             return features.iloc[0:0].copy()
         proba = self.model.predict_proba(prepared[self.feature_columns])[:, 1]
         if apply_style_bonus:
+            from src.programmed_rules import programmed_rules_series
+
             proba, bonuses = apply_style_calibration(prepared, proba)
             out = self._attach_predictions(prepared, proba, prepared=prepared)
             out["style_bonus"] = bonuses
+            out["programmed_rules"] = programmed_rules_series(prepared).to_numpy()
             out["prob_f1_win_raw"] = self.model.predict_proba(
                 prepared[self.feature_columns]
             )[:, 1]

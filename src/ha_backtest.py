@@ -441,9 +441,12 @@ class WalkForwardPredictor:
             return features.iloc[0:0].copy()
         proba = self.model.predict_proba(prepared[self.feature_columns])[:, 1]
         if apply_style_bonus:
+            from src.programmed_rules import programmed_rules_series
+
             proba, bonuses = apply_style_calibration(prepared, proba)
             out = self._attach_predictions(prepared, proba, prepared=prepared)
             out["style_bonus"] = bonuses
+            out["programmed_rules"] = programmed_rules_series(prepared).to_numpy()
         else:
             out = self._attach_predictions(prepared, proba, prepared=prepared)
         return out

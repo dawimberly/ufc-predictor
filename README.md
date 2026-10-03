@@ -178,6 +178,26 @@ Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Bl
 
 Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV.
 
+### Programmed matchup rules
+
+After the ensemble scores a fight, `src/programmed_rules.py` adds a small signed log-odds nudge (capped by `STYLE_BONUS_MAX`, default 0.05). The rules are explicit, leakage-safe, and not in `FEATURE_COLUMNS` — no retrain:
+
+| Rule | When it fires |
+|------|----------------|
+| Southpaw vs orthodox | Signed toward the southpaw (card order does not favor fighter 1) |
+| Striker vs grappler / style-clash grappler | Clear style split |
+| Reach that lands | ≥3" reach and striking accuracy (plus volume) on the same side |
+| Height and reach | Both physical edges ≥2" and the same direction |
+| Short-notice camp | One fighter on short notice; shrinks if their short-notice record is good |
+| Layoff rust | 365-day flag if present, otherwise 180-day; the two do not stack |
+| New division | First fight in a new weight class |
+| Prior KO loss | Been stopped before; larger if the opponent has the power |
+| Past division peak | ≥3 years further past the division peak |
+| Open wrestling path | Style clash plus takedown accuracy, unless a takedown-defense wall blocks it |
+| Form streak / experience | Last-5 and momentum agree; veteran edge only with recent form |
+
+The fight context strip and fight briefs name the rules that fired. Turning off the style adjustment (`apply_style_bonus=False`) turns these off with it.
+
 Helpers:
 
 ```bash
@@ -202,7 +222,7 @@ python main.py --backtest-2025
 
 ```
 data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LGBM+XGB)
-      → predictor → uncertainty_gates (+ Paper wide override) + high_accuracy_strategy
+      → predictor (+ programmed_rules) → uncertainty_gates (+ Paper wide override) + high_accuracy_strategy
       → dashboard_service (books / props / Soft Update)
       → bet_tiers + bet_slip (color rank + Top 5)
       → strategy (auto 2/3-leg parlays) → grok_analysis / Ollama
@@ -215,7 +235,7 @@ data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LG
 | Data | `data_loader` | UFC.com cards, multi-source history |
 | Features | `feature_engineering`, `high_value_features` | Leakage-safe + HV block |
 | Model | `predictor`, `ensemble` | Calibrated LGBM+XGB |
-| Gates | `uncertainty_gates`, `high_accuracy_strategy` | Fail-closed HA sizing |
+| Gates | `uncertainty_gates`, `programmed_rules`, `high_accuracy_strategy` | Fail-closed HA sizing; signed matchup nudges |
 | Color | `bet_tiers` | BET THIS / FUN ONLY action verbs + color tiers |
 | Odds | `odds_providers/*`, `odds_api_client` | Odds API + optional scrapers |
 | Dashboard | `ufc_dashboard`, `dashboard_service`, `bet_slip` | GUI + Top 5 |

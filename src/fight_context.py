@@ -316,6 +316,14 @@ def build_fight_context(row: pd.Series | dict[str, Any] | None) -> dict[str, str
     disagree = _disagreement_badge(series)
     if disagree:
         out["disagree"] = disagree
+    try:
+        from src.programmed_rules import format_programmed_line
+
+        programmed = format_programmed_line(series)
+        if programmed:
+            out["programmed"] = programmed
+    except Exception:
+        pass
 
     f1 = str(_get(series, "fighter_1") or "")
     f2 = str(_get(series, "fighter_2") or "")
@@ -353,6 +361,7 @@ def build_fight_context(row: pd.Series | dict[str, Any] | None) -> dict[str, str
             "market",
             "judges",
             "disagree",
+            "programmed",
         )
         if k in out
     ]
@@ -376,6 +385,7 @@ def format_fight_context_lines(ctx: dict[str, str]) -> list[str]:
         "market",
         "judges",
         "disagree",
+        "programmed",
     ):
         if ctx.get(key):
             lines.append(ctx[key])
