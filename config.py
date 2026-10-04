@@ -371,6 +371,12 @@ _PAPER_UNCERTAINTY_THRESHOLDS_PREV = {
 
 WF_MIN_TRAIN_RATIO = float(os.getenv("WF_MIN_TRAIN_RATIO", "0.60"))
 WF_IMPORTANCE_INTERVAL = int(os.getenv("WF_IMPORTANCE_INTERVAL", "400"))
+# Walk-forward conformal half-width. Floor only by default.
+# Do not cap q down to 0.14: that squeezed genuinely wide intervals under the
+# paper skip (0.52) and sized them as deep-blue BET THIS tickets.
+_wf_q_cap_raw = os.getenv("HA_WF_CONFORMAL_Q_CAP", "").strip()
+HA_WF_CONFORMAL_Q_CAP = float(_wf_q_cap_raw) if _wf_q_cap_raw else None
+HA_WF_CONFORMAL_Q_FLOOR = float(os.getenv("HA_WF_CONFORMAL_Q_FLOOR", "0.05"))
 STYLE_BONUS_MAX = float(os.getenv("STYLE_BONUS_MAX", "0.05"))
 EDGE_RANK_MIN = float(os.getenv("EDGE_RANK_MIN", "0.0"))
 RUN_BACKTEST_ON_TRAIN = os.getenv("RUN_BACKTEST_ON_TRAIN", "true").lower() in (
