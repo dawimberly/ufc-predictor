@@ -8,6 +8,7 @@ import pytest
 import config
 from src.strategy import StrategyConfig, extract_bet_candidates, kelly_stake
 from src.uncertainty_gates import (
+    MARKET_BLEND,
     PAPER_WIDE_OVERRIDE,
     SKIP_HIGH_DISAGREEMENT,
     SKIP_MISSING,
@@ -179,22 +180,46 @@ def _guilherme_type_row(**kwargs):
     return pd.Series(base)
 
 
-def test_paper_wide_override_guilherme_type(monkeypatch):
+def test_overconfident_short_price_stays_skip(monkeypatch):
+    """Model 0.86 at 1.35 is the old sky-blue loss. Blend does not size it."""
     monkeypatch.setattr(config, "UFC_PROFILE", "paper")
     monkeypatch.setattr(config, "UNCERTAINTY_GATES_ENABLED", True)
     monkeypatch.setattr(config, "PAPER_INTERVAL_WIDTH_SKIP", 0.52)
     monkeypatch.setattr(config, "PAPER_INTERVAL_WIDTH_TIGHTEN", 0.36)
     monkeypatch.setattr(config, "PAPER_DISAGREEMENT_SKIP", 0.11)
     monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", True)
-    monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_MIN_EDGE", 0.08)
-    monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_MIN_PROB", 0.70)
-    monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_KELLY_MULT", 0.20)
     gate = evaluate_uncertainty_gate(_guilherme_type_row())
+    assert gate.action == "skip"
+    assert gate.primary_reason == SKIP_WIDE_INTERVAL
+    assert MARKET_BLEND not in gate.reasons
+
+
+def _blend_band_row():
+    """Raw 0.725 at 1.70 / 2.20 lands in the market-blend band."""
+    return _guilherme_type_row(
+        prob_f1_win=0.90,
+        prob_f2_win=0.10,
+        prob_f1_raw=0.725,
+        predicted_prob=0.90,
+        f1_odds=1.70,
+        f2_odds=2.20,
+        best_edge=0.20,
+    )
+
+
+def test_market_blend_sizes_modest_price(monkeypatch):
+    monkeypatch.setattr(config, "UFC_PROFILE", "paper")
+    monkeypatch.setattr(config, "UNCERTAINTY_GATES_ENABLED", True)
+    monkeypatch.setattr(config, "PAPER_INTERVAL_WIDTH_SKIP", 0.52)
+    monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", True)
+    monkeypatch.setattr(config, "MARKET_BLEND_MARKET_WEIGHT", 0.60)
+    gate = evaluate_uncertainty_gate(_blend_band_row())
     assert gate.action == "tighten"
-    assert gate.primary_reason == PAPER_WIDE_OVERRIDE
+    assert gate.primary_reason == MARKET_BLEND
+    assert gate.blend_prob is not None
+    assert 0.58 <= gate.blend_prob <= 0.75
+    assert 0.02 <= float(gate.blend_edge) <= 0.08
     assert SKIP_WIDE_INTERVAL in gate.reasons
-    assert gate.kelly_mult == pytest.approx(0.20)
-    assert gate.kelly_mult > 0.0
 
 
 def test_live_wide_still_skip_guilherme_type(monkeypatch):
@@ -249,12 +274,7 @@ def test_paper_wide_override_stake_cap(monkeypatch):
     monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", True)
     monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01)
     monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_KELLY_MULT", 0.20)
-    row = _guilherme_type_row(
-        implied_prob_f1=0.30,
-        implied_prob_f2=0.70,
-        edge_f1=0.56,
-        edge_f2=-0.20,
-    )
+    row = _blend_band_row()
     cfg = StrategyConfig(
         min_edge=0.03,
         kelly_fraction=0.25,
@@ -267,6 +287,6 @@ def test_paper_wide_override_stake_cap(monkeypatch):
     stake, _, gate_dict = _suggest_stake(
         row, bankroll=bankroll, strategy=cfg, card_risk=None
     )
-    assert gate_dict.get("primary_reason") == PAPER_WIDE_OVERRIDE
+    assert gate_dict.get("primary_reason") == MARKET_BLEND
     assert stake > 0.0
     assert stake <= bankroll * 0.01 + 1e-9

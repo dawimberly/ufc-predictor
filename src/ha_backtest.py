@@ -442,6 +442,13 @@ class WalkForwardPredictor:
         if prepared.empty:
             return features.iloc[0:0].copy()
         proba = self.model.predict_proba(prepared[self.feature_columns])[:, 1]
+        raw_p = None
+        base_model = getattr(self.model, "base", None)
+        if base_model is not None:
+            try:
+                raw_p = base_model.predict_proba(prepared[self.feature_columns])[:, 1]
+            except Exception:
+                raw_p = None
         if apply_style_bonus:
             from src.programmed_rules import programmed_rules_series
 
@@ -451,6 +458,8 @@ class WalkForwardPredictor:
             out["programmed_rules"] = programmed_rules_series(prepared).to_numpy()
         else:
             out = self._attach_predictions(prepared, proba, prepared=prepared)
+        if raw_p is not None and len(raw_p) == len(out):
+            out["prob_f1_raw"] = raw_p
         return out
 
 
@@ -869,6 +878,7 @@ def run_ha_walkforward_backtest(
     as_of: datetime | None = None,
     min_train_rows: int = WF_MIN_TRAIN_ROWS,
     fixed_stake_usd: float | None = None,
+    since: datetime | None = None,
 ) -> dict[str, Any]:
     """
     True walk-forward HA backtest: for each card date D, train only on fights < D.
@@ -885,9 +895,19 @@ def run_ha_walkforward_backtest(
     if features_all.empty:
         raise ValueError("No features available for walk-forward backtest.")
 
-    eval_features = (
-        filter_last_year(features_all, as_of=as_of) if last_year else features_all.copy()
-    )
+    if since is not None:
+        dated = _ensure_bt_date(features_all)
+        start = pd.Timestamp(since)
+        end = pd.Timestamp(as_of) if as_of is not None else dated["_bt_date"].max()
+        eval_features = dated[
+            dated["_bt_date"].notna()
+            & (dated["_bt_date"] >= start)
+            & (dated["_bt_date"] <= end)
+        ].copy()
+    else:
+        eval_features = (
+            filter_last_year(features_all, as_of=as_of) if last_year else features_all.copy()
+        )
     eval_features = _ensure_bt_date(eval_features)
     if eval_features.empty:
         raise ValueError("No labeled fights in the evaluation window.")

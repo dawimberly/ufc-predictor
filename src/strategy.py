@@ -78,27 +78,39 @@ def kelly_stake(
     uncertainty_kelly_mult: float | None = None,
 ) -> float:
     """Fractional Kelly stake with per-bet cap, segment rating, and uncertainty gates."""
-    if edge < config.min_edge or bankroll <= 0:
+    if bankroll <= 0:
         return 0.0
 
+    blend = False
     unc_mult = 1.0
     if uncertainty_kelly_mult is not None:
         unc_mult = float(uncertainty_kelly_mult)
-    elif row is not None:
+    if row is not None:
         try:
             from src.uncertainty_gates import evaluate_uncertainty_gate
 
             gate = evaluate_uncertainty_gate(row)
-            if gate.skip:
-                return 0.0
-            # Tighten also requires edge vs bumped min — caller usually checks;
-            # still cut Kelly here.
-            unc_mult = float(gate.kelly_mult)
-            if gate.tighten and edge < config.min_edge + gate.edge_bump:
-                return 0.0
+            blend = gate.blend_prob is not None
+            if uncertainty_kelly_mult is None:
+                if gate.skip:
+                    return 0.0
+                unc_mult = float(gate.kelly_mult)
+                # Tighten bump is for raw-model leans. Market-blend already
+                # cleared its own 2–8% edge band.
+                if (
+                    not blend
+                    and gate.tighten
+                    and edge < config.min_edge + gate.edge_bump
+                ):
+                    return 0.0
         except Exception:
-            # Fail-closed: missing gate machinery → no stake
-            return 0.0
+            if uncertainty_kelly_mult is None:
+                # Fail-closed: missing gate machinery → no stake
+                return 0.0
+
+    # HA min-edge does not apply to a market-blend ticket; that band is lower.
+    if not blend and edge < config.min_edge:
+        return 0.0
 
     if unc_mult <= 0:
         return 0.0
@@ -119,7 +131,7 @@ def kelly_stake(
         pass
     kelly = raw_kelly_fraction(prob, decimal_odds) * kelly_frac * unc_mult
     kelly = min(kelly, config.max_bet_fraction)
-    if kelly < config.min_bet_fraction:
+    if not blend and kelly < config.min_bet_fraction:
         return 0.0
     return float(min(bankroll * kelly, bankroll * config.max_bet_fraction))
 
@@ -243,6 +255,27 @@ def extract_bet_candidates(
         except Exception:
             log_strategy_block("uncertainty_fail_closed", context="single", fight=fight_lbl)
             return None  # fail-closed
+
+    if apply_uncertainty_gates and gate.blend_prob is not None and gate.blend_odds is not None:
+        side = gate.blend_side or "f1"
+        prob = float(gate.blend_prob)
+        odds = float(gate.blend_odds)
+        edge = float(gate.blend_edge or 0.0)
+        pick_name = gate.blend_pick or (f1 if side == "f1" else f2)
+        return BetCandidate(
+            fight_id=str(row.get("fight_id", "")),
+            event_key=str(row.get("event_name", row.get("event", ""))),
+            bet_side=side,
+            prob=prob,
+            decimal_odds=odds,
+            edge=edge,
+            kelly_full=raw_kelly_fraction(prob, odds) * unc_mult,
+            expected_value=bet_expected_value(prob, odds),
+            fighter1_name=f1,
+            fighter2_name=f2,
+            pick_name=pick_name,
+            winner_name=pick_name,
+        )
 
     market = market_probs(row)
     decimal = fight_decimal_odds(row)

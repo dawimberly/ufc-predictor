@@ -108,12 +108,15 @@ If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE**
 
 ### Paper wide override (Sky Blue)
 
-When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can still size a tiny ticket if:
+When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can still size a tiny ticket if the market-blended probability clears a modest band:
 
 - override enabled (`PAPER_WIDE_OVERRIDE_ENABLED=true`)
 - pure `wide_interval` (no other hard skips)
-- edge ≥ 8% and model prob ≥ 70% (defaults)
-- Kelly multiplier 0.20, stake hard-capped at **1% bankroll** (card-pool allocation cannot raise it), max **2** override singles per card
+- probability = 40% raw model + 60% de-vigged market (`prob_f1_raw` when present)
+- blended prob 58–75%, edge versus the price 2–8%, decimal odds 1.40–2.30
+- Kelly multiplier 0.20, stake hard-capped at **1% bankroll** (card-pool allocation cannot raise it), max **3** of these singles per card
+
+A raw model price like 96% on a short favorite stays a skip. That was the losing book.
 
 **Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
 
@@ -285,12 +288,12 @@ Copy `.env.example` → `.env`. Important keys:
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
 | `ENABLE_PROPS` | false | Prop tabs (Over 1.5 HA when on) |
 | `ENABLE_HIGH_VALUE_FEATURES` | true | Phase-1 HV feature block |
-| `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper sky-blue tiny stakes on wide CI |
-| `PAPER_WIDE_OVERRIDE_MIN_EDGE` | 0.08 | Min edge for override |
-| `PAPER_WIDE_OVERRIDE_MIN_PROB` | 0.70 | Min model prob for override |
-| `PAPER_WIDE_OVERRIDE_KELLY_MULT` | 0.20 | Kelly shrink for override |
+| `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper market-blend singles on wide CI |
+| `MARKET_BLEND_MARKET_WEIGHT` | 0.60 | Weight on the de-vigged market |
+| `MARKET_BLEND_MIN_PROB` / `MAX` | 0.58 / 0.75 | Blended probability band |
+| `MARKET_BLEND_MIN_EDGE` / `MAX` | 0.02 / 0.08 | Edge versus the price |
+| `MARKET_BLEND_MIN_ODDS` / `MAX` | 1.40 / 2.30 | Decimal price band |
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
-| `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
