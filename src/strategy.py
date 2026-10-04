@@ -306,7 +306,8 @@ def build_parlay_candidates(
     """
     High-accuracy parlays: exactly 2 legs, both strong (high prob + real edge).
 
-    Legs are uncertainty-gated via ``extract_bet_candidates``.
+    Each leg must clear full HA uncertainty (action ``allow`` — Deep Blue).
+    Sky Blue paper wide-override singles are not parlay legs.
     """
     from src.high_accuracy_strategy import PARLAY_MAX_LEGS, log_strategy_block
 
@@ -327,6 +328,26 @@ def build_parlay_candidates(
     for _, row in card_rows.iterrows():
         cand = extract_bet_candidates(row, config=config, apply_uncertainty_gates=True)
         if cand is None:
+            continue
+        # Deep blue only. Paper wide-override (sky blue) is a tiny single, not a parlay leg.
+        try:
+            from src.uncertainty_gates import evaluate_uncertainty_gate
+
+            leg_gate = evaluate_uncertainty_gate(row)
+            if leg_gate.action != "allow":
+                log_strategy_block(
+                    "parlay_leg_not_blue",
+                    context="parlay",
+                    fight=f"{cand.fighter1_name} vs {cand.fighter2_name}",
+                    detail=leg_gate.reason_label() or leg_gate.action,
+                )
+                continue
+        except Exception:
+            log_strategy_block(
+                "parlay_leg_not_blue",
+                context="parlay",
+                fight=f"{cand.fighter1_name} vs {cand.fighter2_name}",
+            )
             continue
         if cand.edge < config.parlay_min_edge:
             log_strategy_block(

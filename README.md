@@ -117,6 +117,8 @@ When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can st
 
 **Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
 
+HA-sized 2-leg parlays use **Deep Blue legs only** (uncertainty action `allow`, narrow CI). A Sky Blue override is a single at the 1% cap and is never a parlay leg. Walk-forward conformal half-width is not squeezed by default (`HA_WF_CONFORMAL_Q_CAP` empty), so a wide interval stays wide and cannot be sized as BET THIS.
+
 ### Auto parlays (Ollama Analysis)
 
 Advisory **2-leg** and **3-leg** research parlays are built from HA singles / high model probs (`build_auto_parlay_recommendations`). Shown in the Ollama Analysis tab as styled cards — **$0 advisory only**, not Live HA-sized.
