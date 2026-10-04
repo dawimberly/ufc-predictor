@@ -98,7 +98,7 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 | Color | Action verb | Meaning | Money |
 |-------|-------------|---------|-------|
-| **Deep Blue** `#3b82f6` | **BET THIS** | Clears full HA gates | Real ticket ($) |
+| **Deep Blue** `#3b82f6` | **BET THIS** | Win chance and payout meet: profit if you win is large versus the chance of losing the stake, and the price is +EV | Real ticket ($), 1% cap |
 | **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Paper-only `paper_wide_override` | Paper $ only (not Live) |
 | **Green** | **FUN ONLY** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | `$0` research — not bankroll |
 | **Yellow** | **CAUTION — SKIP SIZED** | Thin edge / borderline | `$0` |
@@ -106,21 +106,22 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE** and may list FUN ONLY leans separately. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
 
-### Paper wide override (Sky Blue)
+### Blue bets (win chance and payout)
 
-When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can still size a tiny ticket if the market-blended probability clears a modest band:
+When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** sizes a **Deep Blue** ticket only where the blended win chance and the payout meet: least stake (1% cap), and a price that pays enough if the pick wins.
 
 - override enabled (`PAPER_WIDE_OVERRIDE_ENABLED=true`)
 - pure `wide_interval` (no other hard skips)
 - probability = 40% raw model + 60% de-vigged market (`prob_f1_raw` when present)
-- blended prob 58–75%, edge versus the price 2–8%, decimal odds 1.40–2.30
+- blended prob 58–75%, edge versus the price 2–8%, decimal odds **1.50–2.30**
+- expected profit at least 3¢ per $1, and profit-if-win / chance-of-loss at least 1.25 (a $1 risk has to pay at least $0.50)
 - Kelly multiplier 0.20, stake hard-capped at **1% bankroll** (card-pool allocation cannot raise it), max **3** of these singles per card
 
 A raw model price like 96% on a short favorite stays a skip. That was the losing book.
 
 **Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
 
-HA-sized 2-leg parlays use **Deep Blue legs only** (uncertainty action `allow`, narrow CI). A Sky Blue override is a single at the 1% cap and is never a parlay leg. Walk-forward conformal half-width is not squeezed by default (`HA_WF_CONFORMAL_Q_CAP` empty), so a wide interval stays wide and cannot be sized as BET THIS.
+HA-sized 2-leg parlays still require a narrow interval on every leg. A market-blend blue single is a 1% ticket and is never a parlay leg. Walk-forward conformal half-width is not squeezed by default (`HA_WF_CONFORMAL_Q_CAP` empty).
 
 ### Auto parlays (Ollama Analysis)
 
@@ -292,7 +293,9 @@ Copy `.env.example` → `.env`. Important keys:
 | `MARKET_BLEND_MARKET_WEIGHT` | 0.60 | Weight on the de-vigged market |
 | `MARKET_BLEND_MIN_PROB` / `MAX` | 0.58 / 0.75 | Blended probability band |
 | `MARKET_BLEND_MIN_EDGE` / `MAX` | 0.02 / 0.08 | Edge versus the price |
-| `MARKET_BLEND_MIN_ODDS` / `MAX` | 1.40 / 2.30 | Decimal price band |
+| `MARKET_BLEND_MIN_ODDS` / `MAX` | 1.50 / 2.30 | Decimal price band ($1 risk pays at least $0.50) |
+| `MARKET_BLEND_MIN_EV` | 0.03 | Minimum expected profit per $1 |
+| `MARKET_BLEND_MIN_REWARD_PER_RISK` | 1.25 | Profit-if-win divided by chance of losing the stake |
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |

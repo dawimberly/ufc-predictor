@@ -178,11 +178,31 @@ def _market_blend_bet(row: pd.Series | dict[str, Any] | None) -> dict[str, Any] 
     hi_p = float(getattr(config, "MARKET_BLEND_MAX_PROB", 0.75) or 0.75)
     lo_e = float(getattr(config, "MARKET_BLEND_MIN_EDGE", 0.02) or 0.02)
     hi_e = float(getattr(config, "MARKET_BLEND_MAX_EDGE", 0.08) or 0.08)
-    lo_o = float(getattr(config, "MARKET_BLEND_MIN_ODDS", 1.40) or 1.40)
+    lo_o = float(getattr(config, "MARKET_BLEND_MIN_ODDS", 1.50) or 1.50)
     hi_o = float(getattr(config, "MARKET_BLEND_MAX_ODDS", 2.30) or 2.30)
     if not (lo_p <= prob <= hi_p and lo_e <= edge <= hi_e and lo_o <= odds <= hi_o):
         return None
-    return {"side": side, "pick": pick, "prob": float(prob), "odds": float(odds), "edge": float(edge)}
+    # Blue: the win chance and the payout meet. Profit if you win has to be
+    # large relative to how often the stake is lost, and EV has to clear a margin.
+    payout = float(odds) - 1.0
+    loss_risk = 1.0 - float(prob)
+    if payout <= 0 or loss_risk <= 0:
+        return None
+    ev = float(prob) * float(odds) - 1.0
+    reward_per_risk = payout / loss_risk
+    min_ev = float(getattr(config, "MARKET_BLEND_MIN_EV", 0.03) or 0.03)
+    min_reward = float(getattr(config, "MARKET_BLEND_MIN_REWARD_PER_RISK", 1.25) or 1.25)
+    if ev < min_ev or reward_per_risk < min_reward:
+        return None
+    return {
+        "side": side,
+        "pick": pick,
+        "prob": float(prob),
+        "odds": float(odds),
+        "edge": float(edge),
+        "ev": float(ev),
+        "reward_per_risk": float(reward_per_risk),
+    }
 
 
 def maybe_paper_wide_override(
@@ -227,7 +247,7 @@ def maybe_paper_wide_override(
     )
     return UncertaintyGateResult(
         action="tighten",
-        reasons=reasons + [MARKET_BLEND, PAPER_WIDE_OVERRIDE],
+        reasons=reasons + [MARKET_BLEND],
         primary_reason=MARKET_BLEND,
         disagreement=gate.disagreement,
         interval_width=gate.interval_width,

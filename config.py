@@ -354,15 +354,19 @@ PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC = float(
 PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "3"))
 
 # Wide-CI paper bets blend 60% de-vigged market + 40% raw model, then only
-# size a modest price band. Raw "model says 96%" tickets stay skipped.
-# Walk-forward 2024-01-13 → 2026-09-26: 49 tickets, 65% hit, +$3.20 on $100.
+# size where win chance and payout meet (odds >= 1.50, EV >= 3c per $1,
+# profit-if-win / loss-chance >= 1.25). Stake stays capped at 1%.
+# Trailing-year walk-forward as of 2026-09-26: 9 blue tickets, 78% hit, $100 → $102.62.
 MARKET_BLEND_MARKET_WEIGHT = float(os.getenv("MARKET_BLEND_MARKET_WEIGHT", "0.60"))
 MARKET_BLEND_MIN_PROB = float(os.getenv("MARKET_BLEND_MIN_PROB", "0.58"))
 MARKET_BLEND_MAX_PROB = float(os.getenv("MARKET_BLEND_MAX_PROB", "0.75"))
 MARKET_BLEND_MIN_EDGE = float(os.getenv("MARKET_BLEND_MIN_EDGE", "0.02"))
 MARKET_BLEND_MAX_EDGE = float(os.getenv("MARKET_BLEND_MAX_EDGE", "0.08"))
-MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.40"))
+MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.50"))
 MARKET_BLEND_MAX_ODDS = float(os.getenv("MARKET_BLEND_MAX_ODDS", "2.30"))
+# Profit per $1 must be large versus the chance of losing that $1.
+MARKET_BLEND_MIN_EV = float(os.getenv("MARKET_BLEND_MIN_EV", "0.03"))
+MARKET_BLEND_MIN_REWARD_PER_RISK = float(os.getenv("MARKET_BLEND_MIN_REWARD_PER_RISK", "1.25"))
 
 # Live: stricter
 LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
@@ -921,8 +925,11 @@ def refresh_runtime_env() -> None:
     MARKET_BLEND_MAX_PROB = float(os.getenv("MARKET_BLEND_MAX_PROB", "0.75"))
     MARKET_BLEND_MIN_EDGE = float(os.getenv("MARKET_BLEND_MIN_EDGE", "0.02"))
     MARKET_BLEND_MAX_EDGE = float(os.getenv("MARKET_BLEND_MAX_EDGE", "0.08"))
-    MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.40"))
+    MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.50"))
     MARKET_BLEND_MAX_ODDS = float(os.getenv("MARKET_BLEND_MAX_ODDS", "2.30"))
+    global MARKET_BLEND_MIN_EV, MARKET_BLEND_MIN_REWARD_PER_RISK
+    MARKET_BLEND_MIN_EV = float(os.getenv("MARKET_BLEND_MIN_EV", "0.03"))
+    MARKET_BLEND_MIN_REWARD_PER_RISK = float(os.getenv("MARKET_BLEND_MIN_REWARD_PER_RISK", "1.25"))
     LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
     LIVE_DISAGREEMENT_TIGHTEN = float(os.getenv("LIVE_DISAGREEMENT_TIGHTEN", "0.04"))
     LIVE_INTERVAL_WIDTH_SKIP = float(os.getenv("LIVE_INTERVAL_WIDTH_SKIP", str(UNCERTAINTY_HIGH_WIDTH)))

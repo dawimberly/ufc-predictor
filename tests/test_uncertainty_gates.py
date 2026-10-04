@@ -207,6 +207,25 @@ def _blend_band_row():
     )
 
 
+def test_short_payout_is_not_blue(monkeypatch):
+    """Odds 1.45 pays $0.45 on a $1 risk. That is not the blue payout band."""
+    monkeypatch.setattr(config, "UFC_PROFILE", "paper")
+    monkeypatch.setattr(config, "UNCERTAINTY_GATES_ENABLED", True)
+    monkeypatch.setattr(config, "PAPER_INTERVAL_WIDTH_SKIP", 0.52)
+    monkeypatch.setattr(config, "PAPER_WIDE_OVERRIDE_ENABLED", True)
+    monkeypatch.setattr(config, "MARKET_BLEND_MARKET_WEIGHT", 0.60)
+    row = _guilherme_type_row(
+        prob_f1_raw=0.81,
+        prob_f1_win=0.90,
+        prob_f2_win=0.10,
+        f1_odds=1.45,
+        f2_odds=2.80,
+    )
+    gate = evaluate_uncertainty_gate(row)
+    assert gate.action == "skip"
+    assert gate.blend_prob is None
+
+
 def test_market_blend_sizes_modest_price(monkeypatch):
     monkeypatch.setattr(config, "UFC_PROFILE", "paper")
     monkeypatch.setattr(config, "UNCERTAINTY_GATES_ENABLED", True)
