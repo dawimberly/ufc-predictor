@@ -403,6 +403,14 @@ def generate_alerts(
                 "skip_reason": "",
             }
         )
+        if config.is_paper_profile() and (
+            gate.primary_reason == "paper_wide_override"
+            or "paper_wide_override" in list(gate.reasons or [])
+        ):
+            max_frac = float(
+                getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01
+            )
+            singles[-1]["max_stake_usd"] = round(float(bankroll) * max(0.0, max_frac), 2)
 
     # Prefer high prob + low uncertainty + clear edge; hard cap per card (singles first pass)
     from src.strategy import apply_max_bets_per_card, apply_max_tickets_per_card

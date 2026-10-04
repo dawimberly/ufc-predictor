@@ -113,7 +113,7 @@ When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can st
 - override enabled (`PAPER_WIDE_OVERRIDE_ENABLED=true`)
 - pure `wide_interval` (no other hard skips)
 - edge ≥ 8% and model prob ≥ 70% (defaults)
-- Kelly multiplier 0.20, stake hard-capped at **1% bankroll**, max **2** override singles per card
+- Kelly multiplier 0.20, stake hard-capped at **1% bankroll** (card-pool allocation cannot raise it), max **2** override singles per card
 
 **Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
 

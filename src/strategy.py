@@ -1438,6 +1438,35 @@ def _largest_remainder_pct(weights: list[float], *, decimals: int = 1) -> list[f
     return [f / scale for f in floors]
 
 
+def _clamp_max_stake_usd(
+    tickets: list[dict[str, Any]],
+    pool: float,
+) -> list[dict[str, Any]]:
+    """Honor a per-ticket USD ceiling after % allocation.
+
+    Paper wide-override singles set ``max_stake_usd`` (1% of bankroll). Card-pool
+    allocation must not size those as full Deep Blue tickets.
+    """
+    for t in tickets:
+        raw = t.get("max_stake_usd")
+        if raw is None or raw == "":
+            continue
+        try:
+            cap = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if cap < 0:
+            continue
+        stake = float(t.get("suggested_stake") or 0.0)
+        if stake <= cap + 1e-9:
+            continue
+        t["suggested_stake"] = round(cap, 2)
+        if pool > 0:
+            t["stake_pct"] = round(100.0 * float(t["suggested_stake"]) / pool, 4)
+        t["sizing_max_stake_capped"] = True
+    return tickets
+
+
 def allocate_card_budget_pct(
     tickets: list[dict[str, Any]],
     pool_usd: float,
@@ -1522,6 +1551,7 @@ def allocate_card_budget_pct(
         out.append(row)
 
     out = _apply_parlay_share_cap(out, pool, live=live)
+    out = _clamp_max_stake_usd(out, pool)
 
     if out and pool > 0:
         spent = sum(float(t["suggested_stake"]) for t in out)
@@ -1532,11 +1562,19 @@ def allocate_card_budget_pct(
             singles = [
                 t
                 for t in out
-                if not _is_parlay_ticket(t) and not bool(t.get("sizing_no_inflate"))
+                if not _is_parlay_ticket(t)
+                and not bool(t.get("sizing_no_inflate"))
+                and t.get("max_stake_usd") in (None, "")
             ]
-            target = singles or out
-            idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
-            target[idx]["suggested_stake"] = round(float(target[idx]["suggested_stake"]) + drift, 2)
+            target = singles or [
+                t for t in out if t.get("max_stake_usd") in (None, "")
+            ]
+            if target:
+                idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
+                target[idx]["suggested_stake"] = round(
+                    float(target[idx]["suggested_stake"]) + drift, 2
+                )
+        out = _clamp_max_stake_usd(out, pool)
 
     return out
 
