@@ -180,7 +180,8 @@ MIN_FIGHTS_PER_FIGHTER = int(os.getenv("MIN_FIGHTS_PER_FIGHTER", "3"))
 # Bump when FEATURE_COLUMNS / feature defs change so models auto-retrain.
 # v3: Sherdog career + CompuBox-style striking (KD / target / range mix).
 # v4: Prior-sport base tiers (wrestling/BJJ/boxing/MT/…) + matchup level advantage.
-FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "5"))
+# v6: Tale-of-the-tape height, reach, and stance, plus length-versus-style.
+FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "6"))
 
 # Optional high-value feature block (Phase 1). Always computed in FE; gated into the model list.
 ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
@@ -268,6 +269,10 @@ FEATURE_COLUMNS = [
     "grappler_score_diff",
     "striker_vs_grappler",
     "style_clash",
+    # Length against the opponent's style. Positive when the longer fighter
+    # is also the stronger striker, or when height and reach agree.
+    "ix_reach_x_striker",
+    "ix_height_x_reach",
     "days_since_last_fight_diff",
     "experience_diff",
     # CompuBox-style striking (Greco detail; real CompuBox when cached)
