@@ -137,7 +137,7 @@ Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `X
 
 ### Context strip (display only)
 
-Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Controversial methods / decision-profile / home-country / pathway A/Bs are **DROP** for production features; leave those flags off unless a keep rule is re-run and passes.
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Judge scorecards stay out of the model. Closing odds are not a training feature. Prior-only pathway rates, home country, rankings, streaks, reversals, and pace are in the training list.
 
 ## Odds sources
 

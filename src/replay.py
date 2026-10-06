@@ -86,6 +86,12 @@ def load_replay_features() -> pd.DataFrame:
         features = attach_physical_matchup(features, download=True)
     except Exception as exc:
         logger.debug("physical matchup attach failed: %s", exc)
+    try:
+        from src.research_variables import attach_research_variables
+
+        features = attach_research_variables(features, download=True)
+    except Exception as exc:
+        logger.debug("research variable attach failed: %s", exc)
     labeled = features.dropna(subset=[config.TARGET_COLUMN]).copy()
     if labeled.empty:
         raise ValueError("No labeled fights in feature matrix.")

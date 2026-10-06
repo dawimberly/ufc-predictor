@@ -181,7 +181,8 @@ MIN_FIGHTS_PER_FIGHTER = int(os.getenv("MIN_FIGHTS_PER_FIGHTER", "3"))
 # v3: Sherdog career + CompuBox-style striking (KD / target / range mix).
 # v4: Prior-sport base tiers (wrestling/BJJ/boxing/MT/…) + matchup level advantage.
 # v6: Tale-of-the-tape height, reach, and stance, plus length-versus-style.
-FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "6"))
+# v7: Prior-only pathway rates, plus rankings, streaks, reversals, pace, and home country.
+FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "7"))
 
 # Optional high-value feature block (Phase 1). Always computed in FE; gated into the model list.
 ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
@@ -197,9 +198,9 @@ HIGH_VALUE_FEATURE_COLUMNS = [
     "ko_losses_career_flag_diff",
 ]
 
-# UFC-only pathway + market blocks (A/B research). Default OFF — do not affect production
-# until pathway_market_ab_2025 keep rule passes. Names are UFC-scoped (not shared with trading bot).
-ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+# Pathway rates are prior-only and already on the feature table, so they train by default.
+# Market price stays off: the book measures edge against that price.
+ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "true")
 ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
 # Research-only: post-hoc shrink of wide-CI probs toward market (not a train feature).
 ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
@@ -295,6 +296,28 @@ FEATURE_COLUMNS = [
     "multi_base_flag_diff",
     # Optional news sentiment (0 when API disabled)
     "sentiment_diff",
+    # Prior-only research variables that were on disk but not trained.
+    # Rank and weight come from the public ufc-master file. Pace and reversals
+    # come from Greco round rows. Home country uses Greco event locations.
+    "rev_rate_diff",
+    "total_strikes_per_min_diff",
+    "sig_share_diff",
+    "pace_decay_diff",
+    "home_country_diff",
+    "home_country_rate_diff",
+    "event_outside_usa",
+    "split_dec_rate_l5_diff",
+    "split_dec_rate_career_diff",
+    "win_streak_diff",
+    "lose_streak_diff",
+    "longest_win_streak_diff",
+    "rounds_fought_diff",
+    "title_bouts_diff",
+    "rank_diff",
+    "p4p_rank_diff",
+    "listed_weight_diff",
+    "empty_arena",
+    "is_womens",
     # Context
     "is_title_fight",
     "is_main_event",
@@ -790,7 +813,7 @@ def refresh_runtime_env() -> None:
 
     ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
     ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
-    ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+    ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "true")
     ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
     ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
     PATHWAY_MARKET_CAL_WIDTH = float(os.getenv("PATHWAY_MARKET_CAL_WIDTH", "0.40"))

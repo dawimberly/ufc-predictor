@@ -2464,7 +2464,14 @@ def build_feature_matrix(
     except Exception:
         pass
 
-    return attach_physical_matchup(features, download=False)
+    features = attach_physical_matchup(features, download=False)
+    try:
+        from src.research_variables import attach_research_variables
+
+        features = attach_research_variables(features, download=False)
+    except Exception as exc:
+        logger.debug("research variable attach failed: %s", exc)
+    return features
 
 
 def _tape_frame(profiles: pd.DataFrame) -> pd.DataFrame:

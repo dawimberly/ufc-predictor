@@ -7,7 +7,8 @@ True Sherdog/Wikipedia nationality caches are empty or noisy, so fighter
 
 Event country comes from the fight ``location`` string.
 
-Not added to production FEATURE_COLUMNS unless A/B keep rule passes.
+home_country_diff and home_country_rate_diff are training columns.
+The attach still only uses gym country or the fighter's prior event countries.
 """
 
 from __future__ import annotations
