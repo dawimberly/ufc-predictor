@@ -65,6 +65,14 @@ def build_fight_brief(
     driver = _top_shap_label(row)
     if driver:
         parts.append(f"key driver: {driver}")
+    try:
+        from src.programmed_rules import rules_supporting_pick
+
+        rule_labels = rules_supporting_pick(row)
+        if rule_labels:
+            parts.append("rules: " + ", ".join(rule_labels))
+    except Exception:
+        pass
     conf = str(row.get("confidence_label", "")).strip()
     if conf and conf not in ("", "nan"):
         parts.append(f"{conf} confidence")

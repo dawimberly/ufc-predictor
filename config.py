@@ -180,7 +180,9 @@ MIN_FIGHTS_PER_FIGHTER = int(os.getenv("MIN_FIGHTS_PER_FIGHTER", "3"))
 # Bump when FEATURE_COLUMNS / feature defs change so models auto-retrain.
 # v3: Sherdog career + CompuBox-style striking (KD / target / range mix).
 # v4: Prior-sport base tiers (wrestling/BJJ/boxing/MT/…) + matchup level advantage.
-FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "5"))
+# v6: Tale-of-the-tape height, reach, and stance, plus length-versus-style.
+# v7: Prior-only pathway rates, plus rankings, streaks, reversals, pace, and home country.
+FEATURE_SCHEMA_VERSION = int(os.getenv("FEATURE_SCHEMA_VERSION", "7"))
 
 # Optional high-value feature block (Phase 1). Always computed in FE; gated into the model list.
 ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
@@ -196,9 +198,9 @@ HIGH_VALUE_FEATURE_COLUMNS = [
     "ko_losses_career_flag_diff",
 ]
 
-# UFC-only pathway + market blocks (A/B research). Default OFF — do not affect production
-# until pathway_market_ab_2025 keep rule passes. Names are UFC-scoped (not shared with trading bot).
-ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+# Pathway rates are prior-only and already on the feature table, so they train by default.
+# Market price stays off: the book measures edge against that price.
+ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "true")
 ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
 # Research-only: post-hoc shrink of wide-CI probs toward market (not a train feature).
 ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
@@ -268,6 +270,10 @@ FEATURE_COLUMNS = [
     "grappler_score_diff",
     "striker_vs_grappler",
     "style_clash",
+    # Length against the opponent's style. Positive when the longer fighter
+    # is also the stronger striker, or when height and reach agree.
+    "ix_reach_x_striker",
+    "ix_height_x_reach",
     "days_since_last_fight_diff",
     "experience_diff",
     # CompuBox-style striking (Greco detail; real CompuBox when cached)
@@ -290,6 +296,28 @@ FEATURE_COLUMNS = [
     "multi_base_flag_diff",
     # Optional news sentiment (0 when API disabled)
     "sentiment_diff",
+    # Prior-only research variables that were on disk but not trained.
+    # Rank and weight come from the public ufc-master file. Pace and reversals
+    # come from Greco round rows. Home country uses Greco event locations.
+    "rev_rate_diff",
+    "total_strikes_per_min_diff",
+    "sig_share_diff",
+    "pace_decay_diff",
+    "home_country_diff",
+    "home_country_rate_diff",
+    "event_outside_usa",
+    "split_dec_rate_l5_diff",
+    "split_dec_rate_career_diff",
+    "win_streak_diff",
+    "lose_streak_diff",
+    "longest_win_streak_diff",
+    "rounds_fought_diff",
+    "title_bouts_diff",
+    "rank_diff",
+    "p4p_rank_diff",
+    "listed_weight_diff",
+    "empty_arena",
+    "is_womens",
     # Context
     "is_title_fight",
     "is_main_event",
@@ -351,7 +379,22 @@ PAPER_WIDE_OVERRIDE_KELLY_MULT = float(os.getenv("PAPER_WIDE_OVERRIDE_KELLY_MULT
 PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC = float(
     os.getenv("PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", "0.01")
 )  # 1% of bankroll
-PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "2"))
+PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "3"))
+
+# Wide-CI paper bets blend 60% de-vigged market + 40% raw model, then only
+# size where win chance and payout meet (odds >= 1.50, EV >= 3c per $1,
+# profit-if-win / loss-chance >= 1.25). Stake stays capped at 1%.
+# Trailing-year walk-forward as of 2026-09-26: 9 blue tickets, 78% hit, $100 → $102.62.
+MARKET_BLEND_MARKET_WEIGHT = float(os.getenv("MARKET_BLEND_MARKET_WEIGHT", "0.60"))
+MARKET_BLEND_MIN_PROB = float(os.getenv("MARKET_BLEND_MIN_PROB", "0.58"))
+MARKET_BLEND_MAX_PROB = float(os.getenv("MARKET_BLEND_MAX_PROB", "0.75"))
+MARKET_BLEND_MIN_EDGE = float(os.getenv("MARKET_BLEND_MIN_EDGE", "0.02"))
+MARKET_BLEND_MAX_EDGE = float(os.getenv("MARKET_BLEND_MAX_EDGE", "0.08"))
+MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.50"))
+MARKET_BLEND_MAX_ODDS = float(os.getenv("MARKET_BLEND_MAX_ODDS", "2.30"))
+# Profit per $1 must be large versus the chance of losing that $1.
+MARKET_BLEND_MIN_EV = float(os.getenv("MARKET_BLEND_MIN_EV", "0.03"))
+MARKET_BLEND_MIN_REWARD_PER_RISK = float(os.getenv("MARKET_BLEND_MIN_REWARD_PER_RISK", "1.25"))
 
 # Live: stricter
 LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
@@ -371,6 +414,12 @@ _PAPER_UNCERTAINTY_THRESHOLDS_PREV = {
 
 WF_MIN_TRAIN_RATIO = float(os.getenv("WF_MIN_TRAIN_RATIO", "0.60"))
 WF_IMPORTANCE_INTERVAL = int(os.getenv("WF_IMPORTANCE_INTERVAL", "400"))
+# Walk-forward conformal half-width. Floor only by default.
+# Do not cap q down to 0.14: that squeezed genuinely wide intervals under the
+# paper skip (0.52) and sized them as deep-blue BET THIS tickets.
+_wf_q_cap_raw = os.getenv("HA_WF_CONFORMAL_Q_CAP", "").strip()
+HA_WF_CONFORMAL_Q_CAP = float(_wf_q_cap_raw) if _wf_q_cap_raw else None
+HA_WF_CONFORMAL_Q_FLOOR = float(os.getenv("HA_WF_CONFORMAL_Q_FLOOR", "0.05"))
 STYLE_BONUS_MAX = float(os.getenv("STYLE_BONUS_MAX", "0.05"))
 EDGE_RANK_MIN = float(os.getenv("EDGE_RANK_MIN", "0.0"))
 RUN_BACKTEST_ON_TRAIN = os.getenv("RUN_BACKTEST_ON_TRAIN", "true").lower() in (
@@ -764,7 +813,7 @@ def refresh_runtime_env() -> None:
 
     ENABLE_PROPS = env_bool("ENABLE_PROPS", "false")
     ENABLE_HIGH_VALUE_FEATURES = env_bool("ENABLE_HIGH_VALUE_FEATURES", "true")
-    ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "false")
+    ENABLE_PATHWAY_FEATURES = env_bool("ENABLE_PATHWAY_FEATURES", "true")
     ENABLE_MARKET_FEATURES = env_bool("ENABLE_MARKET_FEATURES", "false")
     ENABLE_PATHWAY_MARKET_CAL = env_bool("ENABLE_PATHWAY_MARKET_CAL", "false")
     PATHWAY_MARKET_CAL_WIDTH = float(os.getenv("PATHWAY_MARKET_CAL_WIDTH", "0.40"))
@@ -895,7 +944,20 @@ def refresh_runtime_env() -> None:
     PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC = float(
         os.getenv("PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", "0.01")
     )
-    PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "2"))
+    PAPER_WIDE_OVERRIDE_MAX_PER_CARD = int(os.getenv("PAPER_WIDE_OVERRIDE_MAX_PER_CARD", "3"))
+    global MARKET_BLEND_MARKET_WEIGHT, MARKET_BLEND_MIN_PROB, MARKET_BLEND_MAX_PROB
+    global MARKET_BLEND_MIN_EDGE, MARKET_BLEND_MAX_EDGE
+    global MARKET_BLEND_MIN_ODDS, MARKET_BLEND_MAX_ODDS
+    MARKET_BLEND_MARKET_WEIGHT = float(os.getenv("MARKET_BLEND_MARKET_WEIGHT", "0.60"))
+    MARKET_BLEND_MIN_PROB = float(os.getenv("MARKET_BLEND_MIN_PROB", "0.58"))
+    MARKET_BLEND_MAX_PROB = float(os.getenv("MARKET_BLEND_MAX_PROB", "0.75"))
+    MARKET_BLEND_MIN_EDGE = float(os.getenv("MARKET_BLEND_MIN_EDGE", "0.02"))
+    MARKET_BLEND_MAX_EDGE = float(os.getenv("MARKET_BLEND_MAX_EDGE", "0.08"))
+    MARKET_BLEND_MIN_ODDS = float(os.getenv("MARKET_BLEND_MIN_ODDS", "1.50"))
+    MARKET_BLEND_MAX_ODDS = float(os.getenv("MARKET_BLEND_MAX_ODDS", "2.30"))
+    global MARKET_BLEND_MIN_EV, MARKET_BLEND_MIN_REWARD_PER_RISK
+    MARKET_BLEND_MIN_EV = float(os.getenv("MARKET_BLEND_MIN_EV", "0.03"))
+    MARKET_BLEND_MIN_REWARD_PER_RISK = float(os.getenv("MARKET_BLEND_MIN_REWARD_PER_RISK", "1.25"))
     LIVE_DISAGREEMENT_SKIP = float(os.getenv("LIVE_DISAGREEMENT_SKIP", "0.08"))
     LIVE_DISAGREEMENT_TIGHTEN = float(os.getenv("LIVE_DISAGREEMENT_TIGHTEN", "0.04"))
     LIVE_INTERVAL_WIDTH_SKIP = float(os.getenv("LIVE_INTERVAL_WIDTH_SKIP", str(UNCERTAINTY_HIGH_WIDTH)))

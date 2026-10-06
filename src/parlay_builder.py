@@ -346,8 +346,9 @@ def build_parlays_for_card(
 ) -> tuple[list[ParlayCandidate], StrategyConfig, ThresholdResult | None, float]:
     """Build qualified same-card parlays using static or dynamic thresholds.
 
-    Uncertainty gates run inside ``build_parlay_candidates`` / ``extract_bet_candidates``
-    (skip high-disagreement / wide-interval legs; raise min-edge when tightening).
+    Uncertainty gates run inside ``build_parlay_candidates`` / ``extract_bet_candidates``.
+    Only Deep Blue legs (uncertainty action ``allow``) are combined. Wide-interval
+    and paper wide-override rows stay singles or skips.
     """
     strat, thresholds, min_ev = resolve_parlay_thresholds(
         card_rows,

@@ -104,6 +104,26 @@ def test_format_stake_pct_dollars():
     assert txt == "38% · $4.56"
 
 
+def test_max_stake_usd_survives_card_allocation():
+    base = {
+        "edge": 0.22,
+        "prob": 0.95,
+        "confidence": "high",
+        "decimal_odds": 1.30,
+        "uncertainty_action": "tighten",
+        "uncertainty_reason": "paper_wide_override",
+    }
+    uncapped = allocate_card_budget_pct([dict(base)], pool_usd=55.0, profile="paper")
+    capped = allocate_card_budget_pct(
+        [{**base, "max_stake_usd": 1.0}],
+        pool_usd=55.0,
+        profile="paper",
+    )
+    assert float(uncapped[0]["suggested_stake"]) > 1.0
+    assert float(capped[0]["suggested_stake"]) <= 1.0 + 1e-9
+    assert capped[0].get("sizing_max_stake_capped") is True
+
+
 def test_stronger_edge_gets_more_weight():
     strong = {"edge": 0.12, "prob": 0.74, "confidence": "high", "decimal_odds": 1.55, "uncertainty_action": "allow"}
     weak = {"edge": 0.05, "prob": 0.68, "confidence": "medium", "decimal_odds": 1.90, "uncertainty_action": "tighten"}

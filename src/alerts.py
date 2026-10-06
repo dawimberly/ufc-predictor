@@ -102,8 +102,13 @@ def _suggest_stake(
     if cand is None:
         return 0.0, 1.0, gate_dict
 
-    # Double-check tightened edge floor (extract already applies it)
-    if gate.tighten and cand.edge < effective_min_edge(strategy.min_edge, gate):
+    # Market-blend tickets already cleared their own edge band. The tighten
+    # bump is for raw-model leans and would erase that band.
+    if (
+        gate.tighten
+        and gate.blend_prob is None
+        and cand.edge < effective_min_edge(strategy.min_edge, gate)
+    ):
         gate_dict = {**gate_dict, "action": "skip", "primary_reason": "below_tightened_min_edge"}
         return 0.0, 1.0, gate_dict
 
@@ -261,8 +266,59 @@ def generate_alerts(
                 logger.debug("skip scorecard log failed: %s", exc)
 
     for _, row in predictions_df.iterrows():
-        edge, pick = _pick_edge(row)
         f1, f2 = _fighter_names(row)
+        from src.uncertainty_gates import MARKET_BLEND, evaluate_uncertainty_gate
+
+        early_gate = evaluate_uncertainty_gate(row)
+        if early_gate.blend_prob is not None:
+            stake, rating_mult, gate_dict = _suggest_stake(
+                row, bankroll=bankroll, strategy=strategy, card_risk=risk_metrics
+            )
+            if stake > 0 and gate_dict.get("action") != "skip":
+                pick = early_gate.blend_pick or f1
+                edge = float(early_gate.blend_edge or 0.0)
+                prob = float(early_gate.blend_prob)
+                dec = float(early_gate.blend_odds or 0.0)
+                singles.append(
+                    {
+                        "fight_id": str(row.get(config.FIGHT_ID_COLUMN, f"{f1}|{f2}")),
+                        "fight": f"{f1} vs {f2}",
+                        "pick": pick,
+                        "prob": prob,
+                        "edge": edge,
+                        "edge_pct": edge * 100.0,
+                        "decimal_odds": dec,
+                        "odds": dec,
+                        "reasoning": _short_reasoning(row),
+                        "brief": build_fight_brief(row, risk_metrics=risk_metrics, edge_pct=edge * 100.0),
+                        "suggested_stake": stake,
+                        "confidence": str(row.get("confidence_label", "")),
+                        "strategy_rating_mult": rating_mult,
+                        "weight_class": str(row.get("weight_class") or ""),
+                        "uncertainty_action": gate_dict.get("action") or early_gate.action,
+                        "uncertainty_reason": gate_dict.get("primary_reason") or MARKET_BLEND,
+                        "uncertainty_kelly_mult": gate_dict.get("kelly_mult", early_gate.kelly_mult),
+                        "ensemble_disagreement": early_gate.disagreement,
+                        "interval_width": early_gate.interval_width,
+                        "odds_source": str(row.get("odds_source") or row.get("odds_book") or ""),
+                        "event_name": str(row.get("event_name") or row.get("event") or ev_name or ""),
+                        "skip_reason": "",
+                        "max_stake_usd": round(
+                            float(bankroll)
+                            * max(
+                                0.0,
+                                float(
+                                    getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01)
+                                    or 0.01
+                                ),
+                            ),
+                            2,
+                        ),
+                    }
+                )
+            continue
+
+        edge, pick = _pick_edge(row)
         from src.strategy import decimal_odds_for_pick, edge_is_actionable
         from src.uncertainty_gates import (
             evaluate_uncertainty_gate,
@@ -403,6 +459,14 @@ def generate_alerts(
                 "skip_reason": "",
             }
         )
+        if config.is_paper_profile() and (
+            gate.primary_reason == "paper_wide_override"
+            or "paper_wide_override" in list(gate.reasons or [])
+        ):
+            max_frac = float(
+                getattr(config, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01
+            )
+            singles[-1]["max_stake_usd"] = round(float(bankroll) * max(0.0, max_frac), 2)
 
     # Prefer high prob + low uncertainty + clear edge; hard cap per card (singles first pass)
     from src.strategy import apply_max_bets_per_card, apply_max_tickets_per_card

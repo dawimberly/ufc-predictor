@@ -176,6 +176,8 @@ DIFF_FEATURE_FIELDS = [
     "grappler_score_diff",
     "striker_vs_grappler",
     "style_clash",
+    "ix_reach_x_striker",
+    "ix_height_x_reach",
     "win_rate_diff",
     "striking_acc_diff",
     "takedown_acc_diff",
@@ -2462,7 +2464,154 @@ def build_feature_matrix(
     except Exception:
         pass
 
+    features = attach_physical_matchup(features, download=False)
+    try:
+        from src.research_variables import attach_research_variables
+
+        features = attach_research_variables(features, download=False)
+    except Exception as exc:
+        logger.debug("research variable attach failed: %s", exc)
     return features
+
+
+def _tape_frame(profiles: pd.DataFrame) -> pd.DataFrame:
+    """Index tale-of-the-tape rows by cleaned fighter name."""
+    tape = profiles.copy()
+    if "fighter" not in tape.columns:
+        return pd.DataFrame()
+    tape["key"] = tape["fighter"].map(clean_fighter_name)
+    tape = tape[tape["key"].astype(bool)].drop_duplicates("key", keep="last")
+    keep = [c for c in ("height_in", "reach_in", "stance", "dob") if c in tape.columns]
+    if not keep:
+        return pd.DataFrame()
+    return tape.set_index("key")[keep]
+
+
+def _map_tape_side(
+    names: pd.Series,
+    tape: pd.DataFrame,
+    column: str,
+) -> pd.Series:
+    """Map fighter names onto one tape column. Unique last names fill exact misses."""
+    keys = names.map(clean_fighter_name)
+    mapped = keys.map(tape[column]) if column in tape.columns else pd.Series(np.nan, index=names.index)
+    if column not in tape.columns:
+        return pd.Series(np.nan, index=names.index)
+    last = tape.index.to_series().str.split().str[-1]
+    counts = last.value_counts()
+    unique_last = last[last.map(counts).eq(1)]
+    last_to_key = pd.Series(unique_last.index, index=unique_last.to_numpy())
+    miss = mapped.isna() & keys.astype(bool)
+    if miss.any() and not last_to_key.empty:
+        fallback_key = keys.str.split().str[-1].map(last_to_key)
+        fallback = fallback_key.map(tape[column])
+        mapped = mapped.where(~miss, fallback)
+    return mapped
+
+
+def attach_physical_matchup(
+    features: pd.DataFrame,
+    profiles: pd.DataFrame | None = None,
+    *,
+    download: bool = False,
+) -> pd.DataFrame:
+    """Fill height, reach, stance, and the length-versus-style products.
+
+    Tale-of-the-tape is a static bio, not a future fight result. Rows stay
+    unchanged when either fighter is missing from the tape.
+    """
+    if features is None or features.empty:
+        return features
+    if "fighter_1" not in features.columns or "fighter_2" not in features.columns:
+        return features
+    if profiles is None:
+        cache = config.UFCSTATS_GRECO_CACHE_DIR / "ufc_fighter_tott.csv"
+        if not download and not cache.is_file():
+            return features
+        try:
+            from src.data_loader import _build_greco_fighter_profiles
+
+            profiles = _build_greco_fighter_profiles(force_refresh=False)
+        except Exception as exc:
+            logger.warning("Tale of the tape unavailable: %s", exc)
+            return features
+    tape = _tape_frame(profiles)
+    if tape.empty:
+        return features
+
+    out = features.copy()
+    h1 = pd.to_numeric(_map_tape_side(out["fighter_1"], tape, "height_in"), errors="coerce")
+    h2 = pd.to_numeric(_map_tape_side(out["fighter_2"], tape, "height_in"), errors="coerce")
+    r1 = pd.to_numeric(_map_tape_side(out["fighter_1"], tape, "reach_in"), errors="coerce")
+    r2 = pd.to_numeric(_map_tape_side(out["fighter_2"], tape, "reach_in"), errors="coerce")
+    s1 = _map_tape_side(out["fighter_1"], tape, "stance")
+    s2 = _map_tape_side(out["fighter_2"], tape, "stance")
+    out["f1_height_in"] = h1
+    out["f2_height_in"] = h2
+    out["f1_reach_in"] = r1
+    out["f2_reach_in"] = r2
+    out["f1_stance"] = s1
+    out["f2_stance"] = s2
+
+    both_h = h1.notna() & h2.notna()
+    both_r = r1.notna() & r2.notna()
+    out.loc[both_h, "height_diff"] = (h1 - h2)[both_h]
+    out.loc[both_r, "reach_diff"] = (r1 - r2)[both_r]
+
+    enc1 = s1.map(_stance_encoding)
+    enc2 = s2.map(_stance_encoding)
+    known = s1.notna() & s2.notna() & s1.astype(str).str.strip().ne("") & s2.astype(str).str.strip().ne("")
+    # map returns NaN for missing names; encoding of NaN is all zeros, so require known.
+    sw1 = enc1.map(lambda d: d.get("stance_southpaw", 0.0) if isinstance(d, dict) else 0.0)
+    or1 = enc1.map(lambda d: d.get("stance_orthodox", 0.0) if isinstance(d, dict) else 0.0)
+    sw2 = enc2.map(lambda d: d.get("stance_southpaw", 0.0) if isinstance(d, dict) else 0.0)
+    or2 = enc2.map(lambda d: d.get("stance_orthodox", 0.0) if isinstance(d, dict) else 0.0)
+    mismatch = ((sw1.eq(1) & or2.eq(1)) | (or1.eq(1) & sw2.eq(1))).astype(float)
+    southpaw = (sw1.eq(1) & or2.eq(1)).astype(float) * 0.08 - (or1.eq(1) & sw2.eq(1)).astype(float) * 0.08
+    out.loc[known, "stance_matchup"] = mismatch[known]
+    out.loc[known, "southpaw_advantage"] = southpaw[known]
+
+    date_col = config.DATE_COLUMN if config.DATE_COLUMN in out.columns else ("date" if "date" in out.columns else None)
+    if date_col and "dob" in tape.columns:
+        event = pd.to_datetime(out[date_col], errors="coerce")
+        dob1 = pd.to_datetime(_map_tape_side(out["fighter_1"], tape, "dob"), errors="coerce")
+        dob2 = pd.to_datetime(_map_tape_side(out["fighter_2"], tape, "dob"), errors="coerce")
+        age1 = (event - dob1).dt.days / 365.25
+        age2 = (event - dob2).dt.days / 365.25
+        plausible = age1.between(16, 65) & age2.between(16, 65)
+        out.loc[plausible, "age_diff"] = (age1 - age2)[plausible]
+        wc_col = "weight_class" if "weight_class" in out.columns else None
+        if wc_col:
+            sens = out.loc[plausible, wc_col].map(weight_class_age_sensitivity).astype(float)
+            out.loc[plausible, "wc_age_advantage_diff"] = ((age2 - age1)[plausible] * sens)
+            from src.high_value_features import division_peak_age
+
+            peak = out.loc[plausible, wc_col].map(division_peak_age).astype(float)
+            out.loc[plausible, "f1_division_age_adj"] = (age1[plausible] - peak)
+            out.loc[plausible, "f2_division_age_adj"] = (age2[plausible] - peak)
+            out.loc[plausible, "division_age_adj_diff"] = (age1 - age2)[plausible]
+
+    reach = pd.to_numeric(out.get("reach_diff"), errors="coerce")
+    height = pd.to_numeric(out.get("height_diff"), errors="coerce")
+    striker = pd.to_numeric(out.get("striker_score_diff"), errors="coerce")
+    both_len_style = reach.notna() & striker.notna()
+    both_len = reach.notna() & height.notna()
+    out["ix_reach_x_striker"] = np.where(both_len_style, reach * striker, np.nan)
+    out["ix_height_x_reach"] = np.where(both_len, height * reach, np.nan)
+    if "ix_stance_x_clash" in out.columns and "style_clash" in out.columns:
+        stance = pd.to_numeric(out["stance_matchup"], errors="coerce")
+        clash = pd.to_numeric(out["style_clash"], errors="coerce")
+        both_sc = stance.notna() & clash.notna() & known
+        out.loc[both_sc, "ix_stance_x_clash"] = (stance * clash)[both_sc]
+    filled = int(both_r.sum())
+    logger.info(
+        "Tale of the tape: reach on %s/%s fights, height on %s, stance on %s",
+        filled,
+        len(out),
+        int(both_h.sum()),
+        int(known.sum()),
+    )
+    return out
 
 
 def _interaction_product(

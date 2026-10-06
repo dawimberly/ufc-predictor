@@ -98,7 +98,7 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 | Color | Action verb | Meaning | Money |
 |-------|-------------|---------|-------|
-| **Deep Blue** `#3b82f6` | **BET THIS** | Clears full HA gates | Real ticket ($) |
+| **Deep Blue** `#3b82f6` | **BET THIS** | Win chance and payout meet: profit if you win is large versus the chance of losing the stake, and the price is +EV | Real ticket ($), 1% cap |
 | **Sky Blue** `#57B9FF` | **TINY PAPER BET** | Paper-only `paper_wide_override` | Paper $ only (not Live) |
 | **Green** | **FUN ONLY** | Strong lean / +EV but HA SKIP (e.g. `wide_interval`) | `$0` research — not bankroll |
 | **Yellow** | **CAUTION — SKIP SIZED** | Thin edge / borderline | `$0` |
@@ -106,16 +106,22 @@ Overview Top Recommended and Ollama Analysis lead with a plain **WHAT TO BET** l
 
 If no Blue/Sky Blue tickets exist, the header says **WHAT TO BET (sized): NONE** and may list FUN ONLY leans separately. Top recommended caps at **5**, deduped across books; Blue preferred over Sky Blue; Red omitted when non-red options exist.
 
-### Paper wide override (Sky Blue)
+### Blue bets (win chance and payout)
 
-When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** can still size a tiny ticket if:
+When conformal CI width triggers `SKIP:wide` / `wide_interval`, **Paper** sizes a **Deep Blue** ticket only where the blended win chance and the payout meet: least stake (1% cap), and a price that pays enough if the pick wins.
 
 - override enabled (`PAPER_WIDE_OVERRIDE_ENABLED=true`)
 - pure `wide_interval` (no other hard skips)
-- edge ≥ 8% and model prob ≥ 70% (defaults)
-- Kelly multiplier 0.20, stake hard-capped at **1% bankroll**, max **2** override singles per card
+- probability = 40% raw model + 60% de-vigged market (`prob_f1_raw` when present)
+- blended prob 58–75%, edge versus the price 2–8%, decimal odds **1.50–2.30**
+- expected profit at least 3¢ per $1, and profit-if-win / chance-of-loss at least 1.25 (a $1 risk has to pay at least $0.50)
+- Kelly multiplier 0.20, stake hard-capped at **1% bankroll** (card-pool allocation cannot raise it), max **3** of these singles per card
+
+A raw model price like 96% on a short favorite stays a skip. That was the losing book.
 
 **Live stays fail-closed** — wide CI never becomes a Live HA ticket. 2025 re-score autopsy: wide-CI miss rate ~44% vs ~3% narrow — validates Live fail-closed + Paper sky-blue exception.
+
+HA-sized 2-leg parlays still require a narrow interval on every leg. A market-blend blue single is a 1% ticket and is never a parlay leg. Walk-forward conformal half-width is not squeezed by default (`HA_WF_CONFORMAL_Q_CAP` empty).
 
 ### Auto parlays (Ollama Analysis)
 
@@ -131,7 +137,7 @@ Optional **Grok / xAI** cloud narrative via `GROK_ENABLED` + `GROK_API_KEY` / `X
 
 ### Context strip (display only)
 
-Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Controversial methods / decision-profile / home-country / pathway A/Bs are **DROP** for production features; leave those flags off unless a keep rule is re-run and passes.
+Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) and integrity flags (`fighter_flags`) — **context only**, not model features. Judge scorecards stay out of the model. Closing odds are not a training feature. Prior-only pathway rates, home country, rankings, streaks, reversals, and pace are in the training list.
 
 ## Odds sources
 
@@ -178,6 +184,26 @@ Common Kelly / alert SKIP labels (still shown as Green/Yellow/Red, never Deep Bl
 
 Phase-1 **high-value** features are on by default (`ENABLE_HIGH_VALUE_FEATURES=true`, schema v5) after 2025 A/B (~+0.008 AUC). Toggle off in `.env` for ablation; do not retrain casually — production ensemble already includes HV.
 
+### Programmed matchup rules
+
+After the ensemble scores a fight, `src/programmed_rules.py` adds a small signed log-odds nudge (capped by `STYLE_BONUS_MAX`, default 0.05). The rules are explicit, leakage-safe, and not in `FEATURE_COLUMNS` — no retrain:
+
+| Rule | When it fires |
+|------|----------------|
+| Southpaw vs orthodox | Signed toward the southpaw (card order does not favor fighter 1) |
+| Striker vs grappler / style-clash grappler | Clear style split |
+| Reach that lands | ≥3" reach and striking accuracy (plus volume) on the same side |
+| Height and reach | Both physical edges ≥2" and the same direction |
+| Short-notice camp | One fighter on short notice; shrinks if their short-notice record is good |
+| Layoff rust | 365-day flag if present, otherwise 180-day; the two do not stack |
+| New division | First fight in a new weight class |
+| Prior KO loss | Been stopped before; larger if the opponent has the power |
+| Past division peak | ≥3 years further past the division peak |
+| Open wrestling path | Style clash plus takedown accuracy, unless a takedown-defense wall blocks it |
+| Form streak / experience | Last-5 and momentum agree; veteran edge only with recent form |
+
+The fight context strip and fight briefs name the rules that fired. Turning off the style adjustment (`apply_style_bonus=False`) turns these off with it.
+
 Helpers:
 
 ```bash
@@ -202,7 +228,7 @@ python main.py --backtest-2025
 
 ```
 data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LGBM+XGB)
-      → predictor → uncertainty_gates (+ Paper wide override) + high_accuracy_strategy
+      → predictor (+ programmed_rules) → uncertainty_gates (+ Paper wide override) + high_accuracy_strategy
       → dashboard_service (books / props / Soft Update)
       → bet_tiers + bet_slip (color rank + Top 5)
       → strategy (auto 2/3-leg parlays) → grok_analysis / Ollama
@@ -215,7 +241,7 @@ data_loader → feature_engineering (+ fighter_cache + HV) → model_trainer (LG
 | Data | `data_loader` | UFC.com cards, multi-source history |
 | Features | `feature_engineering`, `high_value_features` | Leakage-safe + HV block |
 | Model | `predictor`, `ensemble` | Calibrated LGBM+XGB |
-| Gates | `uncertainty_gates`, `high_accuracy_strategy` | Fail-closed HA sizing |
+| Gates | `uncertainty_gates`, `programmed_rules`, `high_accuracy_strategy` | Fail-closed HA sizing; signed matchup nudges |
 | Color | `bet_tiers` | BET THIS / FUN ONLY action verbs + color tiers |
 | Odds | `odds_providers/*`, `odds_api_client` | Odds API + optional scrapers |
 | Dashboard | `ufc_dashboard`, `dashboard_service`, `bet_slip` | GUI + Top 5 |
@@ -263,12 +289,14 @@ Copy `.env.example` → `.env`. Important keys:
 | `ODDS_FETCH_ONCE` | true | One download, reuse until cache deleted |
 | `ENABLE_PROPS` | false | Prop tabs (Over 1.5 HA when on) |
 | `ENABLE_HIGH_VALUE_FEATURES` | true | Phase-1 HV feature block |
-| `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper sky-blue tiny stakes on wide CI |
-| `PAPER_WIDE_OVERRIDE_MIN_EDGE` | 0.08 | Min edge for override |
-| `PAPER_WIDE_OVERRIDE_MIN_PROB` | 0.70 | Min model prob for override |
-| `PAPER_WIDE_OVERRIDE_KELLY_MULT` | 0.20 | Kelly shrink for override |
+| `PAPER_WIDE_OVERRIDE_ENABLED` | true | Paper market-blend singles on wide CI |
+| `MARKET_BLEND_MARKET_WEIGHT` | 0.60 | Weight on the de-vigged market |
+| `MARKET_BLEND_MIN_PROB` / `MAX` | 0.58 / 0.75 | Blended probability band |
+| `MARKET_BLEND_MIN_EDGE` / `MAX` | 0.02 / 0.08 | Edge versus the price |
+| `MARKET_BLEND_MIN_ODDS` / `MAX` | 1.50 / 2.30 | Decimal price band ($1 risk pays at least $0.50) |
+| `MARKET_BLEND_MIN_EV` | 0.03 | Minimum expected profit per $1 |
+| `MARKET_BLEND_MIN_REWARD_PER_RISK` | 1.25 | Profit-if-win divided by chance of losing the stake |
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
-| `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
 | `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |

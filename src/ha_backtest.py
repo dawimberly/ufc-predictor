@@ -213,6 +213,7 @@ def _settle_single(
         "sizing_mode": bet.get("sizing_mode") or "conf_odds",
         "sizing_target_pct": bet.get("sizing_target_pct"),
         "uncertainty_action": bet.get("uncertainty_action"),
+        "uncertainty_reason": bet.get("uncertainty_reason"),
         "uncertainty_penalty": bet.get("uncertainty_penalty"),
         "fight": str(bet.get("fight") or ""),
         "fight_id": str(bet.get("fight_id") or ""),
@@ -340,6 +341,7 @@ def _settle_parlay(
         "sizing_mode": parlay.get("sizing_mode") or "conf_odds",
         "sizing_target_pct": parlay.get("sizing_target_pct"),
         "uncertainty_action": parlay.get("uncertainty_action"),
+        "uncertainty_reason": parlay.get("uncertainty_reason"),
         "uncertainty_penalty": parlay.get("uncertainty_penalty"),
         "picks": str(parlay.get("picks") or ""),
         "n_legs": 2,
@@ -440,12 +442,24 @@ class WalkForwardPredictor:
         if prepared.empty:
             return features.iloc[0:0].copy()
         proba = self.model.predict_proba(prepared[self.feature_columns])[:, 1]
+        raw_p = None
+        base_model = getattr(self.model, "base", None)
+        if base_model is not None:
+            try:
+                raw_p = base_model.predict_proba(prepared[self.feature_columns])[:, 1]
+            except Exception:
+                raw_p = None
         if apply_style_bonus:
+            from src.programmed_rules import programmed_rules_series
+
             proba, bonuses = apply_style_calibration(prepared, proba)
             out = self._attach_predictions(prepared, proba, prepared=prepared)
             out["style_bonus"] = bonuses
+            out["programmed_rules"] = programmed_rules_series(prepared).to_numpy()
         else:
             out = self._attach_predictions(prepared, proba, prepared=prepared)
+        if raw_p is not None and len(raw_p) == len(out):
+            out["prob_f1_raw"] = raw_p
         return out
 
 
@@ -486,6 +500,28 @@ class _CalibratedEnsemble:
 
     def predict(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+def clamp_walkforward_conformal_q(cq: float) -> float:
+    """Apply optional floor/cap to a walk-forward conformal half-width.
+
+    The raw quantile is kept unless ``HA_WF_CONFORMAL_Q_CAP`` is set. Clamping
+    a ~0.60 quantile down to 0.14 made wide intervals look narrow, so the
+    uncertainty gate allowed them as deep-blue tickets instead of SKIP or
+    Paper sky-blue.
+    """
+    applied = float(cq)
+    floor = float(getattr(config, "HA_WF_CONFORMAL_Q_FLOOR", 0.05) or 0.0)
+    if floor > 0:
+        applied = max(applied, floor)
+    cap = getattr(config, "HA_WF_CONFORMAL_Q_CAP", None)
+    try:
+        cap_f = float(cap) if cap is not None else None
+    except (TypeError, ValueError):
+        cap_f = None
+    if cap_f is not None and cap_f > 0:
+        applied = min(applied, cap_f)
+    return float(applied)
 
 
 def fit_walk_forward_predictor(
@@ -580,12 +616,8 @@ def fit_walk_forward_predictor(
     scores = fit_conformal_scores(y_cal.to_numpy(), cal_proba)
     alpha = float(getattr(config, "CONFORMAL_ALPHA", 0.1) or 0.1)
     cq = float(conformal_quantile(scores, alpha))
-    # Fast WF fits without full production calibration can yield huge q, which makes
-    # interval_width trip HA skip gates on every fight. Cap to a paper-usable band.
-    q_cap = float(getattr(config, "HA_WF_CONFORMAL_Q_CAP", 0.14) or 0.14)
-    q_floor = float(getattr(config, "HA_WF_CONFORMAL_Q_FLOOR", 0.05) or 0.05)
     cq_raw = cq
-    cq = float(min(max(cq, q_floor), q_cap))
+    cq = clamp_walkforward_conformal_q(cq)
     if abs(cq_raw - cq) > 1e-6:
         logger.info("WF conformal_q adjusted %.3f → %.3f", cq_raw, cq)
 
@@ -846,6 +878,7 @@ def run_ha_walkforward_backtest(
     as_of: datetime | None = None,
     min_train_rows: int = WF_MIN_TRAIN_ROWS,
     fixed_stake_usd: float | None = None,
+    since: datetime | None = None,
 ) -> dict[str, Any]:
     """
     True walk-forward HA backtest: for each card date D, train only on fights < D.
@@ -862,9 +895,19 @@ def run_ha_walkforward_backtest(
     if features_all.empty:
         raise ValueError("No features available for walk-forward backtest.")
 
-    eval_features = (
-        filter_last_year(features_all, as_of=as_of) if last_year else features_all.copy()
-    )
+    if since is not None:
+        dated = _ensure_bt_date(features_all)
+        start = pd.Timestamp(since)
+        end = pd.Timestamp(as_of) if as_of is not None else dated["_bt_date"].max()
+        eval_features = dated[
+            dated["_bt_date"].notna()
+            & (dated["_bt_date"] >= start)
+            & (dated["_bt_date"] <= end)
+        ].copy()
+    else:
+        eval_features = (
+            filter_last_year(features_all, as_of=as_of) if last_year else features_all.copy()
+        )
     eval_features = _ensure_bt_date(eval_features)
     if eval_features.empty:
         raise ValueError("No labeled fights in the evaluation window.")

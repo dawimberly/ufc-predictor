@@ -111,6 +111,22 @@ def test_no_odds_is_red() -> None:
     assert reason == "no_usable_odds"
 
 
+def test_market_blend_is_deep_blue(monkeypatch) -> None:
+    """A sized market-blend ticket is BET THIS (Deep Blue), not Sky Blue."""
+    monkeypatch.setattr(config, "UFC_PROFILE", "paper")
+    tier, reason = classify_bet_tier(
+        None,
+        status="BET",
+        edge=0.04,
+        model_prob=0.66,
+        stake_pct=1.0,
+        uncertainty_reason="market_blend",
+        pick="Aiemann Zahabi",
+        debug=False,
+    )
+    assert tier == TIER_BLUE, (tier, reason)
+
+
 def test_paper_wide_override_is_sky_blue(monkeypatch) -> None:
     monkeypatch.setattr(config, "UFC_PROFILE", "paper")
     tier, reason = classify_bet_tier(

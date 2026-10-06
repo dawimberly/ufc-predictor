@@ -80,6 +80,18 @@ def load_replay_features() -> pd.DataFrame:
         raise ValueError("No features available for replay. Run --refresh-data / --train first.")
     if config.TARGET_COLUMN not in features.columns:
         raise ValueError(f"Missing target column {config.TARGET_COLUMN}")
+    try:
+        from src.feature_engineering import attach_physical_matchup
+
+        features = attach_physical_matchup(features, download=True)
+    except Exception as exc:
+        logger.debug("physical matchup attach failed: %s", exc)
+    try:
+        from src.research_variables import attach_research_variables
+
+        features = attach_research_variables(features, download=True)
+    except Exception as exc:
+        logger.debug("research variable attach failed: %s", exc)
     labeled = features.dropna(subset=[config.TARGET_COLUMN]).copy()
     if labeled.empty:
         raise ValueError("No labeled fights in feature matrix.")

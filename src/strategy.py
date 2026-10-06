@@ -78,27 +78,39 @@ def kelly_stake(
     uncertainty_kelly_mult: float | None = None,
 ) -> float:
     """Fractional Kelly stake with per-bet cap, segment rating, and uncertainty gates."""
-    if edge < config.min_edge or bankroll <= 0:
+    if bankroll <= 0:
         return 0.0
 
+    blend = False
     unc_mult = 1.0
     if uncertainty_kelly_mult is not None:
         unc_mult = float(uncertainty_kelly_mult)
-    elif row is not None:
+    if row is not None:
         try:
             from src.uncertainty_gates import evaluate_uncertainty_gate
 
             gate = evaluate_uncertainty_gate(row)
-            if gate.skip:
-                return 0.0
-            # Tighten also requires edge vs bumped min — caller usually checks;
-            # still cut Kelly here.
-            unc_mult = float(gate.kelly_mult)
-            if gate.tighten and edge < config.min_edge + gate.edge_bump:
-                return 0.0
+            blend = gate.blend_prob is not None
+            if uncertainty_kelly_mult is None:
+                if gate.skip:
+                    return 0.0
+                unc_mult = float(gate.kelly_mult)
+                # Tighten bump is for raw-model leans. Market-blend already
+                # cleared its own 2–8% edge band.
+                if (
+                    not blend
+                    and gate.tighten
+                    and edge < config.min_edge + gate.edge_bump
+                ):
+                    return 0.0
         except Exception:
-            # Fail-closed: missing gate machinery → no stake
-            return 0.0
+            if uncertainty_kelly_mult is None:
+                # Fail-closed: missing gate machinery → no stake
+                return 0.0
+
+    # HA min-edge does not apply to a market-blend ticket; that band is lower.
+    if not blend and edge < config.min_edge:
+        return 0.0
 
     if unc_mult <= 0:
         return 0.0
@@ -119,7 +131,7 @@ def kelly_stake(
         pass
     kelly = raw_kelly_fraction(prob, decimal_odds) * kelly_frac * unc_mult
     kelly = min(kelly, config.max_bet_fraction)
-    if kelly < config.min_bet_fraction:
+    if not blend and kelly < config.min_bet_fraction:
         return 0.0
     return float(min(bankroll * kelly, bankroll * config.max_bet_fraction))
 
@@ -244,6 +256,27 @@ def extract_bet_candidates(
             log_strategy_block("uncertainty_fail_closed", context="single", fight=fight_lbl)
             return None  # fail-closed
 
+    if apply_uncertainty_gates and gate.blend_prob is not None and gate.blend_odds is not None:
+        side = gate.blend_side or "f1"
+        prob = float(gate.blend_prob)
+        odds = float(gate.blend_odds)
+        edge = float(gate.blend_edge or 0.0)
+        pick_name = gate.blend_pick or (f1 if side == "f1" else f2)
+        return BetCandidate(
+            fight_id=str(row.get("fight_id", "")),
+            event_key=str(row.get("event_name", row.get("event", ""))),
+            bet_side=side,
+            prob=prob,
+            decimal_odds=odds,
+            edge=edge,
+            kelly_full=raw_kelly_fraction(prob, odds) * unc_mult,
+            expected_value=bet_expected_value(prob, odds),
+            fighter1_name=f1,
+            fighter2_name=f2,
+            pick_name=pick_name,
+            winner_name=pick_name,
+        )
+
     market = market_probs(row)
     decimal = fight_decimal_odds(row)
     if market is None or decimal is None:
@@ -306,7 +339,8 @@ def build_parlay_candidates(
     """
     High-accuracy parlays: exactly 2 legs, both strong (high prob + real edge).
 
-    Legs are uncertainty-gated via ``extract_bet_candidates``.
+    Each leg must clear full HA uncertainty (action ``allow`` — Deep Blue).
+    Sky Blue paper wide-override singles are not parlay legs.
     """
     from src.high_accuracy_strategy import PARLAY_MAX_LEGS, log_strategy_block
 
@@ -327,6 +361,26 @@ def build_parlay_candidates(
     for _, row in card_rows.iterrows():
         cand = extract_bet_candidates(row, config=config, apply_uncertainty_gates=True)
         if cand is None:
+            continue
+        # Deep blue only. Paper wide-override (sky blue) is a tiny single, not a parlay leg.
+        try:
+            from src.uncertainty_gates import evaluate_uncertainty_gate
+
+            leg_gate = evaluate_uncertainty_gate(row)
+            if leg_gate.action != "allow":
+                log_strategy_block(
+                    "parlay_leg_not_blue",
+                    context="parlay",
+                    fight=f"{cand.fighter1_name} vs {cand.fighter2_name}",
+                    detail=leg_gate.reason_label() or leg_gate.action,
+                )
+                continue
+        except Exception:
+            log_strategy_block(
+                "parlay_leg_not_blue",
+                context="parlay",
+                fight=f"{cand.fighter1_name} vs {cand.fighter2_name}",
+            )
             continue
         if cand.edge < config.parlay_min_edge:
             log_strategy_block(
@@ -1417,6 +1471,35 @@ def _largest_remainder_pct(weights: list[float], *, decimals: int = 1) -> list[f
     return [f / scale for f in floors]
 
 
+def _clamp_max_stake_usd(
+    tickets: list[dict[str, Any]],
+    pool: float,
+) -> list[dict[str, Any]]:
+    """Honor a per-ticket USD ceiling after % allocation.
+
+    Paper wide-override singles set ``max_stake_usd`` (1% of bankroll). Card-pool
+    allocation must not size those as full Deep Blue tickets.
+    """
+    for t in tickets:
+        raw = t.get("max_stake_usd")
+        if raw is None or raw == "":
+            continue
+        try:
+            cap = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if cap < 0:
+            continue
+        stake = float(t.get("suggested_stake") or 0.0)
+        if stake <= cap + 1e-9:
+            continue
+        t["suggested_stake"] = round(cap, 2)
+        if pool > 0:
+            t["stake_pct"] = round(100.0 * float(t["suggested_stake"]) / pool, 4)
+        t["sizing_max_stake_capped"] = True
+    return tickets
+
+
 def allocate_card_budget_pct(
     tickets: list[dict[str, Any]],
     pool_usd: float,
@@ -1501,6 +1584,7 @@ def allocate_card_budget_pct(
         out.append(row)
 
     out = _apply_parlay_share_cap(out, pool, live=live)
+    out = _clamp_max_stake_usd(out, pool)
 
     if out and pool > 0:
         spent = sum(float(t["suggested_stake"]) for t in out)
@@ -1511,11 +1595,19 @@ def allocate_card_budget_pct(
             singles = [
                 t
                 for t in out
-                if not _is_parlay_ticket(t) and not bool(t.get("sizing_no_inflate"))
+                if not _is_parlay_ticket(t)
+                and not bool(t.get("sizing_no_inflate"))
+                and t.get("max_stake_usd") in (None, "")
             ]
-            target = singles or out
-            idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
-            target[idx]["suggested_stake"] = round(float(target[idx]["suggested_stake"]) + drift, 2)
+            target = singles or [
+                t for t in out if t.get("max_stake_usd") in (None, "")
+            ]
+            if target:
+                idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
+                target[idx]["suggested_stake"] = round(
+                    float(target[idx]["suggested_stake"]) + drift, 2
+                )
+        out = _clamp_max_stake_usd(out, pool)
 
     return out
 

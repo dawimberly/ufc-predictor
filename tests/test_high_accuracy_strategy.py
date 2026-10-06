@@ -122,6 +122,50 @@ def test_build_parlay_only_2_legs_both_strong(monkeypatch):
     )
     parlays = build_parlay_candidates(rows, config=cfg)
     assert all(len(p.legs) == 2 for p in parlays)
+    assert parlays
+
+
+def test_parlays_skip_wide_interval_legs():
+    rows = pd.DataFrame(
+        [
+            {
+                "fight_id": "a",
+                "event_name": "UFC",
+                "fighter_1": "A",
+                "fighter_2": "B",
+                "prob_f1_win": 0.80,
+                "prob_f2_win": 0.20,
+                "f1_odds": 1.40,
+                "f2_odds": 3.00,
+                "confidence_label": "high",
+                "ensemble_disagreement": 0.01,
+                "interval_width": 0.70,
+            },
+            {
+                "fight_id": "b",
+                "event_name": "UFC",
+                "fighter_1": "C",
+                "fighter_2": "D",
+                "prob_f1_win": 0.78,
+                "prob_f2_win": 0.22,
+                "f1_odds": 1.45,
+                "f2_odds": 2.80,
+                "confidence_label": "high",
+                "ensemble_disagreement": 0.01,
+                "interval_width": 0.70,
+            },
+        ]
+    )
+    cfg = StrategyConfig(
+        min_edge=0.05,
+        min_model_prob=0.60,
+        min_confidence="medium",
+        parlay_min_edge=0.05,
+        parlay_min_combined_prob=0.20,
+        parlay_max_legs=2,
+        parlay_min_leg_prob=0.60,
+    )
+    assert build_parlay_candidates(rows, config=cfg) == []
 
 
 def test_ticket_cap_prefers_singles():

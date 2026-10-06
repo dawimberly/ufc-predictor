@@ -29,6 +29,7 @@ SKIP_MISSING = "missing_uncertainty"
 TIGHTEN_DISAGREEMENT = "elevated_disagreement"
 TIGHTEN_INTERVAL = "elevated_interval_width"
 PAPER_WIDE_OVERRIDE = "paper_wide_override"
+MARKET_BLEND = "market_blend"
 
 
 @dataclass
@@ -40,6 +41,12 @@ class UncertaintyGateResult:
     edge_bump: float = 0.0
     kelly_mult: float = 1.0
     primary_reason: str = ""
+    # Set when a wide-interval row qualifies as a market-blend bet.
+    blend_side: str = ""
+    blend_pick: str = ""
+    blend_prob: float | None = None
+    blend_odds: float | None = None
+    blend_edge: float | None = None
 
     @property
     def skip(self) -> bool:
@@ -131,13 +138,81 @@ def _row_edge_and_prob(row: pd.Series | dict[str, Any] | None) -> tuple[float | 
     return _safe_float(edge), _safe_float(prob)
 
 
+def _market_blend_bet(row: pd.Series | dict[str, Any] | None) -> dict[str, Any] | None:
+    """Wide-CI paper bet: 40% raw model + 60% de-vigged market, modest price only.
+
+    Edge is versus the price (``1/odds``), matching the holdout that was positive
+    in both 2024 and 2025-26. Returns None when odds are missing or the blended
+    pick is outside the band.
+    """
+    if row is None:
+        return None
+    series = pd.Series(row) if isinstance(row, dict) else row
+    try:
+        from ufc_betting_bot.modules.edge import fight_decimal_odds, market_probs
+    except Exception:
+        return None
+    decimal = fight_decimal_odds(series)
+    market = market_probs(series)
+    if decimal is None or market is None:
+        return None
+    raw = _safe_float(series.get("prob_f1_raw"))
+    if raw is None:
+        raw = _safe_float(series.get("prob_f1_win"))
+    if raw is None:
+        return None
+    weight = float(getattr(config, "MARKET_BLEND_MARKET_WEIGHT", 0.60) or 0.60)
+    weight = max(0.0, min(1.0, weight))
+    b1 = (1.0 - weight) * float(raw) + weight * float(market[0])
+    b1 = max(0.0, min(1.0, b1))
+    if b1 >= 0.5:
+        side, prob, odds = "f1", b1, float(decimal[0])
+        pick = str(series.get("fighter_1") or series.get("fighter1") or "")
+    else:
+        side, prob, odds = "f2", 1.0 - b1, float(decimal[1])
+        pick = str(series.get("fighter_2") or series.get("fighter2") or "")
+    if odds <= 1.0:
+        return None
+    edge = float(prob) - (1.0 / odds)
+    lo_p = float(getattr(config, "MARKET_BLEND_MIN_PROB", 0.58) or 0.58)
+    hi_p = float(getattr(config, "MARKET_BLEND_MAX_PROB", 0.75) or 0.75)
+    lo_e = float(getattr(config, "MARKET_BLEND_MIN_EDGE", 0.02) or 0.02)
+    hi_e = float(getattr(config, "MARKET_BLEND_MAX_EDGE", 0.08) or 0.08)
+    lo_o = float(getattr(config, "MARKET_BLEND_MIN_ODDS", 1.50) or 1.50)
+    hi_o = float(getattr(config, "MARKET_BLEND_MAX_ODDS", 2.30) or 2.30)
+    if not (lo_p <= prob <= hi_p and lo_e <= edge <= hi_e and lo_o <= odds <= hi_o):
+        return None
+    # Blue: the win chance and the payout meet. Profit if you win has to be
+    # large relative to how often the stake is lost, and EV has to clear a margin.
+    payout = float(odds) - 1.0
+    loss_risk = 1.0 - float(prob)
+    if payout <= 0 or loss_risk <= 0:
+        return None
+    ev = float(prob) * float(odds) - 1.0
+    reward_per_risk = payout / loss_risk
+    min_ev = float(getattr(config, "MARKET_BLEND_MIN_EV", 0.03) or 0.03)
+    min_reward = float(getattr(config, "MARKET_BLEND_MIN_REWARD_PER_RISK", 1.25) or 1.25)
+    if ev < min_ev or reward_per_risk < min_reward:
+        return None
+    return {
+        "side": side,
+        "pick": pick,
+        "prob": float(prob),
+        "odds": float(odds),
+        "edge": float(edge),
+        "ev": float(ev),
+        "reward_per_risk": float(reward_per_risk),
+    }
+
+
 def maybe_paper_wide_override(
     gate: UncertaintyGateResult,
     row: pd.Series | dict[str, Any] | None = None,
 ) -> UncertaintyGateResult:
     """
-    Paper-only: convert pure ``wide_interval`` skips into a tiny-stake tighten
-    when edge/prob clear floors. Live and disagreement/missing skips unchanged.
+    Paper-only: convert a pure ``wide_interval`` skip into a 1% market-blend
+    bet when the blended price still has a modest edge. Live stays skipped.
+    A raw model that is far above the market does not qualify.
     """
     if gate.action != "skip":
         return gate
@@ -155,32 +230,34 @@ def maybe_paper_wide_override(
     if SKIP_HIGH_DISAGREEMENT in reasons or SKIP_MISSING in reasons:
         return gate
 
-    edge, prob = _row_edge_and_prob(row)
-    min_edge = float(getattr(config, "PAPER_WIDE_OVERRIDE_MIN_EDGE", 0.08) or 0.08)
-    min_prob = float(getattr(config, "PAPER_WIDE_OVERRIDE_MIN_PROB", 0.70) or 0.70)
-    if edge is None or edge < min_edge:
-        return gate
-    if prob is None or prob < min_prob:
+    blend = _market_blend_bet(row)
+    if blend is None:
         return gate
 
     k_mult = float(getattr(config, "PAPER_WIDE_OVERRIDE_KELLY_MULT", 0.20) or 0.20)
     k_mult = max(0.0, min(1.0, k_mult))
     bump = float(getattr(config, "PAPER_UNCERTAINTY_EDGE_BUMP", 0.025) or 0.025)
     logger.info(
-        "Paper wide override: edge=%.3f prob=%.3f width=%s → tighten kelly_mult=%.2f",
-        edge,
-        prob,
+        "Market blend bet: pick=%s prob=%.3f edge=%.3f odds=%.2f width=%s",
+        blend["pick"],
+        blend["prob"],
+        blend["edge"],
+        blend["odds"],
         f"{gate.interval_width:.3f}" if gate.interval_width is not None else "?",
-        k_mult,
     )
     return UncertaintyGateResult(
         action="tighten",
-        reasons=reasons + [PAPER_WIDE_OVERRIDE],
-        primary_reason=PAPER_WIDE_OVERRIDE,
+        reasons=reasons + [MARKET_BLEND],
+        primary_reason=MARKET_BLEND,
         disagreement=gate.disagreement,
         interval_width=gate.interval_width,
         edge_bump=bump,
         kelly_mult=k_mult,
+        blend_side=blend["side"],
+        blend_pick=blend["pick"],
+        blend_prob=blend["prob"],
+        blend_odds=blend["odds"],
+        blend_edge=blend["edge"],
     )
 
 

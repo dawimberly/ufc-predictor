@@ -213,6 +213,54 @@ def test_canonicalize_fighter_slots_alphabetical():
     assert target.iloc[0] == 0
 
 
+def test_physical_matchup_fills_reach_height_and_style():
+    """A longer southpaw striker against a shorter orthodox grappler is a real diff."""
+    from src.feature_engineering import attach_physical_matchup
+
+    features = pd.DataFrame(
+        [
+            {
+                "fighter_1": "Long Striker",
+                "fighter_2": "Short Grappler",
+                "event_date": "2024-06-01",
+                "weight_class": "Lightweight",
+                "striker_score_diff": 0.25,
+                "style_clash": 1.0,
+                "height_diff": 0.0,
+                "reach_diff": 0.0,
+                "stance_matchup": 0.0,
+                "southpaw_advantage": 0.0,
+            }
+        ]
+    )
+    profiles = pd.DataFrame(
+        [
+            {
+                "fighter": "Long Striker",
+                "height_in": 74.0,
+                "reach_in": 76.0,
+                "stance": "Southpaw",
+                "dob": "1994-06-01",
+            },
+            {
+                "fighter": "Short Grappler",
+                "height_in": 68.0,
+                "reach_in": 70.0,
+                "stance": "Orthodox",
+                "dob": "1996-06-01",
+            },
+        ]
+    )
+    out = attach_physical_matchup(features, profiles)
+    assert out.loc[0, "height_diff"] == pytest.approx(6.0)
+    assert out.loc[0, "reach_diff"] == pytest.approx(6.0)
+    assert out.loc[0, "stance_matchup"] == pytest.approx(1.0)
+    assert out.loc[0, "southpaw_advantage"] == pytest.approx(0.08)
+    assert out.loc[0, "ix_reach_x_striker"] == pytest.approx(6.0 * 0.25)
+    assert out.loc[0, "ix_height_x_reach"] == pytest.approx(36.0)
+    assert out.loc[0, "age_diff"] == pytest.approx(2.0, abs=0.05)
+
+
 def test_target_mean_balanced_on_fixture(sample_fights: pd.DataFrame):
     features = build_feature_matrix(sample_fights)
     mean_target = assert_target_encoding(features, min_rows_for_balance=0)
