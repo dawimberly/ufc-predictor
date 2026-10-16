@@ -658,29 +658,18 @@ def _top_shap(row: pd.Series) -> str:
 
 
 def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
-    f1 = str(row.get("fighter_1", ""))
-    f2 = str(row.get("fighter_2", ""))
-    pick = str(row.get("predicted_winner", ""))
+    from src.strategy import edge_for_predicted_pick
+
+    pick = str(row.get("predicted_winner", "") or "")
     if not _has_usable_odds(row):
         return None, pick or None
-    edge: float | None = None
-    if pd.notna(row.get("edge_pct")):
-        edge = float(row["edge_pct"]) / 100.0
-    elif pd.notna(row.get("best_edge")):
-        edge = float(row["best_edge"])
-        if abs(edge) > 1.5:  # sometimes stored as percent
-            edge = edge / 100.0
-    elif pd.notna(row.get("edge_f1")) or pd.notna(row.get("edge_f2")):
-        e1 = float(row["edge_f1"]) if pd.notna(row.get("edge_f1")) else float("-inf")
-        e2 = float(row["edge_f2"]) if pd.notna(row.get("edge_f2")) else float("-inf")
-        edge = max(e1, e2)
-        if edge == float("-inf"):
-            edge = None
+    edge, pick_out = edge_for_predicted_pick(row)
+    pick = pick_out or pick or None
     if edge is None:
-        return None, pick or None
+        return None, pick
     if abs(edge) > _MAX_DISPLAY_EDGE or edge <= -0.50:
-        return None, pick or None
-    return edge, pick or None
+        return None, pick
+    return edge, pick
 
 
 def _site_odds(row: pd.Series, pick: str | None) -> str:

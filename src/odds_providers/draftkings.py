@@ -176,13 +176,19 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     except requests.HTTPError as exc:
         if _is_unauthorized(exc, response):
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
-        logger.warning("DraftKings odds HTTP error: %s", exc)
-        return _fallback_odds(force_refresh=False, reason=str(exc))
+        from src.safe_io import redact_secrets
+
+        safe_exc = redact_secrets(str(exc))
+        logger.warning("DraftKings odds HTTP error: %s", safe_exc)
+        return _fallback_odds(force_refresh=False, reason=safe_exc)
     except requests.RequestException as exc:
         if _is_unauthorized(exc, response):
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
-        logger.warning("DraftKings odds request failed: %s", exc)
-        return _fallback_odds(force_refresh=False, reason=str(exc))
+        from src.safe_io import redact_secrets
+
+        safe_exc = redact_secrets(str(exc))
+        logger.warning("DraftKings odds request failed: %s", safe_exc)
+        return _fallback_odds(force_refresh=False, reason=safe_exc)
     except json.JSONDecodeError as exc:
         logger.warning("DraftKings odds returned invalid JSON: %s", exc)
         return _fallback_odds(force_refresh=False, reason="invalid JSON")

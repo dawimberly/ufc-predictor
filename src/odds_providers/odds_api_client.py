@@ -307,6 +307,9 @@ def odds_api_fail_closed_message(
     detail: str = "",
 ) -> str:
     """Build fail-closed UI text including key/request diagnostics (never the key)."""
+    from src.safe_io import redact_secrets
+
+    detail = redact_secrets(detail)
     key_loaded = "yes" if LAST_REQUEST_META.get("key_loaded") else "no"
     key_len = int(LAST_REQUEST_META.get("key_length") or 0)
     last4 = str(LAST_REQUEST_META.get("key_last4") or "") or "-"

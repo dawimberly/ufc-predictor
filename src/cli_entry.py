@@ -43,7 +43,13 @@ from src.explainability import parse_explanation_json
 from src.fight_brief import build_fight_brief
 from src.logging_utils import setup_logging as setup_file_logging
 from src.safe_io import install_safe_stdout
-from src.strategy import StrategyConfig, extract_bet_candidates, kelly_stake, strategy_from_profile
+from src.strategy import (
+    StrategyConfig,
+    edge_for_predicted_pick,
+    extract_bet_candidates,
+    kelly_stake,
+    strategy_from_profile,
+)
 from ufc_betting_bot.modules.edge import raw_kelly_fraction
 
 console = Console()
@@ -57,17 +63,8 @@ def _truncate(text: str, max_len: int) -> str:
 
 
 def _pick_edge(row: pd.Series) -> float | None:
-    pick = str(row.get("predicted_winner", ""))
-    f1 = str(row.get("fighter_1", ""))
-    if pd.notna(row.get("best_edge")):
-        return float(row["best_edge"])
-    if pick == f1 and pd.notna(row.get("edge_f1")):
-        return float(row["edge_f1"])
-    if pick != f1 and pd.notna(row.get("edge_f2")):
-        return float(row["edge_f2"])
-    if pd.notna(row.get("edge_pct")):
-        return float(row["edge_pct"]) / 100.0
-    return None
+    edge, _pick = edge_for_predicted_pick(row)
+    return edge
 
 
 def _kelly_pct(row: pd.Series, strategy: StrategyConfig, bankroll: float) -> str:

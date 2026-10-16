@@ -269,16 +269,24 @@ def format_recommended_parlay_legs(p: dict[str, Any]) -> list[str]:
 
 
 def strategy_from_thresholds(thresholds: ThresholdResult) -> StrategyConfig:
-    """Map dynamic threshold result onto StrategyConfig."""
+    """Map dynamic threshold result onto StrategyConfig.
+
+    Dynamic singles and parlay edges cannot undercut the active HA profile floor.
+    """
+    import config as _cfg
+
     base = strategy_from_profile()
+    ps = _cfg.profile_settings()
     strat = StrategyConfig(
         kelly_fraction=base.kelly_fraction,
         max_bet_fraction=base.max_bet_fraction,
         min_bet_fraction=base.min_bet_fraction,
         max_card_risk_fraction=base.max_card_risk_fraction,
-        min_edge=thresholds.alert_min_edge,
+        min_edge=max(float(thresholds.alert_min_edge), float(ps.get("alert_min_edge") or 0.0)),
         flat_stake=base.flat_stake,
-        parlay_min_edge=thresholds.parlay_min_edge,
+        parlay_min_edge=max(
+            float(thresholds.parlay_min_edge), float(ps.get("parlay_min_edge") or 0.0)
+        ),
         parlay_min_combined_prob=thresholds.parlay_min_combined_prob,
         parlay_max_legs=base.parlay_max_legs,
     )
@@ -448,9 +456,10 @@ def threshold_context_for_alerts(
         segment_health=health,
     )
     strat = strategy_from_thresholds(thresholds)
+    ps = _cfg.profile_settings()
     return {
         "use_dynamic": True,
-        "min_edge": thresholds.alert_min_edge,
+        "min_edge": max(float(thresholds.alert_min_edge), float(ps.get("alert_min_edge") or 0.0)),
         "min_parlay_ev": thresholds.parlay_min_ev,
         "strategy": _with_profile_parlay_legs(strat),
         "thresholds": thresholds.as_dict(),

@@ -19,6 +19,7 @@ from src.parlay_builder import build_parlays_for_card, leg_pick_label, threshold
 from src.strategy import (
     StrategyConfig,
     build_model_only_parlay_candidates,
+    edge_for_predicted_pick,
     extract_bet_candidates,
     kelly_stake,
     strategy_from_profile,
@@ -38,17 +39,8 @@ def _fighter_names(row: pd.Series) -> tuple[str, str]:
 
 
 def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
-    pick = str(row.get("predicted_winner", ""))
-    f1, f2 = _fighter_names(row)
-    if pd.notna(row.get("best_edge")):
-        return float(row["best_edge"]), pick
-    if pick == f1 and pd.notna(row.get("edge_f1")):
-        return float(row["edge_f1"]), pick
-    if pick == f2 and pd.notna(row.get("edge_f2")):
-        return float(row["edge_f2"]), pick
-    if pd.notna(row.get("edge_pct")):
-        return float(row["edge_pct"]) / 100.0, pick
-    return None, pick
+    """Edge of the model pick. Never the opponent's ``best_edge``."""
+    return edge_for_predicted_pick(row)
 
 
 def _short_reasoning(row: pd.Series, *, max_len: int = 140) -> str:
@@ -100,6 +92,11 @@ def _suggest_stake(
 
     cand = extract_bet_candidates(row, config=strategy, apply_uncertainty_gates=True)
     if cand is None:
+        return 0.0, 1.0, gate_dict
+    pick_name = str(row.get("predicted_winner") or "").strip()
+    if pick_name and cand.pick_name and cand.pick_name != pick_name:
+        # Value side is the other fighter. Do not size the model pick with it.
+        gate_dict = {**gate_dict, "action": "skip", "primary_reason": "pick_edge_mismatch"}
         return 0.0, 1.0, gate_dict
 
     # Double-check tightened edge floor (extract already applies it)
@@ -363,19 +360,20 @@ def generate_alerts(
         stake, rating_mult, gate_dict = _suggest_stake(
             row, bankroll=bankroll, strategy=strategy, card_risk=risk_metrics
         )
-        if gate_dict.get("action") == "skip" or (stake <= 0 and gate.tighten):
-            if gate_dict.get("action") == "skip":
-                _append_skip(
-                    row=row,
-                    f1=f1,
-                    f2=f2,
-                    pick=pick,
-                    reason=gate_dict.get("primary_reason") or gate.reason_label(),
-                    edge=edge,
-                    disagreement=gate.disagreement,
-                    interval_width=gate.interval_width,
-                )
-                continue
+        if gate_dict.get("action") == "skip" or stake <= 0:
+            _append_skip(
+                row=row,
+                f1=f1,
+                f2=f2,
+                pick=pick,
+                reason=gate_dict.get("primary_reason")
+                or ("zero_stake" if stake <= 0 else gate.reason_label()),
+                edge=edge,
+                disagreement=gate.disagreement,
+                interval_width=gate.interval_width,
+                uncertainty_action=str(gate_dict.get("action") or "skip"),
+            )
+            continue
         edge_pct = edge * 100.0
         singles.append(
             {
@@ -390,6 +388,8 @@ def generate_alerts(
                 "reasoning": _short_reasoning(row),
                 "brief": build_fight_brief(row, risk_metrics=risk_metrics, edge_pct=edge_pct),
                 "suggested_stake": stake,
+                "kelly_stake_usd": round(float(stake), 2),
+                "bankroll": float(bankroll),
                 "confidence": str(row.get("confidence_label", "")),
                 "strategy_rating_mult": rating_mult,
                 "weight_class": str(row.get("weight_class") or ""),
@@ -606,8 +606,11 @@ def generate_alerts(
                             stake = float(s.get("suggested_stake") or 0.0)
                             if stake > max_usd:
                                 s["suggested_stake"] = round(max_usd, 2)
-                                if float(bankroll) > 0:
-                                    s["stake_pct"] = round(100.0 * max_usd / float(bankroll), 4)
+                                pool = float(s.get("card_pool_usd") or 0.0)
+                                if pool > 0:
+                                    s["stake_pct"] = round(
+                                        100.0 * float(s["suggested_stake"]) / pool, 1
+                                    )
             except Exception as clamp_exc:
                 logger.debug("paper wide override stake re-clamp skipped: %s", clamp_exc)
     except Exception as exc:

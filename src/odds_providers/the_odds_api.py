@@ -245,7 +245,9 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
     except Exception as exc:
         LAST_ERROR = odds_api_fail_closed_message(detail=str(exc))
         LAST_WARNING = LAST_ERROR
-        logger.warning("Odds API prop events failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("Odds API prop events failed: %s", redact_secrets(str(exc)))
         return empty_prop_odds_df()
 
     if events_resp.status_code == 401:
@@ -262,7 +264,9 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
     except requests.RequestException as exc:
         LAST_ERROR = odds_api_fail_closed_message(detail=str(exc))
         LAST_WARNING = LAST_ERROR
-        logger.warning("Odds API prop events failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("Odds API prop events failed: %s", redact_secrets(str(exc)))
         return empty_prop_odds_df()
     except json.JSONDecodeError:
         LAST_WARNING = "Odds API prop events returned invalid JSON"

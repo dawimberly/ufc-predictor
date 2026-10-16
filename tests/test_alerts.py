@@ -23,14 +23,17 @@ def _preds_with_edge() -> pd.DataFrame:
                 "event_name": "UFC Test 999",
                 "fighter_1": "Jon Jones",
                 "fighter_2": "Stipe Miocic",
-                "prob_f1_win": 0.65,
-                "prob_f2_win": 0.35,
+                "prob_f1_win": 0.74,
+                "prob_f2_win": 0.26,
                 "predicted_winner": "Jon Jones",
-                "predicted_prob": 0.65,
+                "predicted_prob": 0.74,
                 "f1_odds": 1.55,
-                "f2_odds": 2.80,
-                "best_edge": 0.09,
-                "edge_f1": 0.09,
+                "f2_odds": 2.50,
+                "best_edge": 0.12,
+                "best_edge_side": "f1",
+                "edge_f1": 0.12,
+                "edge_f2": -0.10,
+                "edge_pct": 12.0,
                 "reasoning": "Model favors Jon Jones due to Elo edge.",
                 "confidence_label": "high",
                 "ensemble_disagreement": 0.02,
@@ -40,6 +43,32 @@ def _preds_with_edge() -> pd.DataFrame:
             }
         ]
     )
+
+
+def test_generate_alerts_ignores_opponent_edge(monkeypatch):
+    """A positive edge on the other fighter must not size the model pick."""
+    monkeypatch.setattr(
+        "src.alerts.assess_upcoming_card_risk",
+        lambda *a, **k: {"available": False},
+        raising=False,
+    )
+    df = _preds_with_edge()
+    df["predicted_winner"] = "Jon Jones"
+    df["prob_f1_win"] = 0.74
+    df["prob_f2_win"] = 0.26
+    df["predicted_prob"] = 0.74
+    df["edge_f1"] = -0.04
+    df["edge_f2"] = 0.22
+    df["best_edge"] = 0.22
+    df["best_edge_side"] = "f2"
+    df["edge_pct"] = -4.0
+    # Prices that make fighter 2 the value side and fighter 1 -EV.
+    df["f1_odds"] = 1.40
+    df["f2_odds"] = 3.20
+    out = generate_alerts(df, min_edge=0.05, risk_metrics={"available": False})
+    assert out["singles"] == []
+    reasons = {s.get("skip_reason") for s in out.get("skipped") or []}
+    assert reasons
 
 
 def test_generate_alerts_finds_singles(monkeypatch):

@@ -155,7 +155,9 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         events_resp.raise_for_status()
         events = events_resp.json()
     except requests.RequestException as exc:
-        logger.warning("DraftKings prop events request failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("DraftKings prop events request failed: %s", redact_secrets(str(exc)))
         if "401" in str(exc) or "unauthorized" in str(exc).lower():
             LAST_WARNING = DK_UNAVAILABLE_MSG
         if DK_PROP_CACHE_PATH.is_file():

@@ -14,6 +14,7 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
+from src.safe_io import redact_secrets
 from src.odds_providers.prop_odds_common import (
     american_to_decimal,
     empty_prop_odds_df,
@@ -207,14 +208,15 @@ def _log_auth_materials(
     if not sent_cookie:
         cookie_desc = "(none — session query only)" if session_token else "(empty / not set)"
     elif sent_cookie.startswith("session=") and not cookie:
-        cookie_desc = f"Cookie: session=<BETNOW_SESSION> ({_mask_token(session_token)})"
+        cookie_desc = "Cookie: session=<BETNOW_SESSION> (redacted)"
     else:
         cookie_desc = f"Cookie: {_mask_cookie(sent_cookie)}"
+    token_desc = f"(set, len={len(session_token)})" if session_token else "(empty)"
     logger.info(
         "BetNow auth -> session_token=%s | %s%s",
-        session_token if session_token else "(empty)",
+        token_desc,
         cookie_desc,
-        f" | url={url}" if url else "",
+        f" | url={redact_secrets(url)}" if url else "",
     )
 
 
@@ -293,15 +295,24 @@ def _fetch_and_parse(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     """GET one URL and parse moneyline/props. Returns (rows, props, url)."""
     try:
-        logger.info("BetNow fetching (%s): %s", label, url)
+        logger.info("BetNow fetching (%s): %s", label, redact_secrets(url))
         resp = requests.get(url, headers=headers, timeout=config.REQUEST_TIMEOUT_SEC)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        logger.warning("BetNow fetch failed (%s) %s: %s", label, url, exc)
+        logger.warning(
+            "BetNow fetch failed (%s) %s: %s",
+            label,
+            redact_secrets(url),
+            redact_secrets(str(exc)),
+        )
         return [], [], url
 
     if _looks_like_login_wall(resp.text):
-        logger.info("BetNow (%s) looks like a login wall — no public odds on %s", label, url)
+        logger.info(
+            "BetNow (%s) looks like a login wall — no public odds on %s",
+            label,
+            redact_secrets(url),
+        )
         return [], [], url
 
     rows, props = _parse_page_payload(resp.text, url)
@@ -311,10 +322,14 @@ def _fetch_and_parse(
             label,
             len(rows),
             len(props),
-            url,
+            redact_secrets(url),
         )
     else:
-        logger.info("BetNow (%s) returned HTML but no parseable odds on %s", label, url)
+        logger.info(
+            "BetNow (%s) returned HTML but no parseable odds on %s",
+            label,
+            redact_secrets(url),
+        )
     return rows, props, url
 
 
@@ -625,7 +640,7 @@ def _scrape_sportsbook_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]
         logger.info(
             "BetNow session auth returned no odds - falling back to public pages "
             "(session=%s)",
-            session_token,
+            f"set, len={len(session_token)}",
         )
     else:
         logger.info("BetNow: no BETNOW_SESSION set — trying public pages only")
@@ -676,7 +691,7 @@ def _scrape_with_selenium() -> list[dict[str, Any]]:
                 continue
             seen.add(url)
             label = "session" if "session=" in url else "public"
-            logger.info("BetNow Selenium fetching (%s): %s", label, url)
+            logger.info("BetNow Selenium fetching (%s): %s", label, redact_secrets(url))
             driver.get(url)
             time.sleep(4)
             parsed, _props = _parse_page_payload(driver.page_source, url)
@@ -718,7 +733,11 @@ def fetch_betnow_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if "source_url" not in df.columns:
         df["source_url"] = source_url
     df.to_csv(BETNOW_CACHE_PATH, index=False)
-    logger.info("Scraped %s BetNow moneyline rows (source=%s)", len(df), source_url)
+    logger.info(
+        "Scraped %s BetNow moneyline rows (source=%s)",
+        len(df),
+        redact_secrets(source_url),
+    )
     return df
 
 
@@ -742,7 +761,7 @@ def fetch_betnow_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         logger.info(
             "BetNow prop scrape returned no live lines "
             "(session/public pages had no props; source=%s).",
-            source_url,
+            redact_secrets(source_url),
         )
         return empty_prop_odds_df()
 

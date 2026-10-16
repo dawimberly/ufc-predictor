@@ -217,10 +217,14 @@ def resolve_edge_thresholds(
         profile=_cfg.UFC_PROFILE,
         segment_health=health,
     )
+    ps = _cfg.profile_settings()
+    ha_floor = float(ps.get("alert_min_edge") or 0.0)
     return {
         "use_dynamic": True,
-        "alert_min_edge": thresholds.alert_min_edge,
-        "parlay_min_edge": thresholds.parlay_min_edge,
+        "alert_min_edge": max(float(thresholds.alert_min_edge), ha_floor),
+        "parlay_min_edge": max(
+            float(thresholds.parlay_min_edge), float(ps.get("parlay_min_edge") or 0.0)
+        ),
         "parlay_min_combined_prob": thresholds.parlay_min_combined_prob,
         "parlay_min_ev": thresholds.parlay_min_ev,
         "model_confidence": conf,
@@ -1052,9 +1056,12 @@ def merge_predictions_with_odds(
 
             market, odds_meta = fetch_best_available_odds(force_refresh=force_refresh)
         except Exception as exc:
-            logger.warning("Odds fallback chain failed: %s", exc)
+            from src.safe_io import redact_secrets
+
+            safe_exc = redact_secrets(str(exc))
+            logger.warning("Odds fallback chain failed: %s", safe_exc)
             market = pd.DataFrame()
-            odds_meta = {"fail_closed": True, "warning": str(exc), "source": ""}
+            odds_meta = {"fail_closed": True, "warning": safe_exc, "source": ""}
         if market is None or market.empty:
             warn = (odds_meta or {}).get("warning") or "NO BET — no usable odds (fail-closed)"
             logger.warning("Odds merge skipped (fail-closed): %s", warn)

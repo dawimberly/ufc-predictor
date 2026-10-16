@@ -5,7 +5,11 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from src.feature_engineering import _compute_elo_state, _rolling_stats
+from src.feature_engineering import (
+    _compute_elo_state,
+    _rolling_stats,
+    apply_historical_stat_fallbacks,
+)
 from src.sherdog import sherdog_record_as_of
 
 
@@ -175,3 +179,20 @@ def test_rolling_stats_ignore_career_static_columns():
     assert out["sig_strike_acc"].isna().all()
     assert out["td_acc"].isna().all()
     assert "sub_avg" in out.columns
+
+
+def test_reference_year_fallback_does_not_fill_earlier_rows():
+    """Pre-2025 medians must not be written onto earlier historical rows."""
+    features = pd.DataFrame(
+        {
+            "event_date": ["2020-01-01", "2024-06-01", "2025-02-01"],
+            "weight_class": ["Lightweight", "Lightweight", "Lightweight"],
+            "fighter_1": ["A", "B", "C"],
+            "fighter_2": ["D", "E", "F"],
+            "f1_age": [30.0, np.nan, np.nan],
+            "f2_age": [28.0, 29.0, np.nan],
+        }
+    )
+    out = apply_historical_stat_fallbacks(features, reference_year=2025)
+    assert pd.isna(out.loc[1, "f1_age"])
+    assert float(out.loc[2, "f1_age"]) == 30.0

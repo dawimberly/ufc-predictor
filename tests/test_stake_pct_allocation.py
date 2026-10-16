@@ -104,6 +104,41 @@ def test_format_stake_pct_dollars():
     assert txt == "38% · $4.56"
 
 
+def test_live_allocation_drops_paper_wide_override():
+    tickets = [
+        {
+            "fight": "A vs B",
+            "pick": "A",
+            "edge": 0.12,
+            "prob": 0.75,
+            "confidence": "high",
+            "decimal_odds": 1.70,
+            "uncertainty_action": "tighten",
+            "uncertainty_reason": "paper_wide_override",
+            "suggested_stake": 25.0,
+            "kelly_stake_usd": 25.0,
+        }
+    ]
+    out = allocate_card_budget_pct(tickets, pool_usd=100.0, profile="live", inplace=False)
+    assert out == []
+
+
+def test_allocation_caps_at_kelly_stake_and_pool_pct():
+    tickets = [
+        {
+            "edge": 0.20,
+            "prob": 0.80,
+            "confidence": "high",
+            "decimal_odds": 1.80,
+            "uncertainty_action": "allow",
+            "kelly_stake_usd": 1.25,
+        }
+    ]
+    out = allocate_card_budget_pct([dict(t) for t in tickets], 100.0, profile="paper")
+    assert float(out[0]["suggested_stake"]) <= 1.25 + 1e-9
+    assert float(out[0]["stake_pct"]) == round(100.0 * float(out[0]["suggested_stake"]) / 100.0, 1)
+
+
 def test_stronger_edge_gets_more_weight():
     strong = {"edge": 0.12, "prob": 0.74, "confidence": "high", "decimal_odds": 1.55, "uncertainty_action": "allow"}
     weak = {"edge": 0.05, "prob": 0.68, "confidence": "medium", "decimal_odds": 1.90, "uncertainty_action": "tighten"}

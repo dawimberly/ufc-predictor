@@ -1992,10 +1992,18 @@ def apply_historical_stat_fallbacks(
 
     out = features.copy()
     out[config.DATE_COLUMN] = pd.to_datetime(out[config.DATE_COLUMN], errors="coerce")
+    years = out[config.DATE_COLUMN].dt.year
     if reference_year is not None:
-        ref = out[out[config.DATE_COLUMN].dt.year < reference_year]
+        # Medians come only from fights before the reference year, and are
+        # applied only to rows on/after that year. Earlier rows stay missing
+        # so a later training-slice imputer cannot inherit future fills.
+        ref = out[years < reference_year]
         if ref.empty:
-            ref = out
+            logger.info(
+                "Historical stat fallback: no pre-%s rows; leaving missing values",
+                reference_year,
+            )
+            return out
     else:
         ref = out
 
@@ -2028,6 +2036,10 @@ def apply_historical_stat_fallbacks(
     else:
         row_iter = out.index
     for idx in row_iter:
+        if reference_year is not None:
+            row_year = years.loc[idx] if idx in years.index else None
+            if pd.isna(row_year) or int(row_year) < int(reference_year):
+                continue
         row = out.loc[idx]
         touched = False
         wc = str(row.get("weight_class", ""))
