@@ -15,7 +15,7 @@ import config
 logger = logging.getLogger(__name__)
 
 try:
-    from ufc_betting_bot.modules.edge import compute_edge, fight_decimal_odds, market_probs, raw_kelly_fraction
+    from ufc_betting_bot.modules.edge import as_of_price_from_row, compute_edge, raw_kelly_fraction
 except ImportError:
     from src.backtester import _fight_decimal_odds as fight_decimal_odds  # type: ignore
     from src.backtester import _market_probs as market_probs  # type: ignore
@@ -33,6 +33,22 @@ except ImportError:
         b = decimal_odds - 1.0
         q = 1.0 - prob
         return max(0.0, (prob * b - q) / b)
+
+    def as_of_price_from_row(row):
+        market = market_probs(row)
+        decimal = fight_decimal_odds(row)
+        if market is None or decimal is None:
+            return None
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            market_p1=market[0],
+            market_p2=market[1],
+            decimal_f1=decimal[0],
+            decimal_f2=decimal[1],
+            timing="opening",
+            decimals_for_side=lambda side: decimal[0] if side == "f1" else decimal[1],
+        )
 
 
 OutcomeMode = Literal["bootstrap", "parametric"]
@@ -101,21 +117,19 @@ def build_bet_schedule(
     last_event: str | None = None
 
     for _, row in work.iterrows():
-        market = market_probs(row)
-        decimal = fight_decimal_odds(row)
-        if market is None or decimal is None:
+        price = as_of_price_from_row(row)
+        if price is None:
             continue
 
-        m1, m2 = market
         p1 = float(row.get("prob_f1_win", 0.5))
         p2 = float(row.get("prob_f2_win", 1.0 - p1))
-        edge_info = compute_edge(p1, p2, m1, m2)
+        edge_info = compute_edge(p1, p2, price.market_p1, price.market_p2)
         if edge_info["edge"] < min_edge:
             continue
 
         side = edge_info["bet_side"]
         prob = p1 if side == "f1" else p2
-        odds = decimal[0] if side == "f1" else decimal[1]
+        odds = price.decimal_f1 if side == "f1" else price.decimal_f2
         event_key = str(row.get("event_name", row.get("event", "")))
         if last_event is not None and event_key != last_event:
             event_idx += 1
@@ -788,10 +802,26 @@ def get_drawdown_halt() -> DrawdownHalt:
     return _drawdown_halt
 
 
-def check_bankroll_safety(bankroll: float) -> tuple[bool, str]:
-    """Drawdown halt + delegates to circuit breaker."""
-    from src.circuit_breaker import check_alerts_allowed
+def check_bankroll_safety(bankroll: float | None) -> tuple[bool, str]:
+    """Drawdown halt + delegates to circuit breaker.
 
+    Live ignores ``bankroll`` and uses today's recorded bankroll for both the
+    daily-loss and drawdown checks; nothing recorded blocks.
+    """
+    from src.circuit_breaker import check_alerts_allowed, live_observed_bankroll
+
+    if config.is_live_profile():
+        allowed, reason = check_alerts_allowed(None, drawdown_halted=False)
+        if not allowed:
+            return False, reason
+        observed = live_observed_bankroll()
+        if observed is None:
+            return False, "current bankroll missing - live alerts blocked"
+        allowed, reason = get_drawdown_halt().check(observed.value)
+        return (True, "") if allowed else (False, reason)
+
+    if bankroll is None:
+        return check_alerts_allowed(None, drawdown_halted=False)
     halt = get_drawdown_halt()
     allowed, reason = halt.check(bankroll)
     if not allowed:

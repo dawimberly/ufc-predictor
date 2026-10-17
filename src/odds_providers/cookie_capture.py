@@ -283,14 +283,22 @@ def _capture_with_playwright(
         try:
             page.goto(spec.start_url, wait_until="domcontentloaded", timeout=60_000)
         except Exception as exc:
-            logger.warning("%s Playwright navigate: %s", spec.label, exc)
+            from src.safe_io import redact_secrets
+
+            logger.warning(
+                "%s Playwright navigate: %s",
+                spec.label,
+                redact_secrets(str(exc)),
+            )
         captured: CaptureResult | None = None
         while time.time() < deadline:
             try:
                 url = page.url or ""
                 cookies = context.cookies()
             except Exception as exc:
-                logger.debug("%s poll failed: %s", spec.label, exc)
+                from src.safe_io import redact_secrets
+
+                logger.debug("%s poll failed: %s", spec.label, redact_secrets(str(exc)))
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             if _login_detected(spec, url=url, cookies=cookies):
@@ -361,7 +369,9 @@ def _capture_with_selenium(
                 raw = driver.get_cookies() or []
                 cookies = [{"name": c.get("name"), "value": c.get("value")} for c in raw]
             except Exception as exc:
-                logger.debug("%s selenium poll: %s", spec.label, exc)
+                from src.safe_io import redact_secrets
+
+                logger.debug("%s selenium poll: %s", spec.label, redact_secrets(str(exc)))
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             if _login_detected(spec, url=url, cookies=cookies):
@@ -399,12 +409,15 @@ def _capture_with_selenium(
             backend="selenium",
         )
     except Exception as exc:
-        logger.warning("%s Selenium capture failed: %s", spec.label, exc)
+        from src.safe_io import redact_secrets
+
+        safe = redact_secrets(str(exc))
+        logger.warning("%s Selenium capture failed: %s", spec.label, safe)
         return CaptureResult(
             book=spec.label,
             ok=False,
             status="error",
-            message=f"{spec.label} browser failed ({exc}) — continuing in public/guest mode",
+            message=f"{spec.label} browser failed ({safe}) — continuing in public/guest mode",
             backend="selenium",
         )
     finally:
@@ -424,7 +437,9 @@ def _capture_fallback_open_only(
     try:
         webbrowser.open(spec.start_url)
     except Exception as exc:
-        logger.debug("webbrowser.open failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.debug("webbrowser.open failed: %s", redact_secrets(str(exc)))
     msg = (
         f"Opened {spec.label} in your browser. "
         "Install Playwright (`pip install playwright` then `playwright install chromium`) "
@@ -471,12 +486,15 @@ def capture_book_login(
             return _capture_with_selenium(spec, timeout_sec=timeout, progress=progress)
         return _capture_fallback_open_only(spec, progress=progress)
     except Exception as exc:
-        logger.warning("Cookie capture error for %s: %s", spec.label, exc)
+        from src.safe_io import redact_secrets
+
+        safe = redact_secrets(str(exc))
+        logger.warning("Cookie capture error for %s: %s", spec.label, safe)
         return CaptureResult(
             book=spec.label,
             ok=False,
             status="error",
-            message=f"{spec.label} capture failed ({exc}) — continuing",
+            message=f"{spec.label} capture failed ({safe}) — continuing",
             backend=backend or "none",
         )
 

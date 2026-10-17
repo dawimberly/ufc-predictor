@@ -193,8 +193,11 @@ python scripts/upset_autopsy_backtest.py
 python -m src.cli_entry --next-two --odds
 python main.py --preflight
 python main.py --watch --auto-odds --dry-run
-python main.py --backtest-2025
+python main.py --backtest-2025                 # frozen_model (default)
+python main.py --backtest-2025 --walk-forward  # walk_forward_simplified
 ```
+
+`--backtest-2025` defaults to **frozen_model** (production weights; may have seen scored fights). Pass `--walk-forward` for **walk_forward_simplified** (small past-only LightGBM — not the production ensemble). Strict as-of betting requires opening quotes with timestamps ≤ the event cutoff.
 
 `launch_predict.bat` wraps the CLI (`--next-two --odds`).
 
@@ -295,7 +298,8 @@ Includes color-tier / action-verb rules (incl. Sky Blue), fight-table sort, Top 
 
 ## Design notes
 
-- **Leakage-safe features**: rolling stats use only prior fights.
+- **Leakage-safe features**: rolling / Elo / SOS use only prior fights (`shift(1)`, same-card Elo freeze). Physical profile fields forward-fill only (no future back-fill). Strict evaluation still loads a precomputed `fight_features.csv`; chronology is proven by truncated-rebuild equality on `FEATURE_COLUMNS` (`tests/test_leakage_audit.py`), not by rebuild-per-fold. External fills (Sherdog/CompuBox/Greco) are as-of gated in their loaders; market odds features stay off by default.
+- **Strict as-of odds**: unlabeled merge prices are never treated as openings. Opening columns require a timezone-aware observation timestamp ≤ fight start; otherwise rows stay `unproven` / `closing_not_as_of`.
 - **No paid odds required**: Odds API free tier + optional scrapers.
 - **Credit-safe by default**: `ODDS_FETCH_ONCE` + fail-closed without usable lines.
 - **Separate from PythonTrading**: no merge with the Alpaca stock bot.

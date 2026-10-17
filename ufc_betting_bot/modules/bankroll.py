@@ -13,9 +13,8 @@ import pandas as pd
 
 from ufc_betting_bot.config.settings import BankrollSettings, BANKROLL_STATE_PATH
 from ufc_betting_bot.modules.edge import (
+    as_of_price_from_row,
     compute_edge,
-    fight_decimal_odds,
-    market_probs,
     raw_kelly_fraction,
 )
 
@@ -183,16 +182,12 @@ def simulate_flat_bets(
         pending_event = None
 
     for _, row in work.iterrows():
-        market = market_probs(row)
-        if market is None:
+        price = as_of_price_from_row(row)
+        if price is None:
             continue
-        decimal = fight_decimal_odds(row)
-        if decimal is None:
-            continue
-        market_p1, market_p2 = market
         model_p1 = float(row["prob_f1_win"])
         model_p2 = float(row.get("prob_f2_win", 1.0 - model_p1))
-        edge_info = compute_edge(model_p1, model_p2, market_p1, market_p2)
+        edge_info = compute_edge(model_p1, model_p2, price.market_p1, price.market_p2)
         if edge_info["edge"] < settings.min_edge:
             continue
 
@@ -201,10 +196,7 @@ def simulate_flat_bets(
             _flush_event()
         pending_event = event_key
 
-        if edge_info["bet_side"] == "f1":
-            odds = decimal[0]
-        else:
-            odds = decimal[1]
+        odds = price.decimals_for_side(edge_info["bet_side"])
         actual = row.get(target_column)
         if pd.isna(actual):
             continue
@@ -223,6 +215,7 @@ def simulate_flat_bets(
                     "edge_pct": edge_info["edge"] * 100.0,
                     "odds": odds,
                     "won": int(won),
+                    "odds_timing": price.timing,
                 },
             )
         )
@@ -278,10 +271,11 @@ def _summarize_trades(
         return {
             "staking": label,
             "trades": 0,
-            "hit_rate": 0.0,
+            "hit_rate": float("nan"),
             "total_pnl": 0.0,
             "final_equity": initial,
-            "roi_pct": 0.0,
+            "roi_pct": float("nan"),
+            "performance_available": False,
             "kelly_fraction": settings.kelly_fraction,
             "min_edge": settings.min_edge,
             "max_card_risk_pct": settings.max_card_risk_fraction * 100,
@@ -295,6 +289,7 @@ def _summarize_trades(
         "total_pnl": float(trades["pnl"].sum()),
         "final_equity": final,
         "roi_pct": float((final - initial) / initial * 100),
+        "performance_available": True,
         "avg_stake": float(trades["stake"].mean()),
         "max_stake": float(trades["stake"].max()),
         "kelly_fraction": settings.kelly_fraction,
@@ -327,7 +322,9 @@ def simulate_bankroll_bets(
 ) -> tuple[pd.DataFrame, dict[str, float]]:
     """
     Chronological backtest with fractional Kelly + bankroll guardrails.
-    Only bets when closing odds exist and edge clears min_edge.
+
+    Selection, sizing, and settlement all use one validated as-of (opening)
+    price. Closing-only and unproven quotes are skipped.
     """
     manager = BankrollManager(settings)
     rows: list[dict[str, Any]] = []
@@ -357,19 +354,13 @@ def simulate_bankroll_bets(
         pending_event = None
 
     for _, row in work.iterrows():
-        market = market_probs(row)
-        if market is None:
+        price = as_of_price_from_row(row)
+        if price is None:
             continue
 
-        market_p1, market_p2 = market
         model_p1 = float(row["prob_f1_win"])
         model_p2 = float(row.get("prob_f2_win", 1.0 - model_p1))
-        decimal = fight_decimal_odds(row)
-        if decimal is None:
-            continue
-        dec_f1, dec_f2 = decimal
-
-        edge_info = compute_edge(model_p1, model_p2, market_p1, market_p2)
+        edge_info = compute_edge(model_p1, model_p2, price.market_p1, price.market_p2)
         if edge_info["edge"] < settings.min_edge:
             continue
 
@@ -377,9 +368,9 @@ def simulate_bankroll_bets(
         manager._sync_day(bet_day)
 
         if edge_info["bet_side"] == "f1":
-            prob, odds = model_p1, dec_f1
+            prob, odds = model_p1, price.decimal_f1
         else:
-            prob, odds = model_p2, dec_f2
+            prob, odds = model_p2, price.decimal_f2
 
         stake = manager.compute_stake(
             prob=prob,
@@ -414,6 +405,9 @@ def simulate_bankroll_bets(
                 "kelly_fraction_used": settings.kelly_fraction,
                 "odds": odds,
                 "won": won,
+                "odds_timing": price.timing,
+                "as_of_decimal_f1": price.decimal_f1,
+                "as_of_decimal_f2": price.decimal_f2,
                 "daily_pnl": manager.state.daily_pnl,
                 "halted_today": int(manager.state.halted_today),
             }
@@ -481,19 +475,13 @@ def simulate_bankroll_bets_dynamic(
         pending_event = None
 
     for _, row in work.iterrows():
-        market = market_probs(row)
-        if market is None:
+        price = as_of_price_from_row(row)
+        if price is None:
             continue
 
-        market_p1, market_p2 = market
         model_p1 = float(row["prob_f1_win"])
         model_p2 = float(row.get("prob_f2_win", 1.0 - model_p1))
-        decimal = fight_decimal_odds(row)
-        if decimal is None:
-            continue
-        dec_f1, dec_f2 = decimal
-
-        edge_info = compute_edge(model_p1, model_p2, market_p1, market_p2)
+        edge_info = compute_edge(model_p1, model_p2, price.market_p1, price.market_p2)
         wr = recent_win_rate_from_trades(recent_outcomes)
         pick_prob = model_p1 if edge_info["bet_side"] == "f1" else model_p2
         conf = model_confidence_from_prob(pick_prob)
@@ -512,9 +500,9 @@ def simulate_bankroll_bets_dynamic(
         manager._sync_day(bet_day)
 
         if edge_info["bet_side"] == "f1":
-            prob, odds = model_p1, dec_f1
+            prob, odds = model_p1, price.decimal_f1
         else:
-            prob, odds = model_p2, dec_f2
+            prob, odds = model_p2, price.decimal_f2
 
         saved_min_edge = manager.settings.min_edge
         manager.settings.min_edge = dyn_min_edge
@@ -555,6 +543,9 @@ def simulate_bankroll_bets_dynamic(
                 "kelly_fraction_used": settings.kelly_fraction,
                 "odds": odds,
                 "won": won,
+                "odds_timing": price.timing,
+                "as_of_decimal_f1": price.decimal_f1,
+                "as_of_decimal_f2": price.decimal_f2,
                 "daily_pnl": manager.state.daily_pnl,
                 "halted_today": int(manager.state.halted_today),
             }

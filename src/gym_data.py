@@ -106,12 +106,20 @@ def lookup_gym(fighter_name: str, profiles: pd.DataFrame | None = None) -> dict[
     if hit.empty:
         return empty
     row = hit.iloc[0]
-    return {
+    found = {
         "gym": str(row.get("gym") or "").strip(),
         "location": str(row.get("location") or "").strip(),
         "strengths": str(row.get("strengths") or "").strip(),
         "notes": str(row.get("notes") or "").strip(),
     }
+    for stamp_key in ("as_of", "effective_date", "updated_at", "fetched_at"):
+        raw = row.get(stamp_key)
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        text = str(raw).strip()
+        if text and text.lower() not in {"nan", "none", "nat"}:
+            found[stamp_key] = text
+    return found
 
 
 # USPS → full state so "Denver, CO" overlaps gym "Englewood Colorado".
@@ -270,13 +278,55 @@ def _profile_lookup_maps(profiles: pd.DataFrame) -> dict[str, dict[str, str]]:
         key = str(row.get("fighter_key") or "")
         if not key:
             continue
-        maps[key] = {
+        entry = {
             "gym": str(row.get("gym") or "").strip(),
             "location": str(row.get("location") or "").strip(),
             "strengths": str(row.get("strengths") or "").strip(),
             "notes": str(row.get("notes") or "").strip(),
         }
+        for stamp_key in ("as_of", "effective_date", "updated_at", "fetched_at"):
+            raw = row.get(stamp_key)
+            if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+                continue
+            text = str(raw).strip()
+            if text and text.lower() not in {"nan", "none", "nat"}:
+                entry[stamp_key] = text
+        maps[key] = entry
     return maps
+
+
+def _snapshot_utc(profile: dict[str, str]) -> pd.Timestamp | None:
+    for key in ("as_of", "effective_date", "updated_at", "fetched_at"):
+        raw = profile.get(key)
+        if raw is None or not str(raw).strip():
+            continue
+        stamp = pd.to_datetime(raw, utc=True, errors="coerce")
+        if pd.notna(stamp):
+            return stamp
+    return None
+
+
+def _profile_visible_at(
+    profile: dict[str, str],
+    *,
+    historical: bool,
+    fight_ts: Any,
+) -> dict[str, str]:
+    """Current undated gym text is not a historical as-of input."""
+    empty = {"gym": "", "location": "", "strengths": "", "notes": ""}
+    if not profile:
+        return empty
+    snapshot = _snapshot_utc(profile)
+    if snapshot is None:
+        if historical:
+            return empty
+        return profile
+    if not historical:
+        return profile
+    fight = pd.to_datetime(fight_ts, utc=True, errors="coerce")
+    if pd.isna(fight) or snapshot > fight:
+        return empty
+    return profile
 
 
 def attach_gym_features(df: pd.DataFrame, *, event_location_col: str | None = None) -> pd.DataFrame:
@@ -332,6 +382,42 @@ def attach_gym_features(df: pd.DataFrame, *, event_location_col: str | None = No
             p2_list[i] = _resolve(out.iloc[i][f2_col])
         p1 = pd.Series(p1_list, index=out.index)
         p2 = pd.Series(p2_list, index=out.index)
+
+    historical = pd.Series(False, index=out.index)
+    if config.TARGET_COLUMN in out.columns:
+        historical = historical | out[config.TARGET_COLUMN].notna()
+    if "winner" in out.columns:
+        winner_text = out["winner"].astype(str).str.strip().str.lower()
+        historical = historical | (
+            out["winner"].notna() & ~winner_text.isin({"", "nan", "none"})
+        )
+    date_col = next(
+        (
+            cand
+            for cand in (config.DATE_COLUMN, "event_date", "date")
+            if cand in out.columns
+        ),
+        None,
+    )
+    fight_dates = (
+        out[date_col]
+        if date_col
+        else pd.Series([pd.NaT] * len(out), index=out.index)
+    )
+    p1 = pd.Series(
+        [
+            _profile_visible_at(prof, historical=bool(is_hist), fight_ts=fight_dt)
+            for prof, is_hist, fight_dt in zip(p1, historical, fight_dates)
+        ],
+        index=out.index,
+    )
+    p2 = pd.Series(
+        [
+            _profile_visible_at(prof, historical=bool(is_hist), fight_ts=fight_dt)
+            for prof, is_hist, fight_dt in zip(p2, historical, fight_dates)
+        ],
+        index=out.index,
+    )
 
     out["f1_gym"] = p1.map(lambda d: d.get("gym", ""))
     out["f1_gym_location"] = p1.map(lambda d: d.get("location", ""))

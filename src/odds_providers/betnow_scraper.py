@@ -14,13 +14,14 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
+from src.safe_io import redact_secrets
 from src.odds_providers.prop_odds_common import (
     american_to_decimal,
     empty_prop_odds_df,
     parse_american_odds,
     prop_row,
 )
-from src.predictor import OddsAPIError, _implied_probs, _names_match
+from src.predictor import OddsAPIError, _implied_probs
 
 logger = logging.getLogger(__name__)
 
@@ -99,11 +100,7 @@ def _mask_cookie(cookie: str) -> str:
     c = str(cookie or "").strip()
     if not c:
         return "(empty / not set)"
-    # Show first name=value pair prefix only — enough to confirm the right jar.
-    first = c.split(";", 1)[0].strip()
-    if len(first) > 48:
-        first = first[:48] + "..."
-    return f"{first}... ({len(c)} chars, {c.count(';') + 1} parts)"
+    return f"(redacted cookie, {len(c)} chars, {c.count(';') + 1} parts)"
 
 
 def _append_session_query(url: str, token: str) -> str:
@@ -158,13 +155,17 @@ def _discover_session_token(headers: dict[str, str]) -> str:
             tok = _extract_session_token_from_response(resp)
             if tok:
                 logger.info(
-                    "BetNow session token extracted from %s: %s",
+                    "BetNow session token extracted from %s (set, len=%s)",
                     url,
-                    tok,
+                    len(tok),
                 )
                 return tok
         except requests.RequestException as exc:
-            logger.debug("BetNow session discovery failed for %s: %s", url, exc)
+            logger.debug(
+                "BetNow session discovery failed for %s: %s",
+                url,
+                redact_secrets(str(exc)),
+            )
     return ""
 
 
@@ -186,7 +187,11 @@ def resolve_betnow_session_token(*, force_discover: bool = False) -> str:
         source = "page"
     _ACTIVE_SESSION_TOKEN = token
     if token:
-        logger.info("BetNow session token in use (%s): %s", source, token)
+        logger.info(
+            "BetNow session token in use (source=%s, set, len=%s)",
+            source,
+            len(token),
+        )
     else:
         logger.info(
             "BetNow session token not set — will try public pages "
@@ -207,14 +212,15 @@ def _log_auth_materials(
     if not sent_cookie:
         cookie_desc = "(none — session query only)" if session_token else "(empty / not set)"
     elif sent_cookie.startswith("session=") and not cookie:
-        cookie_desc = f"Cookie: session=<BETNOW_SESSION> ({_mask_token(session_token)})"
+        cookie_desc = "Cookie: session=<BETNOW_SESSION> (redacted)"
     else:
         cookie_desc = f"Cookie: {_mask_cookie(sent_cookie)}"
+    token_desc = f"(set, len={len(session_token)})" if session_token else "(empty)"
     logger.info(
         "BetNow auth -> session_token=%s | %s%s",
-        session_token if session_token else "(empty)",
+        token_desc,
         cookie_desc,
-        f" | url={url}" if url else "",
+        f" | url={redact_secrets(url)}" if url else "",
     )
 
 
@@ -293,15 +299,24 @@ def _fetch_and_parse(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     """GET one URL and parse moneyline/props. Returns (rows, props, url)."""
     try:
-        logger.info("BetNow fetching (%s): %s", label, url)
+        logger.info("BetNow fetching (%s): %s", label, redact_secrets(url))
         resp = requests.get(url, headers=headers, timeout=config.REQUEST_TIMEOUT_SEC)
         resp.raise_for_status()
     except requests.RequestException as exc:
-        logger.warning("BetNow fetch failed (%s) %s: %s", label, url, exc)
+        logger.warning(
+            "BetNow fetch failed (%s) %s: %s",
+            label,
+            redact_secrets(url),
+            redact_secrets(str(exc)),
+        )
         return [], [], url
 
     if _looks_like_login_wall(resp.text):
-        logger.info("BetNow (%s) looks like a login wall — no public odds on %s", label, url)
+        logger.info(
+            "BetNow (%s) looks like a login wall — no public odds on %s",
+            label,
+            redact_secrets(url),
+        )
         return [], [], url
 
     rows, props = _parse_page_payload(resp.text, url)
@@ -311,10 +326,14 @@ def _fetch_and_parse(
             label,
             len(rows),
             len(props),
-            url,
+            redact_secrets(url),
         )
     else:
-        logger.info("BetNow (%s) returned HTML but no parseable odds on %s", label, url)
+        logger.info(
+            "BetNow (%s) returned HTML but no parseable odds on %s",
+            label,
+            redact_secrets(url),
+        )
     return rows, props, url
 
 
@@ -456,6 +475,7 @@ def _parse_moneyline_rows(fights: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "implied_prob_f2": imp2,
                 "bookmaker": "BetNow.eu",
                 "bookmaker_count": 1,
+                "price_kind": "book",
                 "source_url": BETNOW_UFC_URL,
             }
         )
@@ -625,7 +645,7 @@ def _scrape_sportsbook_info() -> tuple[list[dict[str, Any]], list[dict[str, Any]
         logger.info(
             "BetNow session auth returned no odds - falling back to public pages "
             "(session=%s)",
-            session_token,
+            f"set, len={len(session_token)}",
         )
     else:
         logger.info("BetNow: no BETNOW_SESSION set — trying public pages only")
@@ -676,7 +696,7 @@ def _scrape_with_selenium() -> list[dict[str, Any]]:
                 continue
             seen.add(url)
             label = "session" if "session=" in url else "public"
-            logger.info("BetNow Selenium fetching (%s): %s", label, url)
+            logger.info("BetNow Selenium fetching (%s): %s", label, redact_secrets(url))
             driver.get(url)
             time.sleep(4)
             parsed, _props = _parse_page_payload(driver.page_source, url)
@@ -684,7 +704,7 @@ def _scrape_with_selenium() -> list[dict[str, Any]]:
                 rows.extend(parsed)
                 break
     except Exception as exc:
-        logger.warning("BetNow Selenium fallback failed: %s", exc)
+        logger.warning("BetNow Selenium fallback failed: %s", redact_secrets(str(exc)))
     finally:
         if driver is not None:
             driver.quit()
@@ -718,7 +738,11 @@ def fetch_betnow_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if "source_url" not in df.columns:
         df["source_url"] = source_url
     df.to_csv(BETNOW_CACHE_PATH, index=False)
-    logger.info("Scraped %s BetNow moneyline rows (source=%s)", len(df), source_url)
+    logger.info(
+        "Scraped %s BetNow moneyline rows (source=%s)",
+        len(df),
+        redact_secrets(source_url),
+    )
     return df
 
 
@@ -742,7 +766,7 @@ def fetch_betnow_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         logger.info(
             "BetNow prop scrape returned no live lines "
             "(session/public pages had no props; source=%s).",
-            source_url,
+            redact_secrets(source_url),
         )
         return empty_prop_odds_df()
 
@@ -756,17 +780,26 @@ def fetch_betnow_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
 
 
 def match_betnow_row(fighter_1: str, fighter_2: str, odds: pd.DataFrame) -> pd.Series | None:
-    """Lookup helper for tests."""
+    """Exact or alias lookup. Surname-only rows are not a BetNow quote."""
+    from src.quote_integrity import pair_alignment
+
     for _, row in odds.iterrows():
-        if _names_match(fighter_1, row["fighter_1"]) and _names_match(fighter_2, row["fighter_2"]):
+        alignment = pair_alignment(
+            fighter_1,
+            fighter_2,
+            str(row.get("fighter_1") or ""),
+            str(row.get("fighter_2") or ""),
+        )
+        if alignment is None:
+            continue
+        if alignment == "aligned":
             return row
-        if _names_match(fighter_1, row["fighter_2"]) and _names_match(fighter_2, row["fighter_1"]):
-            swapped = row.copy()
-            swapped["fighter_1"], swapped["fighter_2"] = row["fighter_2"], row["fighter_1"]
-            swapped["f1_odds"], swapped["f2_odds"] = row["f2_odds"], row["f1_odds"]
-            swapped["implied_prob_f1"], swapped["implied_prob_f2"] = (
-                row["implied_prob_f2"],
-                row["implied_prob_f1"],
-            )
-            return swapped
+        swapped = row.copy()
+        swapped["fighter_1"], swapped["fighter_2"] = row["fighter_2"], row["fighter_1"]
+        swapped["f1_odds"], swapped["f2_odds"] = row["f2_odds"], row["f1_odds"]
+        swapped["implied_prob_f1"], swapped["implied_prob_f2"] = (
+            row["implied_prob_f2"],
+            row["implied_prob_f1"],
+        )
+        return swapped
     return None

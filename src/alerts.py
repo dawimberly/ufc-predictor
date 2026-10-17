@@ -19,6 +19,7 @@ from src.parlay_builder import build_parlays_for_card, leg_pick_label, threshold
 from src.strategy import (
     StrategyConfig,
     build_model_only_parlay_candidates,
+    edge_for_predicted_pick,
     extract_bet_candidates,
     kelly_stake,
     strategy_from_profile,
@@ -38,17 +39,8 @@ def _fighter_names(row: pd.Series) -> tuple[str, str]:
 
 
 def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
-    pick = str(row.get("predicted_winner", ""))
-    f1, f2 = _fighter_names(row)
-    if pd.notna(row.get("best_edge")):
-        return float(row["best_edge"]), pick
-    if pick == f1 and pd.notna(row.get("edge_f1")):
-        return float(row["edge_f1"]), pick
-    if pick == f2 and pd.notna(row.get("edge_f2")):
-        return float(row["edge_f2"]), pick
-    if pd.notna(row.get("edge_pct")):
-        return float(row["edge_pct"]) / 100.0, pick
-    return None, pick
+    """Edge of the model pick. Never the opponent's ``best_edge``."""
+    return edge_for_predicted_pick(row)
 
 
 def _short_reasoning(row: pd.Series, *, max_len: int = 140) -> str:
@@ -101,6 +93,11 @@ def _suggest_stake(
     cand = extract_bet_candidates(row, config=strategy, apply_uncertainty_gates=True)
     if cand is None:
         return 0.0, 1.0, gate_dict
+    pick_name = str(row.get("predicted_winner") or "").strip()
+    if pick_name and cand.pick_name and cand.pick_name != pick_name:
+        # Value side is the other fighter. Do not size the model pick with it.
+        gate_dict = {**gate_dict, "action": "skip", "primary_reason": "pick_edge_mismatch"}
+        return 0.0, 1.0, gate_dict
 
     # Double-check tightened edge floor (extract already applies it)
     if gate.tighten and cand.edge < effective_min_edge(strategy.min_edge, gate):
@@ -152,6 +149,26 @@ def _suggest_stake(
     return stake, float(rating_mult), gate_dict
 
 
+def _alert_bankroll(
+    bankroll: float | None,
+) -> tuple[float, float | None, str, str | None]:
+    """(sizing bankroll, payload bankroll, source, observed_at).
+
+    Live sizes from today's recorded bankroll and ignores caller or configured
+    numbers. With nothing recorded the payload bankroll stays empty and every
+    Live stake is cleared at the end of ``generate_alerts``.
+    """
+    if not config.is_live_profile():
+        value = float(bankroll or config.INITIAL_BANKROLL)
+        return value, value, "caller" if bankroll else "config_default", None
+    from src.circuit_breaker import live_observed_bankroll
+
+    observed = live_observed_bankroll()
+    if observed is None:
+        return float(bankroll or config.INITIAL_BANKROLL), None, "missing", None
+    return observed.value, observed.value, observed.source, observed.observed_at.isoformat()
+
+
 def generate_alerts(
     predictions_df: pd.DataFrame,
     risk_metrics: dict[str, Any] | None = None,
@@ -171,7 +188,7 @@ def generate_alerts(
     ``narrative_result`` (Ollama/Grok) is applied last — after uncertainty gates and
     strategy-rating sizing — and may only tilt Kelly stake, never pick/edge.
     """
-    bankroll = bankroll or config.INITIAL_BANKROLL
+    bankroll, payload_bankroll, bankroll_source, bankroll_observed_at = _alert_bankroll(bankroll)
     ctx = threshold_context_for_alerts(
         predictions_df,
         bankroll=bankroll,
@@ -363,19 +380,20 @@ def generate_alerts(
         stake, rating_mult, gate_dict = _suggest_stake(
             row, bankroll=bankroll, strategy=strategy, card_risk=risk_metrics
         )
-        if gate_dict.get("action") == "skip" or (stake <= 0 and gate.tighten):
-            if gate_dict.get("action") == "skip":
-                _append_skip(
-                    row=row,
-                    f1=f1,
-                    f2=f2,
-                    pick=pick,
-                    reason=gate_dict.get("primary_reason") or gate.reason_label(),
-                    edge=edge,
-                    disagreement=gate.disagreement,
-                    interval_width=gate.interval_width,
-                )
-                continue
+        if gate_dict.get("action") == "skip" or stake <= 0:
+            _append_skip(
+                row=row,
+                f1=f1,
+                f2=f2,
+                pick=pick,
+                reason=gate_dict.get("primary_reason")
+                or ("zero_stake" if stake <= 0 else gate.reason_label()),
+                edge=edge,
+                disagreement=gate.disagreement,
+                interval_width=gate.interval_width,
+                uncertainty_action=str(gate_dict.get("action") or "skip"),
+            )
+            continue
         edge_pct = edge * 100.0
         singles.append(
             {
@@ -390,6 +408,8 @@ def generate_alerts(
                 "reasoning": _short_reasoning(row),
                 "brief": build_fight_brief(row, risk_metrics=risk_metrics, edge_pct=edge_pct),
                 "suggested_stake": stake,
+                "kelly_stake_usd": round(float(stake), 2),
+                "bankroll": payload_bankroll,
                 "confidence": str(row.get("confidence_label", "")),
                 "strategy_rating_mult": rating_mult,
                 "weight_class": str(row.get("weight_class") or ""),
@@ -401,6 +421,26 @@ def generate_alerts(
                 "odds_source": str(row.get("odds_source") or row.get("odds_book") or ""),
                 "event_name": str(row.get("event_name") or row.get("event") or ev_name or ""),
                 "skip_reason": "",
+                "fighter_1": f1,
+                "fighter_2": f2,
+                "bookmaker": str(row.get("bookmaker") or row.get("odds_book") or ""),
+                "bookmaker_count": row.get("bookmaker_count"),
+                "price_kind": str(row.get("price_kind") or ""),
+                "quote_match": str(row.get("quote_match") or ""),
+                "quote_timestamp": row.get("quote_timestamp"),
+                "commence_time": row.get("commence_time"),
+                "quote_event_id": str(row.get("quote_event_id") or ""),
+                "card_event_id": str(row.get("card_event_id") or ""),
+                "card_event_date": row.get("card_event_date") or row.get("event_date"),
+                "quote_fighter_1": str(row.get("quote_fighter_1") or ""),
+                "quote_fighter_2": str(row.get("quote_fighter_2") or ""),
+                "quote_f1_odds": row.get("quote_f1_odds", row.get("f1_odds")),
+                "quote_f2_odds": row.get("quote_f2_odds", row.get("f2_odds")),
+                "quote_decimal_odds": row.get("quote_decimal_odds"),
+                "quote_selection": str(row.get("quote_selection") or ""),
+                "selection": str(row.get("selection") or row.get("quote_selection") or ""),
+                "quote_actionable": row.get("quote_actionable"),
+                "quote_block_reason": str(row.get("quote_block_reason") or ""),
             }
         )
 
@@ -606,8 +646,11 @@ def generate_alerts(
                             stake = float(s.get("suggested_stake") or 0.0)
                             if stake > max_usd:
                                 s["suggested_stake"] = round(max_usd, 2)
-                                if float(bankroll) > 0:
-                                    s["stake_pct"] = round(100.0 * max_usd / float(bankroll), 4)
+                                pool = float(s.get("card_pool_usd") or 0.0)
+                                if pool > 0:
+                                    s["stake_pct"] = round(
+                                        100.0 * float(s["suggested_stake"]) / pool, 1
+                                    )
             except Exception as clamp_exc:
                 logger.debug("paper wide override stake re-clamp skipped: %s", clamp_exc)
     except Exception as exc:
@@ -671,7 +714,9 @@ def generate_alerts(
         "min_confidence": str(getattr(strategy, "min_confidence", "") or ""),
         "max_bets_per_card": max_bets,
         "max_tickets_per_card": max_bets,
-        "bankroll": bankroll,
+        "bankroll": payload_bankroll,
+        "bankroll_source": bankroll_source,
+        "bankroll_observed_at": bankroll_observed_at,
         "dynamic_thresholds": ctx.get("use_dynamic", False),
         "threshold_detail": ctx.get("thresholds"),
         "decision_layer": decision,
@@ -698,6 +743,10 @@ def generate_alerts(
             payload = attach_narrative_tilts_to_alerts(payload, narrative_result)
         except Exception as exc:
             logger.debug("narrative tilt on alerts skipped: %s", exc)
+    if config.is_live_profile():
+        from src.strategy import revalidate_live_alert_lists
+
+        payload = revalidate_live_alert_lists(payload)
     return payload
 
 
@@ -802,15 +851,20 @@ def should_send_alert(
     if not alert_data.get("available"):
         return False, "no actionable bets"
 
+    live = config.is_live_profile()
     bankroll = alert_data.get("bankroll")
-    if bankroll is not None:
+    if live or bankroll is not None:
         try:
             from src.risk_manager import check_bankroll_safety
 
-            allowed, block_reason = check_bankroll_safety(float(bankroll))
+            allowed, block_reason = check_bankroll_safety(
+                float(bankroll) if bankroll is not None else None
+            )
             if not allowed:
                 return False, block_reason
         except Exception as exc:
+            if live:
+                return False, f"live safety check failed: {exc}"
             logger.debug("Safety check skipped: %s", exc)
 
     cooldown = cooldown_minutes or config.ALERT_COOLDOWN_MINUTES
@@ -882,7 +936,11 @@ def send_discord_alert(
                 },
                 {
                     "name": "Bankroll",
-                    "value": f"${alert_data.get('bankroll', 0):,.0f}",
+                    "value": (
+                        f"${float(alert_data['bankroll']):,.0f}"
+                        if alert_data.get("bankroll") is not None
+                        else "not recorded"
+                    ),
                     "inline": True,
                 },
             ],

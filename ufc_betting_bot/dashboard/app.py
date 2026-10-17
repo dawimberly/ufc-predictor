@@ -61,7 +61,7 @@ with tab_bt:
         st.info("No backtest yet. Run: `python main.py --backtest-2025`")
 
     if st.button("Run 2025 backtest"):
-        with st.spinner("Running walk-forward backtest…"):
+        with st.spinner("Running year-scoped backtest (frozen_model by default)…"):
             from ufc_betting_bot.backtester import backtest_2025, print_backtest_summary
 
             result = backtest_2025()

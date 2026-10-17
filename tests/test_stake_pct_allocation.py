@@ -49,11 +49,41 @@ def test_missing_odds_no_inflate():
     assert missing or out[1].get("sizing_no_inflate")
 
 
-def test_live_allocation_less_aggressive_than_paper():
+def _fresh_live_fields(
+    fighter_1: str,
+    fighter_2: str,
+    event_id: str,
+    *,
+    decimal_odds: float,
+) -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "quote_timestamp": (now - timedelta(minutes=5)).isoformat(),
+        "commence_time": (now + timedelta(days=3)).isoformat(),
+        "card_event_id": event_id,
+        "quote_event_id": event_id,
+        "bookmaker": "DraftKings",
+        "odds_source": "DraftKings",
+        "bookmaker_count": 1,
+        "price_kind": "book",
+        "quote_match": "exact",
+        "fighter_1": fighter_1,
+        "fighter_2": fighter_2,
+        "quote_fighter_1": fighter_1,
+        "quote_fighter_2": fighter_2,
+        "quote_f1_odds": decimal_odds,
+        "quote_f2_odds": round(float(decimal_odds) + 0.45, 3),
+        "pick": fighter_1,
+    }
+
+
+def test_live_allocation_less_aggressive_than_paper(live_session):
     tickets = [
-        {"edge": 0.12, "prob": 0.75, "confidence": "high", "decimal_odds": 1.55, "uncertainty_action": "allow"},
-        {"edge": 0.06, "prob": 0.70, "confidence": "medium", "decimal_odds": 1.80, "uncertainty_action": "allow"},
-        {"edge": 0.05, "prob": 0.68, "confidence": "medium", "decimal_odds": 1.90, "uncertainty_action": "allow"},
+        {"edge": 0.12, "prob": 0.75, "confidence": "high", "decimal_odds": 1.55, "uncertainty_action": "allow", "kelly_stake_usd": 100.0, **_fresh_live_fields("Alpha One", "Beta One", "evt-1", decimal_odds=1.55)},
+        {"edge": 0.06, "prob": 0.70, "confidence": "medium", "decimal_odds": 1.80, "uncertainty_action": "allow", "kelly_stake_usd": 100.0, **_fresh_live_fields("Alpha Two", "Beta Two", "evt-1", decimal_odds=1.80)},
+        {"edge": 0.05, "prob": 0.68, "confidence": "medium", "decimal_odds": 1.90, "uncertainty_action": "allow", "kelly_stake_usd": 100.0, **_fresh_live_fields("Alpha Three", "Beta Three", "evt-1", decimal_odds=1.90)},
     ]
     paper = allocate_card_budget_pct([dict(t) for t in tickets], 100.0, profile="paper")
     live = allocate_card_budget_pct([dict(t) for t in tickets], 100.0, profile="live")
@@ -63,6 +93,7 @@ def test_live_allocation_less_aggressive_than_paper():
     live_sum = sum(t["stake_pct"] for t in live)
     assert paper_top >= live_top - 0.5
     assert paper_sum + 1e-6 >= live_sum
+    assert live_sum > 0.0
 
 
 def test_alerts_allocator_splits_singles_parlays_props():
@@ -101,7 +132,42 @@ def test_alerts_allocator_splits_singles_parlays_props():
 
 def test_format_stake_pct_dollars():
     txt = format_stake_pct_dollars({"stake_pct": 38.0, "suggested_stake": 4.56})
-    assert txt == "38% · $4.56"
+    assert txt == "38% | $4.56"
+
+
+def test_live_allocation_drops_paper_wide_override():
+    tickets = [
+        {
+            "fight": "A vs B",
+            "pick": "A",
+            "edge": 0.12,
+            "prob": 0.75,
+            "confidence": "high",
+            "decimal_odds": 1.70,
+            "uncertainty_action": "tighten",
+            "uncertainty_reason": "paper_wide_override",
+            "suggested_stake": 25.0,
+            "kelly_stake_usd": 25.0,
+        }
+    ]
+    out = allocate_card_budget_pct(tickets, pool_usd=100.0, profile="live", inplace=False)
+    assert out == []
+
+
+def test_allocation_caps_at_kelly_stake_and_pool_pct():
+    tickets = [
+        {
+            "edge": 0.20,
+            "prob": 0.80,
+            "confidence": "high",
+            "decimal_odds": 1.80,
+            "uncertainty_action": "allow",
+            "kelly_stake_usd": 1.25,
+        }
+    ]
+    out = allocate_card_budget_pct([dict(t) for t in tickets], 100.0, profile="paper")
+    assert float(out[0]["suggested_stake"]) <= 1.25 + 1e-9
+    assert float(out[0]["stake_pct"]) == round(100.0 * float(out[0]["suggested_stake"]) / 100.0, 1)
 
 
 def test_stronger_edge_gets_more_weight():

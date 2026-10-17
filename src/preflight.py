@@ -82,6 +82,16 @@ def run_preflight(
         f"max DD {ps['max_drawdown_fraction']:.1%}"
     )
 
+    if config.is_live_profile():
+        from src.circuit_breaker import live_safety_block_reason
+
+        session_problem = live_safety_block_reason()
+        if session_problem:
+            fail(f"Live stakes blocked: {session_problem}")
+            passed = False
+        else:
+            ok("Live session started and current bankroll recorded for today")
+
     config.LOG_DIR.mkdir(parents=True, exist_ok=True)
     config.CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ok(f"Log dir: {config.LOG_DIR}")

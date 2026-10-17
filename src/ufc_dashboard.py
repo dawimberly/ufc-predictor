@@ -658,29 +658,18 @@ def _top_shap(row: pd.Series) -> str:
 
 
 def _pick_edge(row: pd.Series) -> tuple[float | None, str | None]:
-    f1 = str(row.get("fighter_1", ""))
-    f2 = str(row.get("fighter_2", ""))
-    pick = str(row.get("predicted_winner", ""))
+    from src.strategy import edge_for_predicted_pick
+
+    pick = str(row.get("predicted_winner", "") or "")
     if not _has_usable_odds(row):
         return None, pick or None
-    edge: float | None = None
-    if pd.notna(row.get("edge_pct")):
-        edge = float(row["edge_pct"]) / 100.0
-    elif pd.notna(row.get("best_edge")):
-        edge = float(row["best_edge"])
-        if abs(edge) > 1.5:  # sometimes stored as percent
-            edge = edge / 100.0
-    elif pd.notna(row.get("edge_f1")) or pd.notna(row.get("edge_f2")):
-        e1 = float(row["edge_f1"]) if pd.notna(row.get("edge_f1")) else float("-inf")
-        e2 = float(row["edge_f2"]) if pd.notna(row.get("edge_f2")) else float("-inf")
-        edge = max(e1, e2)
-        if edge == float("-inf"):
-            edge = None
+    edge, pick_out = edge_for_predicted_pick(row)
+    pick = pick_out or pick or None
     if edge is None:
-        return None, pick or None
+        return None, pick
     if abs(edge) > _MAX_DISPLAY_EDGE or edge <= -0.50:
-        return None, pick or None
-    return edge, pick or None
+        return None, pick
+    return edge, pick
 
 
 def _site_odds(row: pd.Series, pick: str | None) -> str:
@@ -4798,7 +4787,7 @@ class GaneFoulScenarioPanel(_CTK_FRAME):
         ).pack(fill="x", padx=12, pady=(10, 2))
         ctk.CTkLabel(
             self._inner,
-            text="HIGH RISK / SPECULATIVE - tail-event hedge only, not a model core pick",
+            text="ADVISORY ONLY - $0 - not a sized bet, including synthetic prices",
             font=ctk.CTkFont(size=11, weight="bold"),
             text_color="#fbbf24",
             anchor="w",
@@ -4913,12 +4902,11 @@ class GaneFoulScenarioPanel(_CTK_FRAME):
             )
         )
 
-        stake = float(scenario.get("suggested_stake_usd") or 2.5)
+        price_kind = str(scenario.get("price_kind") or (best.get("price_kind") or ""))
+        synthetic = price_kind == "synthetic" or "synthetic" in str(best.get("book") or "").lower()
+        price_note = " Synthetic price." if synthetic else ""
         self.stake_label.configure(
-            text=(
-                f"Suggested speculative stake: ${stake:.2f} "
-                f"(target range {scenario.get('stake_range', '$2-$3')} - lottery hedge only)"
-            )
+            text=f"Advisory only: $0.00. Not a sized bet.{price_note}"
         )
 
         self.explain_label.configure(text=str(scenario.get("explanation", "")))
@@ -5325,6 +5313,7 @@ class UFCDashboardApp(_CTK_BASE):
             return []
         profile = self._profile_from_menu(self.profile_var.get())
         items: list[dict[str, Any]] = []
+        aggregation_failed = False
         try:
             from src.strategy import (
                 aggregate_overview_recommendations,
@@ -5338,7 +5327,9 @@ class UFCDashboardApp(_CTK_BASE):
                 profile=profile,
                 allowed_fights=self._allowed_fight_keys(self._payload.combined),
             )
-            tilted = apply_narrative_tilt_after_model_sizing(recs, self._grok_result)
+            tilted = apply_narrative_tilt_after_model_sizing(
+                recs, self._grok_result, profile=profile
+            )
             if isinstance(tilted, dict):
                 items = list(tilted.get("items") or [])
                 if not items:
@@ -5364,32 +5355,19 @@ class UFCDashboardApp(_CTK_BASE):
                         t["rank"] = i
                 except Exception as exc:
                     _debug_log(f"Overview stake re-alloc skipped: {exc}")
+                    from src.quote_integrity import apply_live_quote_gate
+                    from src.strategy import _reapply_stake_ceilings
+
+                    live_profile = str(profile).strip().lower() == "live"
+                    _reapply_stake_ceilings(items, pool, live=live_profile)
+                    apply_live_quote_gate(items, live=live_profile)
+                    from src.circuit_breaker import apply_live_safety_gate
+
+                    apply_live_safety_gate(items, live=live_profile)
         except Exception as exc:
-            _debug_log(f"Overview recommendations fallback: {exc}")
-            overview = self._payload.books.get("Overview", {}).get("alerts") or {}
-            singles = overview.get("singles") or []
+            _debug_log(f"Overview recommendations failed closed: {exc}")
+            aggregation_failed = True
             items = []
-            for i, s in enumerate(singles[:5], start=1):
-                fight = str(s.get("fight") or "")
-                pick = str(s.get("pick") or "")
-                items.append(
-                    {
-                        "rank": i,
-                        "pick_line": f"{pick} over {fight.split(' vs ')[-1] if ' vs ' in fight else fight}",
-                        "display_label": f"{pick} ML",
-                        "edge_pct": float(s.get("edge_pct") or float(s.get("edge") or 0) * 100),
-                        "book": "Overview",
-                        "american_odds": "-",
-                        "odds_display": "-",
-                        "suggested_stake": float(s.get("suggested_stake") or 0),
-                        "card_pool_usd": float(
-                            config.default_card_budget_usd(
-                                float(self._budget_state.get("total_bankroll") or 100),
-                                profile=profile,
-                            )
-                        ),
-                    }
-                )
 
         for t in items:
             from src.bet_tiers import TIER_BLUE, TIER_SKY_BLUE, is_sky_blue_ticket
@@ -5425,6 +5403,7 @@ class UFCDashboardApp(_CTK_BASE):
                 merge_bet_tier_dicts,
                 rank_card_bet_tiers,
                 rank_prop_bet_tiers,
+                zero_fun_only_stakes,
             )
 
             overview_alerts = (self._payload.books.get("Overview") or {}).get("alerts") or {}
@@ -5450,12 +5429,10 @@ class UFCDashboardApp(_CTK_BASE):
                 items.append(fun)
             if not items:
                 items = list(tiers.get("best_fun") or [])
+            zero_fun_only_stakes(items)
             for t in items:
                 if t.get("bet_tier") in {TIER_GREEN, TIER_YELLOW}:
-                    t["suggested_stake"] = 0.0
-                    t["stake_usd"] = 0.0
-                    t["stake_pct"] = 0.0
-                    t["fun_bet"] = True
+                    continue
                 elif not t.get("bet_tier"):
                     t["bet_tier"] = TIER_BLUE
                 elif t.get("bet_tier") == TIER_SKY_BLUE:
@@ -5484,6 +5461,19 @@ class UFCDashboardApp(_CTK_BASE):
             items = items[:5]
             for i, t in enumerate(items, start=1):
                 t["rank"] = i
+        if aggregation_failed:
+            # Advisory rows may remain. None of them keep a cached dollar stake.
+            for ticket in items:
+                for key in (
+                    "suggested_stake",
+                    "stake_usd",
+                    "stake_pct",
+                    "raw_stake",
+                    "kelly_stake_usd",
+                    "kelly_pct",
+                    "max_safe_bet_usd",
+                ):
+                    ticket[key] = 0.0
         return items
 
     def _payload_has_usable_odds(self) -> bool:

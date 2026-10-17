@@ -1131,6 +1131,10 @@ def _compute_elo_state(history: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, f
 
     fights = fights.copy()
     fights["_elo_day"] = pd.to_datetime(fights[config.DATE_COLUMN], errors="coerce").dt.normalize()
+    # A missing date cannot be ordered. Those results must not move anyone's
+    # rating, and the bout itself only sees the default start rating.
+    undated = fights[fights["_elo_day"].isna()]
+    fights = fights[fights["_elo_day"].notna()]
 
     for _, day_fights in fights.groupby("_elo_day", sort=True):
         # Snapshot ratings at the start of the card for every bout that night.
@@ -1157,6 +1161,9 @@ def _compute_elo_state(history: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, f
                 s1, s2 = 0.5, 0.5
             ratings[f1] = r1 + ELO_K * (s1 - e1)
             ratings[f2] = r2 + ELO_K * (s2 - e2)
+
+    for row in undated.itertuples(index=False):
+        pre_fight[row.fight_id] = {"f1_elo": ELO_START, "f2_elo": ELO_START}
 
     elo_rows = [
         {config.FIGHT_ID_COLUMN: fid, "f1_elo": vals["f1_elo"], "f2_elo": vals["f2_elo"]}
@@ -1456,10 +1463,12 @@ def _rolling_stats(history: pd.DataFrame) -> pd.DataFrame:
 
     history["control_time_per_min"] = np.nan  # not in base dataset
 
-    # Physical attributes at fight time are known pre-bout (DOB / profile); do not shift.
+    # Physical attributes are known pre-bout when present on the row. Forward-fill
+    # carries a previously observed profile value into later missing rows, but never
+    # back-fill from a future fight (that would leak later measurements).
     for col in ("reach_in", "height_in", "age"):
         if col in history.columns:
-            history[col] = g[col].apply(lambda s: s.ffill().bfill())
+            history[col] = g[col].apply(lambda s: s.ffill())
 
     if "stance" in history.columns:
         enc = history["stance"].map(_stance_encoding).apply(pd.Series)
@@ -1992,10 +2001,18 @@ def apply_historical_stat_fallbacks(
 
     out = features.copy()
     out[config.DATE_COLUMN] = pd.to_datetime(out[config.DATE_COLUMN], errors="coerce")
+    years = out[config.DATE_COLUMN].dt.year
     if reference_year is not None:
-        ref = out[out[config.DATE_COLUMN].dt.year < reference_year]
+        # Medians come only from fights before the reference year, and are
+        # applied only to rows on/after that year. Earlier rows stay missing
+        # so a later training-slice imputer cannot inherit future fills.
+        ref = out[years < reference_year]
         if ref.empty:
-            ref = out
+            logger.info(
+                "Historical stat fallback: no pre-%s rows; leaving missing values",
+                reference_year,
+            )
+            return out
     else:
         ref = out
 
@@ -2028,6 +2045,10 @@ def apply_historical_stat_fallbacks(
     else:
         row_iter = out.index
     for idx in row_iter:
+        if reference_year is not None:
+            row_year = years.loc[idx] if idx in years.index else None
+            if pd.isna(row_year) or int(row_year) < int(reference_year):
+                continue
         row = out.loc[idx]
         touched = False
         wc = str(row.get("weight_class", ""))

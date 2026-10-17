@@ -297,7 +297,14 @@ def resolve_prop_quote(
 
     live_row = None
     if prop_odds is not None and not prop_odds.empty:
-        live_row = lookup_prop_odds_row(f1, f2, prop_key, prop_odds)
+        live_row = lookup_prop_odds_row(
+            f1,
+            f2,
+            prop_key,
+            prop_odds,
+            event_id=row.get("card_event_id") or row.get("event_id"),
+            event_date=row.get("card_event_date") or row.get("event_date") or row.get("date"),
+        )
 
     if live_row is not None and float(live_row.get("decimal_odds", 0) or 0) > 1:
         decimal = float(live_row["decimal_odds"])
@@ -316,7 +323,19 @@ def resolve_prop_quote(
             "odds_source": src,
             "american_odds": live_row.get("american_odds"),
             "selection": live_row.get("selection", ""),
+            "quote_selection": str(live_row.get("selection") or ""),
+            "quote_decimal_odds": decimal,
             "book": book,
+            "bookmaker": str(live_row.get("bookmaker") or ""),
+            "bookmaker_count": live_row.get("bookmaker_count"),
+            "price_kind": str(live_row.get("price_kind") or ""),
+            "quote_timestamp": live_row.get("quote_timestamp"),
+            "commence_time": live_row.get("commence_time"),
+            "quote_event_id": str(live_row.get("event_id") or live_row.get("quote_event_id") or ""),
+            "quote_fighter_1": str(live_row.get("fighter_1") or ""),
+            "quote_fighter_2": str(live_row.get("fighter_2") or ""),
+            "card_event_id": str(row.get("card_event_id") or row.get("event_id") or ""),
+            "card_event_date": row.get("card_event_date") or row.get("event_date") or row.get("date"),
         }
 
     decimal = synthetic_market_odds(model_p)
@@ -552,6 +571,24 @@ def extract_prop_candidate(
         display_label=label,
     )
     cand.odds_source = odds_source
+    cand.quote_provenance = {
+        "bookmaker": quote.get("bookmaker") or "",
+        "bookmaker_count": quote.get("bookmaker_count"),
+        "price_kind": quote.get("price_kind") or "",
+        "quote_timestamp": quote.get("quote_timestamp"),
+        "commence_time": quote.get("commence_time"),
+        "quote_event_id": quote.get("quote_event_id") or "",
+        "quote_fighter_1": quote.get("quote_fighter_1") or "",
+        "quote_fighter_2": quote.get("quote_fighter_2") or "",
+        "card_event_id": quote.get("card_event_id") or "",
+        "card_event_date": quote.get("card_event_date"),
+        "selection": quote.get("selection") or "",
+        "quote_selection": quote.get("quote_selection") or quote.get("selection") or "",
+        "quote_decimal_odds": quote.get("quote_decimal_odds"),
+        "odds_source": odds_source,
+        "fighter_1": f1,
+        "fighter_2": f2,
+    }
     return cand
 
 
@@ -664,6 +701,13 @@ def _prop_row_dict(
         ),
         "strict_qualified": strict_qualified,
         "parlay_allowed": config.BOOK_PROP_RULES.get(book, {}).get("allow_prop_parlays", False),
+        "fighter_1": cand.fighter1_name,
+        "fighter_2": cand.fighter2_name,
+        **{
+            key: value
+            for key, value in (getattr(cand, "quote_provenance", None) or {}).items()
+            if value is not None
+        },
     }
 
 

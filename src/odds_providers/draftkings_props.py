@@ -14,7 +14,7 @@ import requests
 import config
 from src.data_loader import ensure_data_dirs
 from src.odds_providers.prop_odds_common import empty_prop_odds_df, prop_row
-from src.predictor import OddsAPIError, _names_match, _to_decimal_odds
+from src.predictor import _to_decimal_odds
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,9 @@ def _totals_to_prop_rows(
     fighter_1: str,
     fighter_2: str,
     outcomes: list[dict[str, Any]],
+    event_id: str = "",
+    commence_time: Any = None,
+    quote_timestamp: str = "",
 ) -> list[dict[str, Any]]:
     """Map DK totals (round O/U 1.5) to internal prop keys."""
     rows: list[dict[str, Any]] = []
@@ -78,6 +81,11 @@ def _totals_to_prop_rows(
                 odds_source="live",
                 market_key="totals",
                 point=point_f,
+                event_id=event_id,
+                commence_time=commence_time,
+                quote_timestamp=quote_timestamp,
+                price_kind="book",
+                bookmaker_count=1,
             )
         )
     return rows
@@ -99,6 +107,10 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         LAST_WARNING = DK_UNAVAILABLE_MSG
         logger.warning(LAST_WARNING)
         return empty_prop_odds_df()
+
+    if force_refresh and bool(getattr(config, "ODDS_FETCH_ONCE", True)) and _cache_fresh(DK_PROP_CACHE_PATH):
+        logger.info("ODDS_FETCH_ONCE: reusing cached DraftKings props (force_refresh ignored)")
+        force_refresh = False
 
     if not force_refresh and _cache_fresh(DK_PROP_CACHE_PATH):
         cached = pd.read_csv(DK_PROP_CACHE_PATH)
@@ -155,7 +167,9 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         events_resp.raise_for_status()
         events = events_resp.json()
     except requests.RequestException as exc:
-        logger.warning("DraftKings prop events request failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("DraftKings prop events request failed: %s", redact_secrets(str(exc)))
         if "401" in str(exc) or "unauthorized" in str(exc).lower():
             LAST_WARNING = DK_UNAVAILABLE_MSG
         if DK_PROP_CACHE_PATH.is_file():
@@ -178,8 +192,11 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         logger.warning("Unexpected DraftKings events response: %s", type(events))
         return empty_prop_odds_df()
 
+    from datetime import datetime, timezone
+
     markets = config.ODDS_API_PROP_MARKETS or "totals"
     rows: list[dict[str, Any]] = []
+    quoted_at = datetime.now(timezone.utc).isoformat()
 
     for event in events:
         event_id = event.get("id")
@@ -201,7 +218,14 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
             resp.raise_for_status()
             payload = resp.json()
         except requests.RequestException as exc:
-            logger.debug("DK prop odds skipped for %s vs %s: %s", home, away, exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug(
+                "DK prop odds skipped for %s vs %s: %s",
+                home,
+                away,
+                redact_secrets(str(exc)),
+            )
             continue
 
         for book in payload.get("bookmakers", []):
@@ -215,6 +239,9 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                             fighter_1=home,
                             fighter_2=away,
                             outcomes=market.get("outcomes", []),
+                            event_id=str(event_id),
+                            commence_time=event.get("commence_time"),
+                            quote_timestamp=quoted_at,
                         )
                     )
 

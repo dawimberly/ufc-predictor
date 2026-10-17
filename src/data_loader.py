@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlparse
@@ -671,6 +671,12 @@ _ODDS_UNIFIED_COLUMNS = [
     "fighter2",
     "f1_odds",
     "f2_odds",
+    "f1_opening_odds",
+    "f2_opening_odds",
+    "f1_closing_odds",
+    "f2_closing_odds",
+    "opening_odds_observed_at",
+    "quote_observed_at",
     "source",
 ]
 
@@ -679,9 +685,41 @@ _ODDS_COLUMN_ALIASES: dict[str, list[str]] = {
     "date": ["date", "event_date", "fight_date"],
     "fighter1": ["fighter1", "fighter_1", "R_fighter", "red_fighter"],
     "fighter2": ["fighter2", "fighter_2", "B_fighter", "blue_fighter"],
-    "f1_odds": ["f1_odds", "R_odds", "red_odds", "favourite_odds"],
-    "f2_odds": ["f2_odds", "B_odds", "blue_odds", "underdog_odds"],
+    "f1_odds": ["f1_odds", "R_odds", "red_odds", "favourite_odds", "odds_1", "odds1"],
+    "f2_odds": ["f2_odds", "B_odds", "blue_odds", "underdog_odds", "odds_2", "odds2"],
+    "f1_opening_odds": ["f1_opening_odds", "opening_f1_odds", "open_f1_odds"],
+    "f2_opening_odds": ["f2_opening_odds", "opening_f2_odds", "open_f2_odds"],
+    "f1_closing_odds": ["f1_closing_odds", "closing_f1_odds", "close_f1_odds"],
+    "f2_closing_odds": ["f2_closing_odds", "closing_f2_odds", "close_f2_odds"],
+    "opening_odds_observed_at": [
+        "opening_odds_observed_at",
+        "opening_quote_timestamp",
+        "opening_odds_timestamp",
+        "f1_opening_odds_timestamp",
+    ],
+    "quote_observed_at": [
+        "quote_observed_at",
+        "quote_timestamp",
+        "observed_at",
+        "collection_timestamp",
+        "collected_at",
+        "scraped_at",
+        "snapshot_timestamp",
+        "snapshot_date",
+        "odds_timestamp",
+        "timestamp",
+        "odds_extract_ts",
+        "odds_date",
+    ],
 }
+
+_ODDS_PROVENANCE_COLUMNS = (
+    "f1_opening_odds",
+    "f2_opening_odds",
+    "f1_closing_odds",
+    "f2_closing_odds",
+    "opening_odds_observed_at",
+)
 
 
 class OddsLoadError(DataLoaderError):
@@ -744,8 +782,99 @@ def _map_fav_dog_odds(
     return None
 
 
+def _coerce_observation_timestamp(value: Any) -> str | None:
+    """Normalize a timezone-aware observation stamp to UTC ISO.
+
+    Naive datetimes and date-only calendar values are rejected. Never assign
+    UTC (or any timezone) to a stamp whose timezone is unknown — only preserve
+    observations that already carry an explicit timezone, then convert to UTC.
+    """
+    if value is None or (isinstance(value, float) and not np.isfinite(value)):
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        # Pure calendar dates have no observation time or timezone.
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return None
+        # Require an explicit offset / Z so we never invent a zone.
+        if not re.search(r"(Z|[+-]\d{2}:?\d{2})$", text, flags=re.IGNORECASE):
+            return None
+
+    try:
+        ts = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        return None
+    return ts.tz_convert("UTC").isoformat()
+
+
+def _fight_start_utc(fight_date: Any) -> pd.Timestamp | None:
+    dt = pd.to_datetime(fight_date, errors="coerce")
+    if pd.isna(dt):
+        return None
+    ts = pd.Timestamp(dt)
+    if ts.tzinfo is None:
+        return ts.normalize().tz_localize("UTC")
+    return ts.tz_convert("UTC").normalize()
+
+
+def _empty_odds_row(
+    *,
+    event: str,
+    date: Any,
+    fighter1: str,
+    fighter2: str,
+    f1_odds: float,
+    f2_odds: float,
+    source: str,
+    quote_observed_at: Any = None,
+    f1_opening_odds: Any = None,
+    f2_opening_odds: Any = None,
+    f1_closing_odds: Any = None,
+    f2_closing_odds: Any = None,
+    opening_odds_observed_at: Any = None,
+) -> dict[str, Any]:
+    return {
+        "event": event,
+        "date": date,
+        "fighter1": fighter1,
+        "fighter2": fighter2,
+        "f1_odds": float(f1_odds),
+        "f2_odds": float(f2_odds),
+        "f1_opening_odds": (
+            float(f1_opening_odds) if _odds_pair_valid(f1_opening_odds, f2_opening_odds) else np.nan
+        ),
+        "f2_opening_odds": (
+            float(f2_opening_odds) if _odds_pair_valid(f1_opening_odds, f2_opening_odds) else np.nan
+        ),
+        "f1_closing_odds": (
+            float(f1_closing_odds) if _odds_pair_valid(f1_closing_odds, f2_closing_odds) else np.nan
+        ),
+        "f2_closing_odds": (
+            float(f2_closing_odds) if _odds_pair_valid(f1_closing_odds, f2_closing_odds) else np.nan
+        ),
+        "opening_odds_observed_at": _coerce_observation_timestamp(opening_odds_observed_at),
+        "quote_observed_at": _coerce_observation_timestamp(quote_observed_at),
+        "source": source,
+    }
+
+
 def _normalize_odds_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
-    """Map heterogeneous odds CSVs (Kaggle R_/B_ schema, fav/dog) to unified rows."""
+    """Map heterogeneous odds CSVs (Kaggle R_/B_ schema, fav/dog) to unified rows.
+
+    Snapshot / unlabeled prices are kept as ``f1_odds`` / ``f2_odds``. Opening
+    fields are populated only when the source supplies them (or later when
+    multiple pre-fight ``quote_observed_at`` snapshots are collapsed). Closing
+    labels are never invented here from unlabeled singles — that happens in
+    :func:`_collapse_odds_snapshots`.
+    """
     if df.empty:
         return pd.DataFrame(columns=_ODDS_UNIFIED_COLUMNS)
 
@@ -762,18 +891,28 @@ def _normalize_odds_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
         f2 = clean_fighter_name(raw.get("fighter2") or raw.get("B_fighter") or "")
         o1 = raw.get("f1_odds", raw.get("R_odds"))
         o2 = raw.get("f2_odds", raw.get("B_odds"))
+        quote_at = raw.get("quote_observed_at")
+        open_at = raw.get("opening_odds_observed_at")
+        open1, open2 = raw.get("f1_opening_odds"), raw.get("f2_opening_odds")
+        close1, close2 = raw.get("f1_closing_odds"), raw.get("f2_closing_odds")
 
         if f1 and f2 and _odds_pair_valid(o1, o2):
             rows.append(
-                {
-                    "event": event,
-                    "date": dt,
-                    "fighter1": f1,
-                    "fighter2": f2,
-                    "f1_odds": float(o1),
-                    "f2_odds": float(o2),
-                    "source": source,
-                }
+                _empty_odds_row(
+                    event=event,
+                    date=dt,
+                    fighter1=f1,
+                    fighter2=f2,
+                    f1_odds=float(o1),
+                    f2_odds=float(o2),
+                    source=source,
+                    quote_observed_at=quote_at,
+                    f1_opening_odds=open1,
+                    f2_opening_odds=open2,
+                    f1_closing_odds=close1,
+                    f2_closing_odds=close2,
+                    opening_odds_observed_at=open_at,
+                )
             )
             continue
 
@@ -786,37 +925,176 @@ def _normalize_odds_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
             )
         if mapped:
             rows.append(
-                {
-                    "event": event,
-                    "date": dt,
-                    "fighter1": f1,
-                    "fighter2": f2,
-                    "f1_odds": mapped[0],
-                    "f2_odds": mapped[1],
-                    "source": source,
-                }
+                _empty_odds_row(
+                    event=event,
+                    date=dt,
+                    fighter1=f1,
+                    fighter2=f2,
+                    f1_odds=mapped[0],
+                    f2_odds=mapped[1],
+                    source=source,
+                    quote_observed_at=quote_at,
+                    f1_opening_odds=open1,
+                    f2_opening_odds=open2,
+                    f1_closing_odds=close1,
+                    f2_closing_odds=close2,
+                    opening_odds_observed_at=open_at,
+                )
             )
             continue
 
         if fav and dog and _odds_pair_valid(raw.get("favourite_odds"), raw.get("underdog_odds")):
             rows.append(
-                {
-                    "event": event,
-                    "date": dt,
-                    "fighter1": fav,
-                    "fighter2": dog,
-                    "f1_odds": float(raw["favourite_odds"]),
-                    "f2_odds": float(raw["underdog_odds"]),
-                    "source": source,
-                }
+                _empty_odds_row(
+                    event=event,
+                    date=dt,
+                    fighter1=fav,
+                    fighter2=dog,
+                    f1_odds=float(raw["favourite_odds"]),
+                    f2_odds=float(raw["underdog_odds"]),
+                    source=source,
+                    quote_observed_at=quote_at,
+                    f1_opening_odds=open1,
+                    f2_opening_odds=open2,
+                    f1_closing_odds=close1,
+                    f2_closing_odds=close2,
+                    opening_odds_observed_at=open_at,
+                )
             )
 
     if not rows:
         return pd.DataFrame(columns=_ODDS_UNIFIED_COLUMNS)
 
     out = pd.DataFrame(rows)
+    # Keep every snapshot row; collapse happens after sources are concatenated.
+    return out.sort_values("date").reset_index(drop=True)
+
+
+def _collapse_odds_snapshots(odds_table: pd.DataFrame) -> pd.DataFrame:
+    """Collapse daily / multi-book snapshots into one row per fight.
+
+    Timestamp binding is strict:
+    - ``quote_observed_at`` validates raw snapshot ``f1_odds`` / ``f2_odds`` only.
+    - ``opening_odds_observed_at`` validates the named opening pair only.
+    An opening timestamp never promotes raw/closing prices into openings.
+    Unlabeled single-shot sources become closing prices without an opening stamp.
+    """
+    if odds_table.empty:
+        return pd.DataFrame(columns=_ODDS_UNIFIED_COLUMNS)
+
+    work = odds_table.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date", "fighter1", "fighter2"])
+    rows: list[dict[str, Any]] = []
+
+    grouped = work.groupby(
+        [work["date"].dt.normalize(), "fighter1", "fighter2"],
+        sort=False,
+        dropna=False,
+    )
+    for (fight_day, f1, f2), grp in grouped:
+        fight_start = _fight_start_utc(fight_day)
+        if fight_start is None:
+            continue
+        event = ""
+        for candidate in grp["event"].tolist():
+            if str(candidate or "").strip():
+                event = str(candidate).strip()
+                break
+        source = str(grp.iloc[-1].get("source", "") or "")
+
+        # Raw snapshot prices are eligible only with quote_observed_at.
+        pre_fight: list[tuple[pd.Timestamp, pd.Series]] = []
+        for _, raw in grp.iterrows():
+            iso = _coerce_observation_timestamp(raw.get("quote_observed_at"))
+            if iso is None:
+                continue
+            ts = pd.Timestamp(iso)
+            if ts <= fight_start and _odds_pair_valid(raw.get("f1_odds"), raw.get("f2_odds")):
+                pre_fight.append((ts, raw))
+
+        # Named opening prices are eligible only with opening_odds_observed_at.
+        explicit_opens: list[tuple[pd.Timestamp, float, float]] = []
+        for _, raw in grp.iterrows():
+            open_iso = _coerce_observation_timestamp(raw.get("opening_odds_observed_at"))
+            if open_iso is None:
+                continue
+            open_ts = pd.Timestamp(open_iso)
+            if open_ts > fight_start:
+                continue
+            if _odds_pair_valid(raw.get("f1_opening_odds"), raw.get("f2_opening_odds")):
+                explicit_opens.append(
+                    (open_ts, float(raw["f1_opening_odds"]), float(raw["f2_opening_odds"]))
+                )
+
+        last = grp.iloc[-1]
+        f1_odds = float(last["f1_odds"]) if _odds_pair_valid(last.get("f1_odds"), last.get("f2_odds")) else np.nan
+        f2_odds = float(last["f2_odds"]) if _odds_pair_valid(last.get("f1_odds"), last.get("f2_odds")) else np.nan
+        f1_open = f2_open = np.nan
+        open_at = None
+        quote_at = None
+        f1_close = f2_close = np.nan
+
+        if pre_fight:
+            pre_fight.sort(key=lambda item: item[0])
+            snap_open_ts, open_row = pre_fight[0]
+            _close_ts, close_row = pre_fight[-1]
+            quote_at = snap_open_ts.isoformat()
+            f1_close = float(close_row["f1_odds"])
+            f2_close = float(close_row["f2_odds"])
+            f1_odds, f2_odds = f1_close, f2_close
+            source = str(close_row.get("source", source) or source)
+            # Snapshot path may supply opening only when no named opening pair wins.
+            if not explicit_opens:
+                open_at = quote_at
+                f1_open = float(open_row["f1_odds"])
+                f2_open = float(open_row["f2_odds"])
+
+        if explicit_opens:
+            explicit_opens.sort(key=lambda item: item[0])
+            open_ts, o1, o2 = explicit_opens[0]
+            open_at = open_ts.isoformat()
+            f1_open, f2_open = o1, o2
+
+        if not _odds_pair_valid(f1_close, f2_close):
+            # Explicit closing columns, else unlabeled last price as closing-only.
+            for _, raw in reversed(list(grp.iterrows())):
+                if _odds_pair_valid(raw.get("f1_closing_odds"), raw.get("f2_closing_odds")):
+                    f1_close = float(raw["f1_closing_odds"])
+                    f2_close = float(raw["f2_closing_odds"])
+                    break
+            if not _odds_pair_valid(f1_close, f2_close) and _odds_pair_valid(f1_odds, f2_odds):
+                f1_close, f2_close = float(f1_odds), float(f2_odds)
+
+        if not _odds_pair_valid(f1_odds, f2_odds) and _odds_pair_valid(f1_close, f2_close):
+            f1_odds, f2_odds = float(f1_close), float(f2_close)
+
+        if not _odds_pair_valid(f1_odds, f2_odds):
+            continue
+
+        rows.append(
+            {
+                "event": event,
+                "date": pd.Timestamp(fight_day).normalize(),
+                "fighter1": f1,
+                "fighter2": f2,
+                "f1_odds": float(f1_odds),
+                "f2_odds": float(f2_odds),
+                "f1_opening_odds": float(f1_open) if _odds_pair_valid(f1_open, f2_open) else np.nan,
+                "f2_opening_odds": float(f2_open) if _odds_pair_valid(f1_open, f2_open) else np.nan,
+                "f1_closing_odds": float(f1_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
+                "f2_closing_odds": float(f2_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
+                "opening_odds_observed_at": open_at,
+                "quote_observed_at": quote_at,
+                "source": source,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=_ODDS_UNIFIED_COLUMNS)
+    out = pd.DataFrame(rows)
     return (
-        out.drop_duplicates(subset=["event", "date", "fighter1", "fighter2"], keep="last")
+        out.drop_duplicates(subset=["date", "fighter1", "fighter2"], keep="last")
         .sort_values("date")
         .reset_index(drop=True)
     )
@@ -955,15 +1233,16 @@ def _supplement_from_odds_api_cache(frames: list[pd.DataFrame]) -> list[pd.DataF
         if not f1 or not f2 or not _odds_pair_valid(raw.get("f1_odds"), raw.get("f2_odds")):
             continue
         rows.append(
-            {
-                "event": "",
-                "date": clean_date(raw.get("commence_time")),
-                "fighter1": f1,
-                "fighter2": f2,
-                "f1_odds": float(raw["f1_odds"]),
-                "f2_odds": float(raw["f2_odds"]),
-                "source": "odds_api:cache",
-            }
+            _empty_odds_row(
+                event="",
+                date=clean_date(raw.get("commence_time")),
+                fighter1=f1,
+                fighter2=f2,
+                f1_odds=float(raw["f1_odds"]),
+                f2_odds=float(raw["f2_odds"]),
+                source="odds_api:cache",
+                quote_observed_at=raw.get("quote_timestamp") or raw.get("quote_observed_at"),
+            )
         )
     if rows:
         frames.append(pd.DataFrame(rows))
@@ -971,7 +1250,7 @@ def _supplement_from_odds_api_cache(frames: list[pd.DataFrame]) -> list[pd.DataF
 
 
 def build_unified_odds_table() -> pd.DataFrame:
-    """Combine all odds sources; later sources win on duplicate fights."""
+    """Combine all odds sources and collapse snapshots with provenance."""
     ensure_data_dirs()
     frames = _supplement_from_odds_api_cache(_load_historical_odds_frames())
     if not frames:
@@ -980,13 +1259,31 @@ def build_unified_odds_table() -> pd.DataFrame:
     unified = pd.concat(frames, ignore_index=True)
     unified["date"] = pd.to_datetime(unified["date"], errors="coerce")
     unified = unified.dropna(subset=["date", "fighter1", "fighter2"])
-    unified = (
-        unified.drop_duplicates(subset=["event", "date", "fighter1", "fighter2"], keep="last")
-        .sort_values("date")
-        .reset_index(drop=True)
-    )
+    unified = _collapse_odds_snapshots(unified)
     unified.to_csv(config.HISTORICAL_ODDS_CACHE, index=False)
     return unified
+
+
+def _odds_match_from_row(row: pd.Series, *, swapped: bool = False) -> dict[str, Any]:
+    """Build a lookup payload; swap corners when fighters matched reversed."""
+    if swapped:
+        f1_odds, f2_odds = float(row["f2_odds"]), float(row["f1_odds"])
+        f1_open, f2_open = row.get("f2_opening_odds"), row.get("f1_opening_odds")
+        f1_close, f2_close = row.get("f2_closing_odds"), row.get("f1_closing_odds")
+    else:
+        f1_odds, f2_odds = float(row["f1_odds"]), float(row["f2_odds"])
+        f1_open, f2_open = row.get("f1_opening_odds"), row.get("f2_opening_odds")
+        f1_close, f2_close = row.get("f1_closing_odds"), row.get("f2_closing_odds")
+    return {
+        "f1_odds": f1_odds,
+        "f2_odds": f2_odds,
+        "f1_opening_odds": float(f1_open) if _odds_pair_valid(f1_open, f2_open) else np.nan,
+        "f2_opening_odds": float(f2_open) if _odds_pair_valid(f1_open, f2_open) else np.nan,
+        "f1_closing_odds": float(f1_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
+        "f2_closing_odds": float(f2_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
+        "opening_odds_observed_at": row.get("opening_odds_observed_at"),
+        "source": row.get("source"),
+    }
 
 
 def _lookup_odds_for_fight(
@@ -996,8 +1293,13 @@ def _lookup_odds_for_fight(
     fight_date: pd.Timestamp,
     fighter1: str,
     fighter2: str,
-) -> tuple[float, float] | None:
-    """Match odds by date + fighters; fuzzy fallback on event/date."""
+) -> dict[str, Any] | None:
+    """Match odds by date + fighters; fuzzy fallback on event/date.
+
+    Returns a provenance dict (prices + optional opening/closing stamps).
+    Callers that only need a pair can use ``matched["f1_odds"]`` /
+    ``matched["f2_odds"]``.
+    """
     if odds_table.empty:
         return None
 
@@ -1012,8 +1314,7 @@ def _lookup_odds_for_fight(
         & (odds_table["fighter2"] == f2)
     ]
     if not exact.empty:
-        row = exact.iloc[-1]
-        return float(row["f1_odds"]), float(row["f2_odds"])
+        return _odds_match_from_row(exact.iloc[-1], swapped=False)
 
     swapped = odds_table[
         (odds_table["date"].dt.normalize() == dt)
@@ -1021,8 +1322,7 @@ def _lookup_odds_for_fight(
         & (odds_table["fighter2"] == f1)
     ]
     if not swapped.empty:
-        row = swapped.iloc[-1]
-        return float(row["f2_odds"]), float(row["f1_odds"])
+        return _odds_match_from_row(swapped.iloc[-1], swapped=True)
 
     if ev_norm:
         event_rows = odds_table[
@@ -1033,17 +1333,17 @@ def _lookup_odds_for_fight(
             if _fighters_same_person(f1, row["fighter1"]) and _fighters_same_person(
                 f2, row["fighter2"]
             ):
-                return float(row["f1_odds"]), float(row["f2_odds"])
+                return _odds_match_from_row(row, swapped=False)
             if _fighters_same_person(f1, row["fighter2"]) and _fighters_same_person(
                 f2, row["fighter1"]
             ):
-                return float(row["f2_odds"]), float(row["f1_odds"])
+                return _odds_match_from_row(row, swapped=True)
 
     for _, row in odds_table[odds_table["date"].dt.normalize() == dt].iterrows():
         if _fighters_same_person(f1, row["fighter1"]) and _fighters_same_person(f2, row["fighter2"]):
-            return float(row["f1_odds"]), float(row["f2_odds"])
+            return _odds_match_from_row(row, swapped=False)
         if _fighters_same_person(f1, row["fighter2"]) and _fighters_same_person(f2, row["fighter1"]):
-            return float(row["f2_odds"]), float(row["f1_odds"])
+            return _odds_match_from_row(row, swapped=True)
 
     return None
 
@@ -1052,16 +1352,18 @@ def merge_historical_odds(fights: pd.DataFrame) -> pd.DataFrame:
     """
     Left-join historical odds on event_date + fighter names (fuzzy fallback).
 
-    Unmatched fights keep NaN ``f1_odds`` / ``f2_odds``; no rows are dropped.
+    Writes unlabeled ``f1_odds`` / ``f2_odds`` for backward compatibility, plus
+    opening/closing provenance when available. Unlabeled sources become closing
+    prices only — opening columns stay empty unless a pre-fight observation
+    timestamp exists. Unmatched fights keep NaN odds; no rows are dropped.
     """
     if fights.empty:
         return fights
 
     out = fights.copy()
-    if "f1_odds" not in out.columns:
-        out["f1_odds"] = np.nan
-    if "f2_odds" not in out.columns:
-        out["f2_odds"] = np.nan
+    for col in ("f1_odds", "f2_odds", *_ODDS_PROVENANCE_COLUMNS):
+        if col not in out.columns:
+            out[col] = np.nan if col != "opening_odds_observed_at" else pd.NA
 
     odds_table = build_unified_odds_table()
     if odds_table.empty:
@@ -1070,10 +1372,14 @@ def merge_historical_odds(fights: pd.DataFrame) -> pd.DataFrame:
 
     out["date"] = pd.to_datetime(out["date"], errors="coerce")
     filled = 0
+    opened = 0
     for idx, row in out.iterrows():
-        if pd.notna(row.get("f1_odds")) and pd.notna(row.get("f2_odds")):
-            if _odds_pair_valid(row["f1_odds"], row["f2_odds"]):
-                continue
+        already_priced = _odds_pair_valid(row.get("f1_odds"), row.get("f2_odds"))
+        already_open = _odds_pair_valid(row.get("f1_opening_odds"), row.get("f2_opening_odds")) and bool(
+            _coerce_observation_timestamp(row.get("opening_odds_observed_at"))
+        )
+        if already_priced and already_open:
+            continue
         if pd.isna(row.get("date")):
             continue
 
@@ -1086,13 +1392,32 @@ def merge_historical_odds(fights: pd.DataFrame) -> pd.DataFrame:
         )
         if matched is None:
             continue
-        out.at[idx, "f1_odds"] = matched[0]
-        out.at[idx, "f2_odds"] = matched[1]
-        filled += 1
+
+        if not already_priced:
+            out.at[idx, "f1_odds"] = matched["f1_odds"]
+            out.at[idx, "f2_odds"] = matched["f2_odds"]
+            filled += 1
+
+        if not already_open and _odds_pair_valid(
+            matched.get("f1_opening_odds"), matched.get("f2_opening_odds")
+        ):
+            open_at = _coerce_observation_timestamp(matched.get("opening_odds_observed_at"))
+            if open_at is not None:
+                out.at[idx, "f1_opening_odds"] = matched["f1_opening_odds"]
+                out.at[idx, "f2_opening_odds"] = matched["f2_opening_odds"]
+                out.at[idx, "opening_odds_observed_at"] = open_at
+                opened += 1
+
+        if not _odds_pair_valid(row.get("f1_closing_odds"), row.get("f2_closing_odds")) and _odds_pair_valid(
+            matched.get("f1_closing_odds"), matched.get("f2_closing_odds")
+        ):
+            out.at[idx, "f1_closing_odds"] = matched["f1_closing_odds"]
+            out.at[idx, "f2_closing_odds"] = matched["f2_closing_odds"]
 
     logger.info(
-        "Odds merge: filled %s fights; %s/%s have odds",
+        "Odds merge: filled %s fights (%s with opening stamps); %s/%s have odds",
         filled,
+        opened,
         int(out["f1_odds"].notna().sum()),
         len(out),
     )

@@ -49,11 +49,12 @@ def _normalize_odds_frame(df: pd.DataFrame, *, bookmaker: str) -> pd.DataFrame:
     usable = out[(out["f1_odds"] > 1.0) & (out["f2_odds"] > 1.0)].copy()
     if usable.empty:
         return pd.DataFrame()
+    # Fill only a missing identity. Never relabel another source as the requested book.
     if "bookmaker" not in usable.columns or usable["bookmaker"].isna().all():
         usable["bookmaker"] = bookmaker
     if "bookmaker_count" not in usable.columns:
         usable["bookmaker_count"] = 1
-    if "odds_source" not in usable.columns:
+    if "odds_source" not in usable.columns or usable["odds_source"].isna().all():
         usable["odds_source"] = bookmaker
     return usable.reset_index(drop=True)
 
@@ -77,15 +78,21 @@ def _try_fetch(
     try:
         raw = fn(force_refresh=force_refresh)
     except Exception as exc:
-        logger.info("Odds source %s failed: %s", label, exc)
-        return pd.DataFrame(), str(exc)
+        from src.safe_io import redact_secrets
+
+        safe = redact_secrets(str(exc))
+        logger.info("Odds source %s failed: %s", label, safe)
+        return pd.DataFrame(), safe
     norm = _normalize_odds_frame(raw, bookmaker=label)
     if norm.empty:
         return pd.DataFrame(), f"{label}: no usable lines"
     if "odds_source" not in norm.columns:
         norm["odds_source"] = label
     else:
-        norm["odds_source"] = norm["odds_source"].fillna(label)
+        norm["odds_source"] = norm["odds_source"].where(
+            norm["odds_source"].notna() & (norm["odds_source"].astype(str).str.strip() != ""),
+            label,
+        )
     return norm, None
 
 
@@ -119,7 +126,9 @@ def fetch_book_scraper_odds(
             if not _skip_label("BetNow.eu"):
                 chain.append(("BetNow.eu", fetch_betnow_odds))
         except Exception as exc:
-            logger.debug("BetNow import failed: %s", exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug("BetNow import failed: %s", redact_secrets(str(exc)))
     if getattr(config, "MYBOOKIE_ENABLED", False):
         try:
             from src.odds_providers.mybookie_scraper import fetch_mybookie_odds
@@ -127,7 +136,9 @@ def fetch_book_scraper_odds(
             if not _skip_label("MyBookie"):
                 chain.append(("MyBookie", fetch_mybookie_odds))
         except Exception as exc:
-            logger.debug("MyBookie import failed: %s", exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug("MyBookie import failed: %s", redact_secrets(str(exc)))
 
     if not chain:
         LAST_ODDS_META.clear()
@@ -217,7 +228,9 @@ def fetch_best_available_odds(
                 )
                 return df, meta
             if err:
-                errors.append(err)
+                from src.safe_io import redact_secrets
+
+                errors.append(redact_secrets(err))
                 low = err.lower()
                 if "401" in low or "unauthorized" in low:
                     logger.warning(
@@ -225,8 +238,11 @@ def fetch_best_available_odds(
                     )
                     skip.add("draftkings")
         except Exception as exc:
-            errors.append(str(exc))
-            low = str(exc).lower()
+            from src.safe_io import redact_secrets
+
+            raw = str(exc)
+            errors.append(redact_secrets(raw))
+            low = raw.lower()
             if "401" in low or "unauthorized" in low or "missing odds api" in low:
                 skip.add("draftkings")
 
@@ -255,9 +271,13 @@ def fetch_best_available_odds(
                 )
                 return df, meta
             if err:
-                errors.append(err)
+                from src.safe_io import redact_secrets
+
+                errors.append(redact_secrets(err))
         except Exception as exc:
-            errors.append(str(exc))
+            from src.safe_io import redact_secrets
+
+            errors.append(redact_secrets(str(exc)))
 
     # 3) DraftKings (optional — off by default; shares Odds API quota when used)
     if getattr(config, "DRAFTKINGS_ENABLED", False) and _want("draftkings"):
@@ -293,9 +313,13 @@ def fetch_best_available_odds(
                 logger.info("Odds fallback: using %s (%s rows)", src, len(df))
                 return df, meta
             if err:
-                errors.append(err)
+                from src.safe_io import redact_secrets
+
+                errors.append(redact_secrets(err))
         except Exception as exc:
-            errors.append(str(exc))
+            from src.safe_io import redact_secrets
+
+            errors.append(redact_secrets(str(exc)))
 
     # 4) Optional book scrapers (BetNow / MyBookie — off by default)
     scraped = fetch_book_scraper_odds(

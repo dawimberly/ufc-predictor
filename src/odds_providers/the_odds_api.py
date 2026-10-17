@@ -140,8 +140,8 @@ def _pick_best_totals_price(
     *,
     side: str,
     point: float = 1.5,
-) -> tuple[float, str] | None:
-    """Median decimal price across books for Over/Under at point; return (dec, book)."""
+) -> dict[str, Any] | None:
+    """One book's price, or a median marked consensus when several books quote it."""
     prices: list[tuple[float, str]] = []
     for book_title, outcomes in outcomes_by_book:
         for outcome in outcomes:
@@ -160,9 +160,22 @@ def _pick_best_totals_price(
                 prices.append((dec, book_title))
     if not prices:
         return None
+    if len(prices) == 1:
+        dec, book = prices[0]
+        return {
+            "decimal_odds": dec,
+            "bookmaker": book,
+            "bookmaker_count": 1,
+            "price_kind": "book",
+        }
     prices.sort(key=lambda x: x[0])
     mid = prices[len(prices) // 2]
-    return mid
+    return {
+        "decimal_odds": mid[0],
+        "bookmaker": "consensus",
+        "bookmaker_count": len(prices),
+        "price_kind": "consensus",
+    }
 
 
 # Odds API totals point → internal prop_key (+ display selection).
@@ -245,7 +258,9 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
     except Exception as exc:
         LAST_ERROR = odds_api_fail_closed_message(detail=str(exc))
         LAST_WARNING = LAST_ERROR
-        logger.warning("Odds API prop events failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("Odds API prop events failed: %s", redact_secrets(str(exc)))
         return empty_prop_odds_df()
 
     if events_resp.status_code == 401:
@@ -262,7 +277,9 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
     except requests.RequestException as exc:
         LAST_ERROR = odds_api_fail_closed_message(detail=str(exc))
         LAST_WARNING = LAST_ERROR
-        logger.warning("Odds API prop events failed: %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning("Odds API prop events failed: %s", redact_secrets(str(exc)))
         return empty_prop_odds_df()
     except json.JSONDecodeError:
         LAST_WARNING = "Odds API prop events returned invalid JSON"
@@ -319,7 +336,14 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
             resp.raise_for_status()
             payload = resp.json()
         except requests.RequestException as exc:
-            logger.debug("Odds API props skipped for %s vs %s: %s", home, away, exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug(
+                "Odds API props skipped for %s vs %s: %s",
+                home,
+                away,
+                redact_secrets(str(exc)),
+            )
             continue
 
         outcomes_by_book: list[tuple[str, list[dict[str, Any]]]] = []
@@ -346,7 +370,9 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
                 )
                 if priced is None:
                     continue
-                dec, book_title = priced
+                dec = float(priced["decimal_odds"])
+                from datetime import datetime, timezone
+
                 rows.append(
                     prop_row(
                         fighter_1=home,
@@ -354,27 +380,17 @@ def fetch_the_odds_api_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame
                         prop_key=prop_key,
                         selection=selection,
                         decimal_odds=dec,
-                        bookmaker=book_title or BOOK_NAME,
+                        bookmaker=str(priced["bookmaker"] or ""),
                         odds_source=ODDS_SOURCE,
                         market_key="totals",
                         point=float(point),
+                        event_id=str(event_id),
+                        commence_time=event.get("commence_time"),
+                        quote_timestamp=datetime.now(timezone.utc).isoformat(),
+                        price_kind=str(priced["price_kind"]),
+                        bookmaker_count=int(priced["bookmaker_count"]),
                     )
                 )
-                # Alias: Under 1.5 == Round 1 finish for scrapers / older keys
-                if prop_key == "under_1_5_rounds":
-                    rows.append(
-                        prop_row(
-                            fighter_1=home,
-                            fighter_2=away,
-                            prop_key="round_1_finish",
-                            selection="Under 1.5 / R1 Finish",
-                            decimal_odds=dec,
-                            bookmaker=book_title or BOOK_NAME,
-                            odds_source=ODDS_SOURCE,
-                            market_key="totals",
-                            point=float(point),
-                        )
-                    )
 
     if not rows:
         LAST_WARNING = "Odds API returned no totals prop markets for mapped round lines"

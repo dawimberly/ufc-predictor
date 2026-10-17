@@ -582,6 +582,7 @@ examples:
   python main.py --watch --alerts --discord --telegram --dry-run
   python main.py --backtest
   python main.py --backtest-2025
+  python main.py --backtest-2025 --walk-forward
   python main.py --refresh-data --train --backtest
   python main.py --refresh-data --enrich-ufcstats --train --backtest-2025
   python -m main replay --event "UFC 329"
@@ -648,7 +649,20 @@ examples:
     parser.add_argument(
         "--backtest-2025",
         action="store_true",
-        help="Run 2025 event walk-forward backtest (train up to event N-1, predict event N).",
+        help=(
+            "Run year-scoped event backtest. Default evaluation_mode=frozen_model "
+            "(production weights). Pass --walk-forward for walk_forward_simplified "
+            "(small past-only LightGBM — not the production ensemble)."
+        ),
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help=(
+            "With --backtest-2025: walk_forward_simplified — imputer + small LightGBM "
+            "+ optional isotonic on fights strictly before each event. Not production "
+            "ensemble training. Default without this flag is frozen_model."
+        ),
     )
     parser.add_argument(
         "--dynamic-thresholds",
@@ -737,6 +751,17 @@ def main(argv: list[str] | None = None) -> int:
         from src.replay import run_replay_cli
 
         return run_replay_cli(argv[1:])
+
+    # Subcommands: python main.py start-live-session --bankroll 1000
+    #              python main.py record-bankroll --bankroll 985
+    if argv and argv[0] == "start-live-session":
+        from src.circuit_breaker import start_live_session_cli
+
+        return start_live_session_cli(argv[1:])
+    if argv and argv[0] == "record-bankroll":
+        from src.circuit_breaker import record_bankroll_cli
+
+        return record_bankroll_cli(argv[1:])
 
     # Subcommand: python -m main backtest --strategy high-accuracy --bankroll 100 --last-year
     if argv and argv[0] == "backtest":
@@ -845,11 +870,23 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit("No trained model. Run with --train first.")
 
         try:
+            if args.walk_forward:
+                logger.info(
+                    "evaluation_mode=walk_forward_simplified — "
+                    "simplified_lgbm_isotonic on earlier fights "
+                    "(not production ensemble / discovery)"
+                )
+            else:
+                logger.info(
+                    "evaluation_mode=frozen_model — production weights "
+                    "(pass --walk-forward for walk_forward_simplified)"
+                )
             result = backtest_2025(
                 features,
                 use_dynamic_thresholds=args.dynamic_thresholds,
                 compare_threshold_modes=True,
                 profile=config.UFC_PROFILE,
+                walk_forward=bool(args.walk_forward),
             )
             print_backtest_2025_summary(result)
         except ValueError as exc:
@@ -1124,7 +1161,13 @@ def run_cli(
             from src.circuit_breaker import check_alerts_allowed
             from src.risk_manager import check_bankroll_safety
 
-            bankroll = float(combined_alerts.get("bankroll") or config.INITIAL_BANKROLL)
+            # Live reads today's recorded bankroll inside the gates; a configured
+            # number must not stand in for it.
+            bankroll = (
+                None
+                if config.is_live_profile()
+                else float(combined_alerts.get("bankroll") or config.INITIAL_BANKROLL)
+            )
             allowed, reason = check_alerts_allowed(bankroll)
             if allowed:
                 allowed, reason = check_bankroll_safety(bankroll)
