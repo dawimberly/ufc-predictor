@@ -30,6 +30,9 @@ def _synthetic_predictions(n: int = 40) -> pd.DataFrame:
                 "event_date": pd.Timestamp("2025-01-01") + pd.Timedelta(days=(i // 5) * 14),
                 "prob_f1_win": p1,
                 "prob_f2_win": 1.0 - p1,
+                # Strict as-of requires labeled opening prices.
+                "f1_opening_odds": f1_odds,
+                "f2_opening_odds": f2_odds,
                 "f1_odds": f1_odds,
                 "f2_odds": f2_odds,
                 "f1_win": int(rng.random() < p1),

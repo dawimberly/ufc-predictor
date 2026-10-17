@@ -193,8 +193,11 @@ python scripts/upset_autopsy_backtest.py
 python -m src.cli_entry --next-two --odds
 python main.py --preflight
 python main.py --watch --auto-odds --dry-run
-python main.py --backtest-2025
+python main.py --backtest-2025                 # frozen_model (default)
+python main.py --backtest-2025 --walk-forward  # true walk-forward
 ```
+
+`--backtest-2025` defaults to **frozen_model** (production weights; may have seen scored fights). Pass `--walk-forward` to refit preprocessing / model / calibration on earlier fights only. Strict as-of betting uses **opening** prices only.
 
 `launch_predict.bat` wraps the CLI (`--next-two --odds`).
 

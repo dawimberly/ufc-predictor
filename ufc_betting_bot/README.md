@@ -13,7 +13,7 @@ ufc_betting_bot/
 │   ├── bankroll.py         # Fractional Kelly + daily loss limit
 │   └── model_bridge.py     # Adapter to ufc-predictor
 ├── backtester/
-│   └── backtest_2025.py    # Event walk-forward backtest
+│   └── backtest_2025.py    # Year-scoped event backtest (frozen or walk-forward)
 ├── live_runner/runner.py   # Dry-run signal generation
 ├── dashboard/app.py        # Streamlit UI
 └── main.py                 # CLI
@@ -26,8 +26,10 @@ cd ufc_betting_bot
 pip install -r requirements.txt
 cp .env.example .env
 
-# Merge odds into ufc-predictor fights + run 2025 backtest
+# Merge odds + run 2025 backtest (default: frozen_model)
 python main.py --backtest-2025 --refresh-odds
+# True walk-forward (refit on earlier fights only):
+python main.py --backtest-2025 --walk-forward
 
 # Dashboard
 streamlit run dashboard/app.py
@@ -45,19 +47,16 @@ streamlit run dashboard/app.py
 
 Bets are skipped when odds are missing, edge is below threshold, or the daily loss limit is hit.
 
-## Current performance (2025 walk-forward backtest)
+## Evaluation modes
 
-Last run on **2025 UFC events** (362 fights scored, 42 events):
+| Mode | Flag | Meaning |
+|------|------|---------|
+| **frozen_model** | default `--backtest-2025` | Scores the production artifact. Weights may have seen the fights being scored. |
+| **walk_forward** | `--backtest-2025 --walk-forward` | Refits preprocessing, model, and calibration on fights **strictly before** each event. |
 
-| Metric | Value |
-|--------|-------|
-| Model accuracy | 43.4% |
-| ROC AUC | 0.543 |
-| Fights with closing odds | 329 / 362 |
-| Flat-stake ROI (edge ≥ 5%, legacy) | +76.8% on $1k |
-| **Fractional Kelly** (2% cap, 5% min edge) | **+139.8% ROI**, 266 trades, 44.4% hit rate on $1k |
+Strict as-of pricing uses **opening** quotes only. Closing-only and unlabeled (`f1_odds` without an opening/closing label) prices are excluded from selection, sizing, and settlement.
 
-> **Caveat:** High flat-stake ROI reflects many small-edge bets with uncapped stakes. The betting bot uses capped fractional Kelly and daily stop-loss for live use. Model calibration still needs work before real money.
+Profitability / ROI figures from older runs that mixed closing or unlabeled odds are **paused** until re-run under these rules.
 
 Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical lines, joined on event + date + fighter names.
 
@@ -65,15 +64,16 @@ Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical li
 
 ```bash
 python main.py merge-odds              # Merge odds into ufc-predictor/data/raw/fights.csv
-python main.py backtest-2025           # Walk-forward backtest
+python main.py backtest-2025           # frozen_model (default)
+python main.py backtest-2025 --walk-forward   # true walk-forward
 python main.py backtest-2025 --year 2024
 python main.py live                    # Dry-run signals for next card
 ```
 
 ## Next milestones
 
-1. **Calibration** — isotonic / conformal adjustment before edge calc (reduce overconfidence)
-2. **Closing vs open odds** — separate backtest modes; avoid training on closing line if claiming early predictions
+1. **Calibration** — keep WF isotonic / conformal on past-only holdouts; tighten live edge calc
+2. **Opening-line coverage** — persist opening vs closing columns in the odds merge (strict as-of already refuses unlabeled)
 3. **Live execution** — DraftKings / Odds API polling + bet slip export (no auto-bet yet)
 4. **Per-bookmaker line shop** — best available price instead of averaged odds
 5. **Alerting** — Telegram/discord when edge > threshold on upcoming main events

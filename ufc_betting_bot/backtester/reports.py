@@ -13,8 +13,14 @@ logger = logging.getLogger(__name__)
 
 def print_backtest_summary(result) -> None:
     m = result.overall_metrics
+    mode = str(getattr(result, "evaluation_mode", "") or "frozen_model")
+    if mode == "walk_forward":
+        mode_label = "walk_forward (refit on earlier fights only)"
+    else:
+        mode_label = "frozen_model (production weights; may have seen scored fights)"
     print(f"\n  UFC BETTING BOT — BACKTEST {result.target_year}")
     print("  " + "=" * 72)
+    print(f"  Evaluation mode  {mode_label}")
     print(f"  Fights scored     {int(m.get('n_fights', 0))}")
     print(f"  Events            {len(result.per_event)}")
     print(f"  Accuracy          {m.get('accuracy', 0):.1%}")
@@ -22,6 +28,10 @@ def print_backtest_summary(result) -> None:
     print(f"  Brier score       {m.get('brier_score', 0):.3f}")
     print(f"  ROC AUC           {m.get('roc_auc', float('nan')):.3f}")
     print(f"  Fights w/ odds    {result.fights_with_odds}")
+    print(
+        "  As-of prices      opening only "
+        "(closing-only / unproven quotes excluded from sizing)"
+    )
 
     print("\n  SEGMENT ACCURACY")
     print("  " + "-" * 40)

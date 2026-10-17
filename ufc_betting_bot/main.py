@@ -52,7 +52,15 @@ def cmd_backtest_2025(args: argparse.Namespace) -> int:
         fights = load_fights()
         rebuild_features(fights)
 
-    result = backtest_2025(target_year=args.year)
+    walk_forward = bool(getattr(args, "walk_forward", False))
+    if walk_forward:
+        print("evaluation_mode=walk_forward (refit on earlier fights only)")
+    else:
+        print(
+            "evaluation_mode=frozen_model (production weights; "
+            "pass --walk-forward for true walk-forward)"
+        )
+    result = backtest_2025(target_year=args.year, walk_forward=walk_forward)
     print_backtest_summary(result)
     return 0
 
@@ -73,9 +81,17 @@ def build_parser() -> argparse.ArgumentParser:
     merge = sub.add_parser("merge-odds", help="Merge historical odds into ufc-predictor fights.csv")
     merge.set_defaults(func=cmd_merge_odds)
 
-    bt = sub.add_parser("backtest-2025", help="Run event walk-forward backtest")
+    bt = sub.add_parser(
+        "backtest-2025",
+        help="Run year-scoped event backtest (default: frozen_model)",
+    )
     bt.add_argument("--year", type=int, default=get_settings().backtest_year)
     bt.add_argument("--refresh-odds", action="store_true", help="Merge odds + rebuild features first")
+    bt.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="Refit preprocess/model/calibration on earlier fights only (true walk-forward)",
+    )
     bt.set_defaults(func=cmd_backtest_2025)
 
     live = sub.add_parser("live", help="Generate live bet signals (dry-run by default)")
@@ -85,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Shortcuts
     p.add_argument("--merge-odds", action="store_true")
     p.add_argument("--backtest-2025", action="store_true")
+    p.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help="With --backtest-2025: true walk-forward (default is frozen_model)",
+    )
     p.add_argument("--refresh-odds", action="store_true")
     p.add_argument("--year", type=int, default=get_settings().backtest_year)
     return p

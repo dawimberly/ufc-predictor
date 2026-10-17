@@ -1,4 +1,10 @@
-"""Event walk-forward backtest with odds-aware edge and bankroll rules."""
+"""Year-scoped event backtest with strict as-of prices and bankroll rules.
+
+Default ``walk_forward=False`` scores a frozen production model
+(``evaluation_mode=frozen_model``). Pass ``walk_forward=True`` to refit
+preprocessing, the classifier, and calibration on fights strictly before each
+event (``evaluation_mode=walk_forward``).
+"""
 
 from __future__ import annotations
 
@@ -97,9 +103,11 @@ def walk_forward_events(
     fits a new model on rows dated strictly before the event.
     """
     from src.feature_engineering import apply_imputer, apply_interaction_specs, fit_imputer
-    from ufc_betting_bot.modules.edge import as_of_market_probs
+    from ufc_betting_bot.modules.edge import validated_as_of_price
 
-    interaction_specs = getattr(predictor, "interaction_specs", None) or []
+    # Frozen-model scoring may reuse production interaction specs. True walk-forward
+    # must not: those specs may have been selected with knowledge of later fights.
+    frozen_interaction_specs = getattr(predictor, "interaction_specs", None) or []
 
     df = _attach_event_names(features)
     df[DATE_COLUMN] = pd.to_datetime(df[DATE_COLUMN], errors="coerce")
@@ -130,35 +138,39 @@ def walk_forward_events(
         if train.empty or test.empty:
             continue
 
-        if interaction_specs:
-            train = apply_interaction_specs(train, interaction_specs)
-            test = apply_interaction_specs(test, interaction_specs)
+        if not refit_model and frozen_interaction_specs:
+            train = apply_interaction_specs(train, frozen_interaction_specs)
+            test = apply_interaction_specs(test, frozen_interaction_specs)
+
+        fold_cols = [c for c in feature_cols if c in train.columns and c in test.columns]
+        if not fold_cols:
+            continue
 
         if refit_model:
             if trainer is None and len(train) < min_train_rows:
                 continue
             fit_model = trainer or _fit_past_only_model
-            model = fit_model(train, feature_cols)
+            model = fit_model(train, fold_cols)
             prepared = test
             if trainer is None:
+                # Imputer + model already fitted inside _fit_past_only_model on
+                # past rows only; re-fit imputer here for the score-time transform.
                 imputer = fit_imputer(train)
-                prepared = apply_imputer(test, imputer).dropna(subset=feature_cols)
+                prepared = apply_imputer(test, imputer).dropna(subset=fold_cols)
             if prepared.empty:
                 continue
-            proba = model.predict_proba(prepared[feature_cols])[:, 1]
+            proba = model.predict_proba(prepared[fold_cols])[:, 1]
         else:
-            if not feature_cols:
-                continue
             imputer = fit_imputer(train)
-            prepared = apply_imputer(test, imputer).dropna(subset=feature_cols)
+            prepared = apply_imputer(test, imputer).dropna(subset=fold_cols)
             if prepared.empty:
                 continue
-            proba = predictor.model.predict_proba(prepared[feature_cols])[:, 1]
+            proba = predictor.model.predict_proba(prepared[fold_cols])[:, 1]
 
         for i, (_, row) in enumerate(prepared.iterrows()):
             actual = int(row[TARGET_COLUMN])
             p1 = float(proba[i])
-            market, odds_timing = as_of_market_probs(row)
+            price, odds_timing = validated_as_of_price(row)
             record = row.to_dict()
             record["prob_f1_win"] = p1
             record["prob_f2_win"] = 1.0 - p1
@@ -169,15 +181,18 @@ def walk_forward_events(
             record["evaluation_mode"] = mode
             record["odds_timing"] = odds_timing
 
-            if market:
-                m1, m2 = market
-                edges = compute_edge(p1, 1.0 - p1, m1, m2)
-                record["implied_prob_f1"] = m1
-                record["implied_prob_f2"] = m2
+            if price is not None:
+                edges = compute_edge(p1, 1.0 - p1, price.market_p1, price.market_p2)
+                record["implied_prob_f1"] = price.market_p1
+                record["implied_prob_f2"] = price.market_p2
+                record["as_of_decimal_f1"] = price.decimal_f1
+                record["as_of_decimal_f2"] = price.decimal_f2
                 record.update(edges)
             else:
                 record["implied_prob_f1"] = np.nan
                 record["implied_prob_f2"] = np.nan
+                record["as_of_decimal_f1"] = np.nan
+                record["as_of_decimal_f2"] = np.nan
                 record["edge_f1"] = np.nan
                 record["edge_f2"] = np.nan
                 record["best_edge"] = np.nan
@@ -189,17 +204,44 @@ def walk_forward_events(
 
 
 def _fit_past_only_model(train: pd.DataFrame, feature_cols: list[str]):
-    """Fit one classifier on rows the caller already limited to the past."""
+    """Fit imputer, optional calibration, and classifier on past-only rows.
+
+    Feature selection is limited to columns present on the past slice. No
+    frozen production interaction specs are applied here.
+    """
     from lightgbm import LGBMClassifier
 
     from src.feature_engineering import apply_imputer, fit_imputer
 
     cols = [col for col in feature_cols if col in train.columns]
-    work = train.dropna(subset=[TARGET_COLUMN])
+    work = train.dropna(subset=[TARGET_COLUMN]).copy()
+    if work.empty or not cols:
+        raise ValueError("Walk-forward train slice has no usable rows")
+
+    # Chronological order so a calibration holdout is strictly earlier than test.
+    if DATE_COLUMN in work.columns:
+        work = work.sort_values(DATE_COLUMN)
+
     imputer = fit_imputer(work)
     prepared = apply_imputer(work, imputer).dropna(subset=cols + [TARGET_COLUMN])
     if prepared.empty or not cols:
         raise ValueError("Walk-forward train slice has no usable rows")
+
+    y = prepared[TARGET_COLUMN].astype(int)
+    X = prepared[cols]
+    cal_n = 0
+    if len(prepared) >= 40:
+        cal_n = max(8, min(int(len(prepared) * 0.15), len(prepared) // 5))
+        if len(prepared) - cal_n < 12:
+            cal_n = 0
+
+    if cal_n:
+        X_fit, y_fit = X.iloc[:-cal_n], y.iloc[:-cal_n]
+        X_cal, y_cal = X.iloc[-cal_n:], y.iloc[-cal_n:]
+    else:
+        X_fit, y_fit = X, y
+        X_cal = y_cal = None
+
     model = LGBMClassifier(
         n_estimators=40,
         num_leaves=8,
@@ -207,7 +249,17 @@ def _fit_past_only_model(train: pd.DataFrame, feature_cols: list[str]):
         verbose=-1,
         random_state=42,
     )
-    model.fit(prepared[cols], prepared[TARGET_COLUMN].astype(int))
+    model.fit(X_fit, y_fit)
+
+    if X_cal is not None and len(X_cal) >= 8:
+        try:
+            from sklearn.calibration import CalibratedClassifierCV
+
+            calibrated = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+            calibrated.fit(X_cal, y_cal)
+            return calibrated
+        except Exception:
+            pass
     return model
 
 

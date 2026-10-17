@@ -582,6 +582,7 @@ examples:
   python main.py --watch --alerts --discord --telegram --dry-run
   python main.py --backtest
   python main.py --backtest-2025
+  python main.py --backtest-2025 --walk-forward
   python main.py --refresh-data --train --backtest
   python main.py --refresh-data --enrich-ufcstats --train --backtest-2025
   python -m main replay --event "UFC 329"
@@ -648,7 +649,18 @@ examples:
     parser.add_argument(
         "--backtest-2025",
         action="store_true",
-        help="Run 2025 event walk-forward backtest (train up to event N-1, predict event N).",
+        help=(
+            "Run year-scoped event backtest. Default evaluation_mode=frozen_model "
+            "(production weights). Pass --walk-forward to refit on earlier fights only."
+        ),
+    )
+    parser.add_argument(
+        "--walk-forward",
+        action="store_true",
+        help=(
+            "With --backtest-2025: true walk-forward (preprocess / fit / calibrate on "
+            "fights strictly before each event). Without this flag the run is frozen_model."
+        ),
     )
     parser.add_argument(
         "--dynamic-thresholds",
@@ -856,11 +868,21 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit("No trained model. Run with --train first.")
 
         try:
+            if args.walk_forward:
+                logger.info(
+                    "evaluation_mode=walk_forward — refitting on earlier fights only"
+                )
+            else:
+                logger.info(
+                    "evaluation_mode=frozen_model — production weights "
+                    "(not a true walk-forward; pass --walk-forward to refit)"
+                )
             result = backtest_2025(
                 features,
                 use_dynamic_thresholds=args.dynamic_thresholds,
                 compare_threshold_modes=True,
                 profile=config.UFC_PROFILE,
+                walk_forward=bool(args.walk_forward),
             )
             print_backtest_2025_summary(result)
         except ValueError as exc:
