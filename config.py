@@ -564,6 +564,8 @@ PREDICTION_BANK_AUTO_LOG = env_bool("PREDICTION_BANK_AUTO_LOG", "true")
 NARRATIVE_TILT_LOG = LOG_DIR / "narrative_tilts.jsonl"
 HEARTBEAT_PATH = CACHE_DIR / "heartbeat.json"
 CIRCUIT_BREAKER_STATE_PATH = CACHE_DIR / "circuit_breaker_state.json"
+# Live stakes need a recorded current bankroll no older than this.
+LIVE_BANKROLL_MAX_AGE_MINUTES = float(os.getenv("LIVE_BANKROLL_MAX_AGE_MINUTES", "120"))
 DRAWDOWN_STATE_PATH = CACHE_DIR / "drawdown_state.json"
 RISK_EVENTS_LOG = LOG_DIR / "risk_events.log"
 

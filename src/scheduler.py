@@ -92,7 +92,8 @@ def watch_cycle(
     if preds is None:
         preds, event_name = run_prediction_cycle(explain=explain)
 
-    bankroll = bankroll or config.INITIAL_BANKROLL
+    if not config.is_live_profile():
+        bankroll = bankroll or config.INITIAL_BANKROLL
     allowed, block_reason = check_bankroll_safety(bankroll)
     if not allowed:
         alert_data = {
@@ -157,7 +158,8 @@ def watch_loop(
     card_poll = card_check_minutes or config.WATCH_CARD_CHECK_MINUTES
     odds_poll = odds_refresh_minutes or config.WATCH_AUTO_ODDS_MINUTES
     poll = poll_minutes or (odds_poll if auto_odds else config.ALERT_POLL_MINUTES)
-    bankroll = bankroll or config.INITIAL_BANKROLL
+    if not config.is_live_profile():
+        bankroll = bankroll or config.INITIAL_BANKROLL
     log_event(
         "watch_start",
         profile=config.UFC_PROFILE,

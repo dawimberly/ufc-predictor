@@ -307,6 +307,9 @@ def odds_api_fail_closed_message(
     detail: str = "",
 ) -> str:
     """Build fail-closed UI text including key/request diagnostics (never the key)."""
+    from src.safe_io import redact_secrets
+
+    detail = redact_secrets(detail)
     key_loaded = "yes" if LAST_REQUEST_META.get("key_loaded") else "no"
     key_len = int(LAST_REQUEST_META.get("key_length") or 0)
     last4 = str(LAST_REQUEST_META.get("key_last4") or "") or "-"
@@ -413,13 +416,21 @@ def odds_api_get(
     )
 
     session = _fresh_session()
-    resp = session.get(
-        url,
-        params=params,
-        timeout=timeout
-        if timeout is not None
-        else float(getattr(config, "REQUEST_TIMEOUT_SEC", 30)),
-    )
+    try:
+        resp = session.get(
+            url,
+            params=params,
+            timeout=timeout
+            if timeout is not None
+            else float(getattr(config, "REQUEST_TIMEOUT_SEC", 30)),
+        )
+    except requests.RequestException as exc:
+        from src.safe_io import redact_secrets
+
+        cleaned = redact_secrets(str(exc))
+        if cleaned != str(exc):
+            exc.args = (cleaned,)
+        raise
     LAST_REQUEST_META["status_code"] = resp.status_code
     LAST_REQUEST_META["requests_remaining"] = resp.headers.get("x-requests-remaining")
     LAST_REQUEST_META["requests_used"] = resp.headers.get("x-requests-used")

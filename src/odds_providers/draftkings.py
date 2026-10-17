@@ -13,7 +13,7 @@ import requests
 
 import config
 from src.data_loader import ensure_data_dirs
-from src.predictor import OddsAPIError, _implied_probs, _names_match, _to_decimal_odds
+from src.predictor import OddsAPIError, _implied_probs, _to_decimal_odds
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +97,13 @@ def _fallback_odds(*, force_refresh: bool, reason: str) -> pd.DataFrame:
         logger.warning(LAST_WARNING)
         return consensus
     except Exception as api_exc:
-        logger.warning("%s Consensus fallback failed: %s", DK_UNAVAILABLE_MSG, api_exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning(
+            "%s Consensus fallback failed: %s",
+            DK_UNAVAILABLE_MSG,
+            redact_secrets(str(api_exc)),
+        )
 
     # Odds API down (e.g. 401) → automatic BetNow / MyBookie scrapers
     try:
@@ -112,7 +118,12 @@ def _fallback_odds(*, force_refresh: bool, reason: str) -> pd.DataFrame:
             logger.warning(LAST_WARNING)
             return scraped
     except Exception as scrape_exc:
-        logger.warning("Book scraper fallback after DraftKings failed: %s", scrape_exc)
+        from src.safe_io import redact_secrets
+
+        logger.warning(
+            "Book scraper fallback after DraftKings failed: %s",
+            redact_secrets(str(scrape_exc)),
+        )
 
     LAST_WARNING = DK_UNAVAILABLE_MSG
     return pd.DataFrame()
@@ -135,6 +146,10 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
 
     if not config.ODDS_API_KEY:
         return _fallback_odds(force_refresh=force_refresh, reason="missing API key")
+
+    if force_refresh and bool(getattr(config, "ODDS_FETCH_ONCE", True)) and _cache_fresh(DK_CACHE_PATH):
+        logger.info("ODDS_FETCH_ONCE: reusing cached DraftKings odds (force_refresh ignored)")
+        force_refresh = False
 
     if not force_refresh and _cache_fresh(DK_CACHE_PATH):
         cached = _read_cache(DK_CACHE_PATH)
@@ -176,13 +191,19 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     except requests.HTTPError as exc:
         if _is_unauthorized(exc, response):
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
-        logger.warning("DraftKings odds HTTP error: %s", exc)
-        return _fallback_odds(force_refresh=False, reason=str(exc))
+        from src.safe_io import redact_secrets
+
+        safe_exc = redact_secrets(str(exc))
+        logger.warning("DraftKings odds HTTP error: %s", safe_exc)
+        return _fallback_odds(force_refresh=False, reason=safe_exc)
     except requests.RequestException as exc:
         if _is_unauthorized(exc, response):
             return _fallback_odds(force_refresh=False, reason="401 Unauthorized")
-        logger.warning("DraftKings odds request failed: %s", exc)
-        return _fallback_odds(force_refresh=False, reason=str(exc))
+        from src.safe_io import redact_secrets
+
+        safe_exc = redact_secrets(str(exc))
+        logger.warning("DraftKings odds request failed: %s", safe_exc)
+        return _fallback_odds(force_refresh=False, reason=safe_exc)
     except json.JSONDecodeError as exc:
         logger.warning("DraftKings odds returned invalid JSON: %s", exc)
         return _fallback_odds(force_refresh=False, reason="invalid JSON")
@@ -215,12 +236,16 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                         prices[name] = _to_decimal_odds(
                             float(price), config.ODDS_API_ODDS_FORMAT
                         )
-                f1_px = next((px for nm, px in prices.items() if _names_match(nm, home)), None)
-                f2_px = next((px for nm, px in prices.items() if _names_match(nm, away)), None)
+                from src.quote_integrity import price_for_selection
+
+                f1_px = price_for_selection(prices, home)
+                f2_px = price_for_selection(prices, away)
                 break
 
         if not f1_px or not f2_px or f1_px <= 1 or f2_px <= 1:
             continue
+
+        from datetime import datetime, timezone
 
         imp1, imp2 = _implied_probs(f1_px, f2_px)
         rows.append(
@@ -234,7 +259,10 @@ def fetch_draftkings_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                 "implied_prob_f1": imp1,
                 "implied_prob_f2": imp2,
                 "bookmaker": "DraftKings",
+                "odds_source": "DraftKings",
                 "bookmaker_count": 1,
+                "price_kind": "book",
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
 

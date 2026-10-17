@@ -738,6 +738,17 @@ def main(argv: list[str] | None = None) -> int:
 
         return run_replay_cli(argv[1:])
 
+    # Subcommands: python main.py start-live-session --bankroll 1000
+    #              python main.py record-bankroll --bankroll 985
+    if argv and argv[0] == "start-live-session":
+        from src.circuit_breaker import start_live_session_cli
+
+        return start_live_session_cli(argv[1:])
+    if argv and argv[0] == "record-bankroll":
+        from src.circuit_breaker import record_bankroll_cli
+
+        return record_bankroll_cli(argv[1:])
+
     # Subcommand: python -m main backtest --strategy high-accuracy --bankroll 100 --last-year
     if argv and argv[0] == "backtest":
         from src.ha_backtest import main as ha_backtest_main
@@ -1124,7 +1135,13 @@ def run_cli(
             from src.circuit_breaker import check_alerts_allowed
             from src.risk_manager import check_bankroll_safety
 
-            bankroll = float(combined_alerts.get("bankroll") or config.INITIAL_BANKROLL)
+            # Live reads today's recorded bankroll inside the gates; a configured
+            # number must not stand in for it.
+            bankroll = (
+                None
+                if config.is_live_profile()
+                else float(combined_alerts.get("bankroll") or config.INITIAL_BANKROLL)
+            )
             allowed, reason = check_alerts_allowed(bankroll)
             if allowed:
                 allowed, reason = check_bankroll_safety(bankroll)

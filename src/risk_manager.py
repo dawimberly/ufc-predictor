@@ -788,10 +788,26 @@ def get_drawdown_halt() -> DrawdownHalt:
     return _drawdown_halt
 
 
-def check_bankroll_safety(bankroll: float) -> tuple[bool, str]:
-    """Drawdown halt + delegates to circuit breaker."""
-    from src.circuit_breaker import check_alerts_allowed
+def check_bankroll_safety(bankroll: float | None) -> tuple[bool, str]:
+    """Drawdown halt + delegates to circuit breaker.
 
+    Live ignores ``bankroll`` and uses today's recorded bankroll for both the
+    daily-loss and drawdown checks; nothing recorded blocks.
+    """
+    from src.circuit_breaker import check_alerts_allowed, live_observed_bankroll
+
+    if config.is_live_profile():
+        allowed, reason = check_alerts_allowed(None, drawdown_halted=False)
+        if not allowed:
+            return False, reason
+        observed = live_observed_bankroll()
+        if observed is None:
+            return False, "current bankroll missing - live alerts blocked"
+        allowed, reason = get_drawdown_halt().check(observed.value)
+        return (True, "") if allowed else (False, reason)
+
+    if bankroll is None:
+        return check_alerts_allowed(None, drawdown_halted=False)
     halt = get_drawdown_halt()
     allowed, reason = halt.check(bankroll)
     if not allowed:

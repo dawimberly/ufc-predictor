@@ -15,6 +15,120 @@ from ufc_betting_bot.modules.edge import fight_decimal_odds, market_probs, raw_k
 logger = logging.getLogger(__name__)
 
 
+def _finite_float(value: Any) -> float | None:
+    try:
+        if value is None or pd.isna(value):
+            return None
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(out):
+        return None
+    return out
+
+
+def edge_for_predicted_pick(row: pd.Series | dict[str, Any]) -> tuple[float | None, str | None]:
+    """Edge that belongs to ``predicted_winner``.
+
+    ``best_edge`` is the larger of the two sides and must not be paired with
+    the model pick when that pick is the other fighter.
+    """
+    if not isinstance(row, pd.Series):
+        row = pd.Series(row)
+    pick = str(row.get("predicted_winner") or row.get("pick") or "").strip()
+    f1 = str(row.get("fighter_1") or row.get("fighter1") or "").strip()
+    f2 = str(row.get("fighter_2") or row.get("fighter2") or "").strip()
+
+    if pick and f1 and pick == f1:
+        edge_f1 = _finite_float(row.get("edge_f1"))
+        if edge_f1 is not None:
+            return edge_f1, pick
+    if pick and f2 and pick == f2:
+        edge_f2 = _finite_float(row.get("edge_f2"))
+        if edge_f2 is not None:
+            return edge_f2, pick
+
+    side = str(row.get("best_edge_side") or "").strip().lower()
+    best = _finite_float(row.get("best_edge"))
+    if best is not None and pick:
+        side_is_other = (
+            (side in {"f1", "1", "fighter_1"} and f1 and pick != f1)
+            or (side in {"f2", "2", "fighter_2"} and f2 and pick != f2)
+            or (side and side not in {"f1", "1", "fighter_1", "f2", "2", "fighter_2"} and side != pick.lower())
+        )
+        # Rows that only store best_edge (no side) mean the pick's edge.
+        # A side that names the other fighter must not be reused.
+        if not side_is_other:
+            return best, pick
+
+    # attach_edge_columns stores the model-pick edge as a percent.
+    pct = _finite_float(row.get("edge_pct"))
+    if pct is not None:
+        return pct / 100.0, pick or None
+    return None, pick or None
+
+
+def _is_paper_wide_override(ticket: dict[str, Any]) -> bool:
+    blob = " ".join(
+        str(ticket.get(key) or "")
+        for key in ("uncertainty_reason", "uncertainty_action", "primary_reason", "skip_reason")
+    )
+    return "paper_wide_override" in blob
+
+
+def _kelly_ceiling_usd(ticket: dict[str, Any], *, live: bool) -> float | None:
+    """Dollar Kelly cap for one selection.
+
+    Paper with no stored ceiling keeps the strength curve. Live with a missing,
+    blank, unreadable, non-finite, negative, or zero ceiling is $0. The cap is
+    never taken from a previous suggested stake or from the other fighter.
+    """
+    if "kelly_stake_usd" not in ticket:
+        return 0.0 if live else None
+    raw_kelly = ticket.get("kelly_stake_usd")
+    blank = raw_kelly is None or (isinstance(raw_kelly, str) and not raw_kelly.strip())
+    if blank:
+        return 0.0 if live else None
+    kelly = _finite_float(raw_kelly)
+    if kelly is None or kelly <= 0:
+        return 0.0
+    return kelly
+
+
+def _cap_allocated_stake(
+    ticket: dict[str, Any],
+    dollars: float,
+    pct: float,
+    pool: float,
+    *,
+    live: bool,
+) -> tuple[float, float]:
+    """Keep final dollars inside Kelly and Paper-override ceilings.
+
+    ``stake_pct`` stays a share of the card pool, not of bankroll.
+    """
+    caps: list[float] = []
+    ceiling = _kelly_ceiling_usd(ticket, live=live)
+    if ceiling is not None:
+        caps.append(ceiling)
+    if _is_paper_wide_override(ticket):
+        if live:
+            caps.append(0.0)
+        else:
+            import config as _cfg
+
+            bankroll = _finite_float(ticket.get("bankroll"))
+            if bankroll is None:
+                bankroll = float(getattr(_cfg, "INITIAL_BANKROLL", 0.0) or 0.0)
+            max_frac = float(getattr(_cfg, "PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC", 0.01) or 0.01)
+            caps.append(max(0.0, bankroll) * max(0.0, max_frac))
+    if not caps:
+        return dollars, pct
+    capped = round(max(0.0, min([dollars, *caps])), 2)
+    new_pct = round(100.0 * capped / pool, 1) if pool > 0 else 0.0
+    return capped, new_pct
+
+
 @dataclass
 class StrategyConfig:
     """Conservative defaults: high-accuracy / low-volume (Paper vs Live via profile)."""
@@ -425,8 +539,10 @@ def strategy_from_profile(
             profile=_cfg.UFC_PROFILE,
             segment_health=health,
         )
-        edge = thresholds.alert_min_edge if min_edge is None else min_edge
         ps_dyn = _cfg.profile_settings()
+        ha_floor = float(ps_dyn.get("alert_min_edge") or 0.0)
+        dyn_edge = float(thresholds.alert_min_edge)
+        edge = max(dyn_edge, ha_floor) if min_edge is None else min_edge
         return StrategyConfig(
             kelly_fraction=_cfg.profile_value("kelly_fraction"),
             max_bet_fraction=_cfg.profile_value("max_bet_fraction"),
@@ -1220,6 +1336,7 @@ def compute_ticket_strength(ticket: dict[str, Any], *, live: bool) -> dict[str, 
     unc_pen, unc_no_inflate, unc_action = _uncertainty_penalty(
         ticket, live=live, tighten_mult=float(curve["tighten_mult"])
     )
+    live_override = live and _is_paper_wide_override(ticket)
 
     kind = str(ticket.get("bet_type") or ticket.get("market_type") or "").lower()
     is_parlay = bool(ticket.get("is_parlay")) or "parlay" in kind or int(ticket.get("n_legs") or 1) >= 2
@@ -1234,10 +1351,10 @@ def compute_ticket_strength(ticket: dict[str, Any], *, live: bool) -> dict[str, 
 
     fail_closed_reason = ""
     no_inflate = False
-    if odds is None:
-        # Missing odds → never inflate stake
+    if odds is None or live_override:
+        # Missing odds, or a Paper-only wide override viewed under Live → no stake.
         strength = 0.0
-        fail_closed_reason = "missing_odds"
+        fail_closed_reason = "paper_wide_override" if live_override else "missing_odds"
         no_inflate = True
         prob_score = 0.0
         edge_score = 0.0
@@ -1423,6 +1540,7 @@ def allocate_card_budget_pct(
     *,
     profile: str | None = None,
     inplace: bool = True,
+    as_of: Any = None,
 ) -> list[dict[str, Any]]:
     """
     Allocate card budget via confidence- and odds-aware strength scores.
@@ -1449,6 +1567,16 @@ def allocate_card_budget_pct(
         live = bool(_cfg.is_live_profile())
 
     pool = max(0.0, float(pool_usd or 0.0))
+    if live:
+        rejected = [t for t in tickets if _is_paper_wide_override(t)]
+        if rejected:
+            logger.info(
+                "Live allocation rejected %s paper_wide_override ticket(s)",
+                len(rejected),
+            )
+        tickets = [t for t in tickets if not _is_paper_wide_override(t)]
+    if not tickets:
+        return []
     details_list = [compute_ticket_strength(t, live=live) for t in tickets]
     raw_pcts = [float(d["target_stake_pct"]) for d in details_list]
     total_raw = sum(raw_pcts)
@@ -1466,6 +1594,7 @@ def allocate_card_budget_pct(
     for i, (ticket, pct, details) in enumerate(zip(tickets, pcts, details_list), start=1):
         row = ticket if inplace else dict(ticket)
         dollars = round(pool * (pct / 100.0), 2) if pool > 0 else 0.0
+        dollars, pct = _cap_allocated_stake(row, dollars, pct, pool, live=live)
         row["stake_pct"] = float(pct)
         row["suggested_stake"] = dollars
         row["card_pool_usd"] = pool
@@ -1517,7 +1646,37 @@ def allocate_card_budget_pct(
             idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
             target[idx]["suggested_stake"] = round(float(target[idx]["suggested_stake"]) + drift, 2)
 
+    _reapply_stake_ceilings(out, pool, live=live)
+    from src.quote_integrity import apply_live_quote_gate
+
+    apply_live_quote_gate(out, live=live, now=as_of)
+    from src.circuit_breaker import apply_live_safety_gate
+
+    apply_live_safety_gate(out, live=live)
     return out
+
+
+def _reapply_stake_ceilings(
+    tickets: list[dict[str, Any]],
+    pool: float,
+    *,
+    live: bool,
+) -> None:
+    """Parlay redistribution and penny drift must not punch through Kelly or Paper caps."""
+    for ticket in tickets:
+        try:
+            dollars = float(ticket.get("suggested_stake") or 0.0)
+        except (TypeError, ValueError):
+            dollars = 0.0
+        try:
+            pct = float(ticket.get("stake_pct") or 0.0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        capped, new_pct = _cap_allocated_stake(ticket, dollars, pct, pool, live=live)
+        ticket["suggested_stake"] = capped
+        ticket["stake_pct"] = new_pct
+        if "stake_usd" in ticket:
+            ticket["stake_usd"] = capped
 
 
 def allocate_alerts_card_budget_pct(
@@ -1575,7 +1734,12 @@ def allocate_alerts_card_budget_pct(
         key=lambda t: ticket_allocation_weight(t, live=is_live),
         reverse=True,
     )
-    allocated = allocate_card_budget_pct(tickets_sorted, pool_usd, profile=profile, inplace=True)
+    allocated = allocate_card_budget_pct(
+        tickets_sorted,
+        pool_usd,
+        profile=profile,
+        inplace=True,
+    )
     for i, t in enumerate(allocated, start=1):
         t["rank"] = i
 
@@ -1668,8 +1832,7 @@ def attach_prop_stakes(
         row["market_type"] = "prop"
         row["is_parlay"] = False
         tickets.append(row)
-    allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
-    return allocated
+    return allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
 
 
 def budget_summary_text(budget_state: dict[str, Any]) -> str:
@@ -1905,6 +2068,112 @@ def bankroll_from_budget(budget_state: dict[str, Any] | None) -> float:
     return float(budget_state.get("total_bankroll") or _cfg.INITIAL_BANKROLL)
 
 
+_ALERT_STAKE_LISTS = ("singles", "parlays", "prop_singles", "model_parlays")
+
+
+def _enforce_live_kelly_ceiling(ticket: dict[str, Any]) -> None:
+    """Live stake fields stay inside the stored Kelly ceiling; no valid ceiling is $0."""
+    from src.quote_integrity import clear_actionable_stakes
+
+    if _is_paper_wide_override(ticket):
+        clear_actionable_stakes(ticket, reason="paper_wide_override")
+        return
+    ceiling = _kelly_ceiling_usd(ticket, live=True)
+    if ceiling is None or ceiling <= 0:
+        clear_actionable_stakes(
+            ticket,
+            reason=str(ticket.get("quote_block_reason") or "invalid_kelly_ceiling"),
+        )
+        return
+    cap = round(ceiling, 2)
+    for field in ("suggested_stake", "stake_usd", "raw_stake", "max_safe_bet_usd"):
+        if field not in ticket or ticket.get(field) is None:
+            continue
+        value = _finite_float(ticket.get(field))
+        if value is None or value < 0:
+            ticket[field] = 0.0
+        elif value > cap:
+            ticket[field] = cap
+    pool = _finite_float(ticket.get("card_pool_usd"))
+    stake = _finite_float(ticket.get("suggested_stake"))
+    if pool is not None and pool > 0 and stake is not None:
+        ticket["stake_pct"] = round(100.0 * stake / pool, 1)
+
+
+def revalidate_live_tickets(
+    tickets: list[dict[str, Any]],
+    *,
+    now: Any = None,
+) -> list[dict[str, Any]]:
+    """Final Live check for tickets returned after allocation (narrative, cache).
+
+    Same rules as allocation: Kelly ceiling, quote identity / price / freshness /
+    event start, then the daily-loss gate. Edits the tickets in place.
+    """
+    from src.circuit_breaker import apply_live_safety_gate
+    from src.quote_integrity import apply_live_quote_gate
+
+    rows = [ticket for ticket in tickets if isinstance(ticket, dict)]
+    if not rows:
+        return tickets
+    for ticket in rows:
+        _enforce_live_kelly_ceiling(ticket)
+    apply_live_quote_gate(rows, live=True, now=now)
+    apply_live_safety_gate(rows, live=True)
+    return tickets
+
+
+def revalidate_live_alert_lists(
+    alerts: dict[str, Any],
+    *,
+    now: Any = None,
+) -> dict[str, Any]:
+    """Copy every alert stake list and run ``revalidate_live_tickets`` on it."""
+    held = dict(alerts)
+    for key in _ALERT_STAKE_LISTS:
+        rows = held.get(key)
+        if not isinstance(rows, list):
+            continue
+        copied = [dict(row) if isinstance(row, dict) else row for row in rows]
+        revalidate_live_tickets(copied, now=now)
+        held[key] = copied
+    if isinstance(held.get("items"), list):
+        copied_items = [dict(row) if isinstance(row, dict) else row for row in held["items"]]
+        revalidate_live_tickets(copied_items, now=now)
+        held["items"] = copied_items
+    return held
+
+
+def _clear_live_alert_stakes_if_blocked(alerts: dict[str, Any]) -> dict[str, Any] | None:
+    """Copy alert stake lists and zero them when daily loss or a bad safety file blocks.
+
+    Returns None when Live stakes may stand. An empty list still counts: the
+    safety file is read once, then every stake list is cleared.
+    """
+    from src.circuit_breaker import live_safety_block_reason
+    from src.quote_integrity import clear_actionable_stakes
+
+    reason = live_safety_block_reason()
+    if not reason:
+        return None
+    held = dict(alerts)
+    for key in _ALERT_STAKE_LISTS:
+        rows = held.get(key)
+        if not isinstance(rows, list):
+            continue
+        copied: list[Any] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                copied.append(row)
+                continue
+            item = dict(row)
+            clear_actionable_stakes(item, reason=reason)
+            item["safety_block_reason"] = reason
+            copied.append(item)
+        held[key] = copied
+    return held
+
+
 def scale_alerts_to_book_pool(
     alerts: dict[str, Any],
     budget_state: dict[str, Any] | None,
@@ -1913,7 +2182,20 @@ def scale_alerts_to_book_pool(
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Allocate singles + Over 1.5 props + parlays as % of the book's card pool (sum 100%)."""
+    import config as _cfg
+
+    live = (
+        str(profile).strip().lower() == "live"
+        if profile is not None
+        else bool(_cfg.is_live_profile())
+    )
+    if live and isinstance(alerts, dict):
+        blocked = _clear_live_alert_stakes_if_blocked(alerts)
+        if blocked is not None:
+            return blocked
     if not alerts or not budget_state:
+        if live and isinstance(alerts, dict):
+            return revalidate_live_alert_lists(alerts)
         return alerts
 
     resolved = resolve_budget_for_calculations(budget_state, profile=profile)
@@ -1926,16 +2208,24 @@ def scale_alerts_to_book_pool(
         plan = allocate_card_budget_per_book(resolved, profile=profile)
         info = plan.get(book, {})
         if not info.get("enabled"):
-            return {**alerts, "singles": [], "parlays": [], "book_disabled": True}
+            disabled = {**alerts, "singles": [], "parlays": [], "book_disabled": True}
+            if live:
+                return revalidate_live_alert_lists(disabled)
+            return disabled
         pool = float(info.get("allocation") or 0)
 
     props = list(alerts.get("prop_singles") or [])
-    return allocate_alerts_card_budget_pct(
+    out = allocate_alerts_card_budget_pct(
         alerts,
         pool,
         profile=profile,
         prop_singles=props,
     )
+    if live and isinstance(out.get("model_parlays"), list):
+        model_parlays = [dict(row) if isinstance(row, dict) else row for row in out["model_parlays"]]
+        revalidate_live_tickets(model_parlays)
+        out["model_parlays"] = model_parlays
+    return out
 
 
 def budget_aware_alerts(
@@ -1945,9 +2235,11 @@ def budget_aware_alerts(
     *,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Apply book enablement and card-budget % stake allocation to an alert payload."""
-    if not budget_state:
-        return alerts
+    """Apply book enablement and card-budget % stake allocation to an alert payload.
+
+    A missing budget still runs the Live safety gate. Cached stakes must not
+    survive a daily-loss block or an unreadable safety file.
+    """
     return scale_alerts_to_book_pool(alerts, budget_state, book, profile=profile)
 
 
@@ -1998,6 +2290,13 @@ def collect_dashboard_risk_warnings(
                 )
         elif card_eff < raw_card:
             _add("warn", f"Card budget trimmed to safe cap ${card_eff:,.2f} for current profile.")
+
+    if _cfg.is_live_profile():
+        from src.circuit_breaker import live_safety_block_reason
+
+        safety_reason = live_safety_block_reason()
+        if safety_reason:
+            _add("critical", f"Live stakes are $0: {safety_reason}")
 
     for w in _cfg.live_small_bankroll_warnings(br):
         _add("critical", w)
@@ -2408,9 +2707,13 @@ def aggregate_overview_recommendations(
     if len(singles) < singles_cap:
         overview_singles = (books.get("Overview", {}).get("alerts") or {}).get("singles") or []
         seen = {s.get("fight_id") for s in singles}
+        live_profile = str(profile or "").strip().lower() == "live"
         for s in sorted(overview_singles, key=lambda x: float(x.get("edge") or 0), reverse=True):
             fid = str(s.get("fight_id") or s.get("fight") or "")
             if not fid or fid in seen:
+                continue
+            # Profile switch re-renders cached Paper slips. Do not revive a wide-CI override as Live.
+            if live_profile and _is_paper_wide_override(s):
                 continue
             edge = float(s.get("edge") or 0)
             prob = s.get("prob")
@@ -2434,6 +2737,31 @@ def aggregate_overview_recommendations(
                     "book": "Overview",
                     "book_key": "Overview",
                     "suggested_stake": float(s.get("suggested_stake") or 0),
+                    "kelly_stake_usd": s.get("kelly_stake_usd"),
+                    "uncertainty_action": s.get("uncertainty_action") or "",
+                    "uncertainty_reason": s.get("uncertainty_reason") or "",
+                    "decimal_odds": s.get("decimal_odds"),
+                    "bankroll": s.get("bankroll"),
+                    "fighter_1": s.get("fighter_1"),
+                    "fighter_2": s.get("fighter_2"),
+                    "bookmaker": s.get("bookmaker"),
+                    "bookmaker_count": s.get("bookmaker_count"),
+                    "price_kind": s.get("price_kind"),
+                    "quote_match": s.get("quote_match"),
+                    "quote_timestamp": s.get("quote_timestamp"),
+                    "commence_time": s.get("commence_time"),
+                    "quote_event_id": s.get("quote_event_id"),
+                    "card_event_id": s.get("card_event_id"),
+                    "card_event_date": s.get("card_event_date"),
+                    "quote_fighter_1": s.get("quote_fighter_1"),
+                    "quote_fighter_2": s.get("quote_fighter_2"),
+                    "quote_f1_odds": s.get("quote_f1_odds"),
+                    "quote_f2_odds": s.get("quote_f2_odds"),
+                    "quote_decimal_odds": s.get("quote_decimal_odds"),
+                    "quote_selection": s.get("quote_selection"),
+                    "quote_actionable": s.get("quote_actionable"),
+                    "quote_block_reason": s.get("quote_block_reason"),
+                    "event_id": s.get("event_id"),
                     "american_odds": "-",
                     "odds_display": "-",
                     "is_parlay": False,
@@ -2646,13 +2974,17 @@ def aggregate_best_parlay(
 def apply_narrative_tilt_after_model_sizing(
     bets: list[dict[str, Any]] | dict[str, Any],
     narrative_result: dict[str, Any] | None,
+    *,
+    profile: str | None = None,
+    now: Any = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Final sizing step: narrative Kelly tilt after uncertainty gates + strategy rating.
 
     Model pick/edge stay locked; only stake fields may move within profile ±bounds.
+    Live tickets are revalidated on return, including when there is no narrative.
     """
     from src.grok_analysis import apply_grok_kelly_adjustments
 
-    return apply_grok_kelly_adjustments(bets, narrative_result)
+    return apply_grok_kelly_adjustments(bets, narrative_result, profile=profile, now=now)
 

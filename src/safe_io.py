@@ -5,11 +5,25 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
+_SECRET_QUERY = re.compile(
+    r"(?i)((?:api[_-]?key|access[_-]?token|session(?:_token)?|token|cookie)=)([^&\s\"']+)"
+)
+_COOKIE_HEADER = re.compile(r"(?i)(\bCookie\s*:\s*)([^\r\n]+)")
+
 logger = logging.getLogger(__name__)
+
+
+def redact_secrets(text: str | None) -> str:
+    """Strip credential query values and cookie/session material from log text."""
+    if not text:
+        return ""
+    cleaned = _COOKIE_HEADER.sub(r"\1<redacted>", str(text))
+    return _SECRET_QUERY.sub(r"\1<redacted>", cleaned)
 
 
 def safe_print(*args, sep: str = " ", end: str = "\n", file=None, flush: bool = False) -> None:

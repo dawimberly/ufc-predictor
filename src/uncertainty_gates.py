@@ -356,7 +356,13 @@ def log_uncertainty_skip(
         ev = event
         if not ev:
             ev = str(data.get("event_name") or data.get("event") or "")
-        edge = data.get("best_edge", data.get("edge"))
+        try:
+            from src.strategy import edge_for_predicted_pick
+
+            picked_edge, _picked = edge_for_predicted_pick(data)
+        except Exception:
+            picked_edge = None
+        edge = picked_edge if picked_edge is not None else data.get("edge")
         edge_pct = ""
         try:
             if edge is not None and str(edge).strip() != "" and not (
