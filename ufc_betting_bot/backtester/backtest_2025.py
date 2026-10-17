@@ -40,7 +40,7 @@ from ufc_betting_bot.modules.bankroll import (
     sweep_bankroll_thresholds,
 )
 from ufc_betting_bot.modules.dynamic_thresholds import print_threshold_comparison_report
-from ufc_betting_bot.modules.edge import compute_edge, market_probs
+from ufc_betting_bot.modules.edge import compute_edge
 from ufc_betting_bot.modules.model_bridge import get_predictor, load_features, load_fights, model_exists
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ class Backtest2025Result:
     report_dir: Path
     monte_carlo: Any = None
     threshold_comparison: dict[str, Any] | None = None
+    evaluation_mode: str = "frozen_model"
 
 
 def _attach_event_names(features: pd.DataFrame) -> pd.DataFrame:
@@ -85,9 +86,18 @@ def walk_forward_events(
     predictor,
     *,
     target_year: int,
+    refit_model: bool = False,
+    trainer=None,
+    min_train_rows: int = 80,
 ) -> pd.DataFrame:
-    """Imputer fit on fights before event N; predict event N with frozen model."""
+    """Predict each event from information available before that event.
+
+    ``refit_model=False`` scores a frozen artifact. That is not walk-forward:
+    the weights may have seen the fights being scored. ``refit_model=True``
+    fits a new model on rows dated strictly before the event.
+    """
     from src.feature_engineering import apply_imputer, apply_interaction_specs, fit_imputer
+    from ufc_betting_bot.modules.edge import as_of_market_probs
 
     interaction_specs = getattr(predictor, "interaction_specs", None) or []
 
@@ -108,8 +118,9 @@ def walk_forward_events(
         .sort_values(DATE_COLUMN)
     )
 
-    feature_cols = predictor.feature_columns
+    feature_cols = list(getattr(predictor, "feature_columns", []) or [])
     rows: list[dict] = []
+    mode = "walk_forward" if refit_model else "frozen_model"
 
     for _, ev in events.iterrows():
         ev_date = ev[DATE_COLUMN]
@@ -123,16 +134,31 @@ def walk_forward_events(
             train = apply_interaction_specs(train, interaction_specs)
             test = apply_interaction_specs(test, interaction_specs)
 
-        imputer = fit_imputer(train)
-        prepared = apply_imputer(test, imputer).dropna(subset=feature_cols)
-        if prepared.empty:
-            continue
+        if refit_model:
+            if trainer is None and len(train) < min_train_rows:
+                continue
+            fit_model = trainer or _fit_past_only_model
+            model = fit_model(train, feature_cols)
+            prepared = test
+            if trainer is None:
+                imputer = fit_imputer(train)
+                prepared = apply_imputer(test, imputer).dropna(subset=feature_cols)
+            if prepared.empty:
+                continue
+            proba = model.predict_proba(prepared[feature_cols])[:, 1]
+        else:
+            if not feature_cols:
+                continue
+            imputer = fit_imputer(train)
+            prepared = apply_imputer(test, imputer).dropna(subset=feature_cols)
+            if prepared.empty:
+                continue
+            proba = predictor.model.predict_proba(prepared[feature_cols])[:, 1]
 
-        proba = predictor.model.predict_proba(prepared[feature_cols])[:, 1]
         for i, (_, row) in enumerate(prepared.iterrows()):
             actual = int(row[TARGET_COLUMN])
             p1 = float(proba[i])
-            market = market_probs(row)
+            market, odds_timing = as_of_market_probs(row)
             record = row.to_dict()
             record["prob_f1_win"] = p1
             record["prob_f2_win"] = 1.0 - p1
@@ -140,6 +166,8 @@ def walk_forward_events(
             record["correct"] = int((p1 >= 0.5) == bool(actual))
             record["wf_train_rows"] = len(train)
             record["event_name"] = ev["event"]
+            record["evaluation_mode"] = mode
+            record["odds_timing"] = odds_timing
 
             if market:
                 m1, m2 = market
@@ -158,6 +186,29 @@ def walk_forward_events(
             rows.append(record)
 
     return pd.DataFrame(rows)
+
+
+def _fit_past_only_model(train: pd.DataFrame, feature_cols: list[str]):
+    """Fit one classifier on rows the caller already limited to the past."""
+    from lightgbm import LGBMClassifier
+
+    from src.feature_engineering import apply_imputer, fit_imputer
+
+    cols = [col for col in feature_cols if col in train.columns]
+    work = train.dropna(subset=[TARGET_COLUMN])
+    imputer = fit_imputer(work)
+    prepared = apply_imputer(work, imputer).dropna(subset=cols + [TARGET_COLUMN])
+    if prepared.empty or not cols:
+        raise ValueError("Walk-forward train slice has no usable rows")
+    model = LGBMClassifier(
+        n_estimators=40,
+        num_leaves=8,
+        learning_rate=0.1,
+        verbose=-1,
+        random_state=42,
+    )
+    model.fit(prepared[cols], prepared[TARGET_COLUMN].astype(int))
+    return model
 
 
 def _per_event_breakdown(predictions: pd.DataFrame) -> pd.DataFrame:
@@ -193,6 +244,7 @@ def backtest_2025(
     use_dynamic_thresholds: bool | None = None,
     compare_threshold_modes: bool | None = None,
     profile: str | None = None,
+    walk_forward: bool = False,
 ) -> Backtest2025Result:
     ensure_dirs()
     settings = get_settings()
@@ -210,7 +262,17 @@ def backtest_2025(
         raise ValueError(f"Features missing '{TARGET_COLUMN}'.")
 
     predictor = get_predictor()
-    predictions = walk_forward_events(features, predictor, target_year=year)
+    predictions = walk_forward_events(
+        features,
+        predictor,
+        target_year=year,
+        refit_model=walk_forward,
+    )
+    evaluation_mode = (
+        str(predictions["evaluation_mode"].iloc[0])
+        if "evaluation_mode" in predictions.columns and not predictions.empty
+        else ("walk_forward" if walk_forward else "frozen_model")
+    )
 
     if predictions.empty:
         raise ValueError(
@@ -323,6 +385,7 @@ def backtest_2025(
         report_dir=REPORTS_DIR,
         monte_carlo=monte_carlo,
         threshold_comparison=threshold_comparison,
+        evaluation_mode=evaluation_mode,
     )
 
     if save_outputs:
@@ -344,6 +407,8 @@ def backtest_2025(
             **{f"bankroll_{k}": v for k, v in bankroll_summary.items()},
             "dynamic_thresholds": dynamic_enabled,
             "threshold_comparison": threshold_comparison,
+            "evaluation_mode": evaluation_mode,
+            "walk_forward": evaluation_mode == "walk_forward",
             "staking_modes": staking_modes.to_dict(orient="records"),
         }
         (REPORTS_DIR / f"backtest_{year}_summary.json").write_text(

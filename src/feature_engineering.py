@@ -1131,6 +1131,10 @@ def _compute_elo_state(history: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, f
 
     fights = fights.copy()
     fights["_elo_day"] = pd.to_datetime(fights[config.DATE_COLUMN], errors="coerce").dt.normalize()
+    # A missing date cannot be ordered. Those results must not move anyone's
+    # rating, and the bout itself only sees the default start rating.
+    undated = fights[fights["_elo_day"].isna()]
+    fights = fights[fights["_elo_day"].notna()]
 
     for _, day_fights in fights.groupby("_elo_day", sort=True):
         # Snapshot ratings at the start of the card for every bout that night.
@@ -1157,6 +1161,9 @@ def _compute_elo_state(history: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, f
                 s1, s2 = 0.5, 0.5
             ratings[f1] = r1 + ELO_K * (s1 - e1)
             ratings[f2] = r2 + ELO_K * (s2 - e2)
+
+    for row in undated.itertuples(index=False):
+        pre_fight[row.fight_id] = {"f1_elo": ELO_START, "f2_elo": ELO_START}
 
     elo_rows = [
         {config.FIGHT_ID_COLUMN: fid, "f1_elo": vals["f1_elo"], "f2_elo": vals["f2_elo"]}

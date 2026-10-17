@@ -61,6 +61,63 @@ def market_probs(row: pd.Series) -> tuple[float, float] | None:
     return None
 
 
+_OPENING_ODDS_PAIRS = (
+    ("f1_opening_odds", "f2_opening_odds"),
+    ("opening_f1_odds", "opening_f2_odds"),
+    ("open_f1_odds", "open_f2_odds"),
+)
+_CLOSING_ODDS_PAIRS = (
+    ("f1_closing_odds", "f2_closing_odds"),
+    ("closing_f1_odds", "closing_f2_odds"),
+)
+
+
+def _probs_from_named_pair(row: pd.Series, left: str, right: str) -> tuple[float, float] | None:
+    if left not in row.index or right not in row.index:
+        return None
+    renamed = row.copy()
+    renamed["f1_odds"] = row[left]
+    renamed["f2_odds"] = row[right]
+    return market_probs(renamed)
+
+
+def as_of_market_probs(row: pd.Series) -> tuple[tuple[float, float] | None, str]:
+    """Market probabilities a historical bet could have used.
+
+    Opening prices win when they are present. A closing-only quote is not an
+    as-of price. ``f1_odds`` without an opening or closing label stays
+    ``unspecified`` and is still returned, because the file does not say when
+    it was posted.
+    """
+    for left, right in _OPENING_ODDS_PAIRS:
+        opening = _probs_from_named_pair(row, left, right)
+        if opening is not None:
+            return opening, "opening"
+
+    closing_pair: tuple[str, str] | None = None
+    for left, right in _CLOSING_ODDS_PAIRS:
+        if _probs_from_named_pair(row, left, right) is not None:
+            closing_pair = (left, right)
+            break
+
+    stored = market_probs(row) if has_valid_odds(row) else None
+    if closing_pair is not None:
+        left, right = closing_pair
+        if stored is None:
+            return None, "closing_not_as_of"
+        try:
+            same = abs(float(row["f1_odds"]) - float(row[left])) <= 1e-6 and abs(
+                float(row["f2_odds"]) - float(row[right])
+            ) <= 1e-6
+        except (TypeError, ValueError):
+            same = False
+        if same:
+            return None, "closing_not_as_of"
+    if stored is not None:
+        return stored, "unspecified"
+    return None, "missing"
+
+
 def compute_edge(
     model_p1: float,
     model_p2: float,
