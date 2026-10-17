@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urljoin, urlparse
@@ -783,24 +783,36 @@ def _map_fav_dog_odds(
 
 
 def _coerce_observation_timestamp(value: Any) -> str | None:
-    """Normalize an observation stamp to an explicit UTC ISO string.
+    """Normalize a timezone-aware observation stamp to UTC ISO.
 
-    Date-only and naive values are treated as UTC midnight / UTC wall time so
-    strict as-of parsing (which requires an explicit timezone) can accept them.
-    Invalid values return None — never invent a stamp from missing data.
+    Naive datetimes and date-only calendar values are rejected. Never assign
+    UTC (or any timezone) to a stamp whose timezone is unknown — only preserve
+    observations that already carry an explicit timezone, then convert to UTC.
     """
     if value is None or (isinstance(value, float) and not np.isfinite(value)):
         return None
-    if isinstance(value, str) and not value.strip():
+    if isinstance(value, date) and not isinstance(value, datetime):
         return None
-    ts = pd.to_datetime(value, errors="coerce", utc=False)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        # Pure calendar dates have no observation time or timezone.
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            return None
+        # Require an explicit offset / Z so we never invent a zone.
+        if not re.search(r"(Z|[+-]\d{2}:?\d{2})$", text, flags=re.IGNORECASE):
+            return None
+
+    try:
+        ts = pd.Timestamp(value)
+    except (TypeError, ValueError):
+        return None
     if pd.isna(ts):
         return None
-    if getattr(ts, "tzinfo", None) is None:
-        ts = pd.Timestamp(ts).tz_localize("UTC")
-    else:
-        ts = pd.Timestamp(ts).tz_convert("UTC")
-    return ts.isoformat()
+    if ts.tzinfo is None:
+        return None
+    return ts.tz_convert("UTC").isoformat()
 
 
 def _fight_start_utc(fight_date: Any) -> pd.Timestamp | None:
@@ -961,10 +973,11 @@ def _normalize_odds_frame(df: pd.DataFrame, *, source: str) -> pd.DataFrame:
 def _collapse_odds_snapshots(odds_table: pd.DataFrame) -> pd.DataFrame:
     """Collapse daily / multi-book snapshots into one row per fight.
 
-    Opening prices are taken only from the earliest quote with
-    ``quote_observed_at`` (or an explicit opening stamp) at or before fight
-    start. Unlabeled single-shot sources become closing prices and never invent
-    an opening observation.
+    Timestamp binding is strict:
+    - ``quote_observed_at`` validates raw snapshot ``f1_odds`` / ``f2_odds`` only.
+    - ``opening_odds_observed_at`` validates the named opening pair only.
+    An opening timestamp never promotes raw/closing prices into openings.
+    Unlabeled single-shot sources become closing prices without an opening stamp.
     """
     if odds_table.empty:
         return pd.DataFrame(columns=_ODDS_UNIFIED_COLUMNS)
@@ -990,17 +1003,18 @@ def _collapse_odds_snapshots(odds_table: pd.DataFrame) -> pd.DataFrame:
                 break
         source = str(grp.iloc[-1].get("source", "") or "")
 
+        # Raw snapshot prices are eligible only with quote_observed_at.
         pre_fight: list[tuple[pd.Timestamp, pd.Series]] = []
         for _, raw in grp.iterrows():
-            stamp = raw.get("quote_observed_at") or raw.get("opening_odds_observed_at")
-            iso = _coerce_observation_timestamp(stamp)
+            iso = _coerce_observation_timestamp(raw.get("quote_observed_at"))
             if iso is None:
                 continue
             ts = pd.Timestamp(iso)
             if ts <= fight_start and _odds_pair_valid(raw.get("f1_odds"), raw.get("f2_odds")):
                 pre_fight.append((ts, raw))
 
-        explicit_open = None
+        # Named opening prices are eligible only with opening_odds_observed_at.
+        explicit_opens: list[tuple[pd.Timestamp, float, float]] = []
         for _, raw in grp.iterrows():
             open_iso = _coerce_observation_timestamp(raw.get("opening_odds_observed_at"))
             if open_iso is None:
@@ -1009,30 +1023,38 @@ def _collapse_odds_snapshots(odds_table: pd.DataFrame) -> pd.DataFrame:
             if open_ts > fight_start:
                 continue
             if _odds_pair_valid(raw.get("f1_opening_odds"), raw.get("f2_opening_odds")):
-                explicit_open = (open_ts, float(raw["f1_opening_odds"]), float(raw["f2_opening_odds"]))
-                break
+                explicit_opens.append(
+                    (open_ts, float(raw["f1_opening_odds"]), float(raw["f2_opening_odds"]))
+                )
 
         last = grp.iloc[-1]
         f1_odds = float(last["f1_odds"]) if _odds_pair_valid(last.get("f1_odds"), last.get("f2_odds")) else np.nan
         f2_odds = float(last["f2_odds"]) if _odds_pair_valid(last.get("f1_odds"), last.get("f2_odds")) else np.nan
         f1_open = f2_open = np.nan
         open_at = None
+        quote_at = None
         f1_close = f2_close = np.nan
 
-        if explicit_open is not None:
-            open_at = explicit_open[0].isoformat()
-            f1_open, f2_open = explicit_open[1], explicit_open[2]
-        elif pre_fight:
+        if pre_fight:
             pre_fight.sort(key=lambda item: item[0])
-            open_ts, open_row = pre_fight[0]
-            close_ts, close_row = pre_fight[-1]
-            open_at = open_ts.isoformat()
-            f1_open = float(open_row["f1_odds"])
-            f2_open = float(open_row["f2_odds"])
+            snap_open_ts, open_row = pre_fight[0]
+            _close_ts, close_row = pre_fight[-1]
+            quote_at = snap_open_ts.isoformat()
             f1_close = float(close_row["f1_odds"])
             f2_close = float(close_row["f2_odds"])
             f1_odds, f2_odds = f1_close, f2_close
             source = str(close_row.get("source", source) or source)
+            # Snapshot path may supply opening only when no named opening pair wins.
+            if not explicit_opens:
+                open_at = quote_at
+                f1_open = float(open_row["f1_odds"])
+                f2_open = float(open_row["f2_odds"])
+
+        if explicit_opens:
+            explicit_opens.sort(key=lambda item: item[0])
+            open_ts, o1, o2 = explicit_opens[0]
+            open_at = open_ts.isoformat()
+            f1_open, f2_open = o1, o2
 
         if not _odds_pair_valid(f1_close, f2_close):
             # Explicit closing columns, else unlabeled last price as closing-only.
@@ -1063,7 +1085,7 @@ def _collapse_odds_snapshots(odds_table: pd.DataFrame) -> pd.DataFrame:
                 "f1_closing_odds": float(f1_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
                 "f2_closing_odds": float(f2_close) if _odds_pair_valid(f1_close, f2_close) else np.nan,
                 "opening_odds_observed_at": open_at,
-                "quote_observed_at": open_at,
+                "quote_observed_at": quote_at,
                 "source": source,
             }
         )
