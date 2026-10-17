@@ -1798,18 +1798,64 @@ def apply_grok_kelly_adjustments(
             row["grok_crowd"] = item.get("crowd_positioning", "")
             row["grok_risks"] = item.get("invalidation_risks") or []
 
+        from src.strategy import _finite_float
+
+        # kelly_stake_usd is the computed ceiling. Narrative may scale the
+        # stake, then the stake is put back under that same ceiling.
+        ceiling = _finite_float(row.get("kelly_stake_usd"))
         if abs(factor - 1.0) > 1e-9:
             for field in _NARRATIVE_STAKE_FIELDS:
-                if row.get(field) is not None:
-                    try:
-                        row[field] = round(float(row[field]) * factor, 2)
-                    except (TypeError, ValueError):
-                        pass
+                if field == "kelly_stake_usd" or row.get(field) is None:
+                    continue
+                try:
+                    row[field] = round(float(row[field]) * factor, 2)
+                except (TypeError, ValueError):
+                    pass
+        if ceiling is not None:
+            cap = round(max(0.0, ceiling), 2)
+            for field in ("suggested_stake", "stake_usd", "raw_stake"):
+                stake_val = _finite_float(row.get(field))
+                if stake_val is not None and stake_val > cap:
+                    row[field] = cap
+            pool = _finite_float(row.get("card_pool_usd"))
+            if pool is not None and pool > 0 and row.get("suggested_stake") is not None:
+                row["stake_pct"] = round(100.0 * float(row["suggested_stake"]) / pool, 1)
+        if row.get("quote_block_reason") or row.get("quote_actionable") is False:
+            from src.quote_integrity import clear_actionable_stakes
+
+            clear_actionable_stakes(
+                row,
+                reason=str(row.get("quote_block_reason") or "quote_not_actionable"),
+            )
+        if row.get("safety_block_reason"):
+            from src.quote_integrity import clear_actionable_stakes
+
+            clear_actionable_stakes(
+                row,
+                reason=str(row.get("safety_block_reason")),
+            )
+            row["safety_block_reason"] = str(row.get("safety_block_reason"))
 
         # Restore locked model fields (never flip pick / inflate edge)
         for k, v in locked.items():
             row[k] = v
         adjusted.append(row)
+    import config as _cfg
+
+    live = bool(_cfg.is_live_profile())
+    if live and adjusted:
+        from src.circuit_breaker import apply_live_safety_gate
+
+        bankroll = None
+        for row in adjusted:
+            try:
+                candidate = float(row.get("bankroll") or 0)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0:
+                bankroll = candidate
+                break
+        apply_live_safety_gate(adjusted, live=True, bankroll=bankroll)
     return adjusted
 
 

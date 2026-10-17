@@ -71,6 +71,17 @@ TIER_ACTIONS = {
 _ACTIONABLE_TIERS = frozenset({TIER_BLUE, TIER_SKY_BLUE})
 _PAPER_WIDE_OVERRIDE_TOKEN = "paper_wide_override"
 
+
+def zero_fun_only_stakes(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Green and yellow research leans stay $0. Blue tickets keep their stakes."""
+    for ticket in items:
+        if ticket.get("bet_tier") in {TIER_GREEN, TIER_YELLOW}:
+            ticket["suggested_stake"] = 0.0
+            ticket["stake_usd"] = 0.0
+            ticket["stake_pct"] = 0.0
+            ticket["fun_bet"] = True
+    return items
+
 # Color thresholds (do not change HA sizing gates).
 _RED_PROB_FLOOR = 0.52
 _GREEN_MIN_EDGE = 0.05

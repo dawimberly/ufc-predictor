@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -96,10 +97,12 @@ def _parse_scoreboard(payload: dict[str, Any]) -> pd.DataFrame:
                 "f2_odds": round(f2, 4),
                 "implied_prob_f1": ip1,
                 "implied_prob_f2": ip2,
-                "bookmaker": "ActionNetwork",
+                "bookmaker": "consensus",
                 "bookmaker_count": max(len(home_px), 1),
                 "odds_source": "ActionNetwork",
+                "price_kind": "consensus",
                 "event_label": str((fight.get("meta") or {}).get("title") or ""),
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
     if not rows:
@@ -134,7 +137,9 @@ def fetch_action_network_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                 )
                 return cached
         except Exception as exc:
-            logger.debug("Action Network cache read failed: %s", exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug("Action Network cache read failed: %s", redact_secrets(str(exc)))
 
     url = str(
         getattr(config, "ACTION_NETWORK_UFC_URL", "") or DEFAULT_URL
@@ -161,10 +166,17 @@ def fetch_action_network_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         try:
             df.to_csv(cache_path, index=False)
         except Exception as exc:
-            logger.debug("Action Network cache write skipped: %s", exc)
+            from src.safe_io import redact_secrets
+
+            logger.debug("Action Network cache write skipped: %s", redact_secrets(str(exc)))
         logger.info("Action Network odds fetched (%s fights)", len(df))
         return df
     except Exception as exc:
         # Fail-soft: never break the odds chain
-        logger.info("Action Network odds unavailable (fail-soft): %s", exc)
+        from src.safe_io import redact_secrets
+
+        logger.info(
+            "Action Network odds unavailable (fail-soft): %s",
+            redact_secrets(str(exc)),
+        )
         return pd.DataFrame()

@@ -416,13 +416,21 @@ def odds_api_get(
     )
 
     session = _fresh_session()
-    resp = session.get(
-        url,
-        params=params,
-        timeout=timeout
-        if timeout is not None
-        else float(getattr(config, "REQUEST_TIMEOUT_SEC", 30)),
-    )
+    try:
+        resp = session.get(
+            url,
+            params=params,
+            timeout=timeout
+            if timeout is not None
+            else float(getattr(config, "REQUEST_TIMEOUT_SEC", 30)),
+        )
+    except requests.RequestException as exc:
+        from src.safe_io import redact_secrets
+
+        cleaned = redact_secrets(str(exc))
+        if cleaned != str(exc):
+            exc.args = (cleaned,)
+        raise
     LAST_REQUEST_META["status_code"] = resp.status_code
     LAST_REQUEST_META["requests_remaining"] = resp.headers.get("x-requests-remaining")
     LAST_REQUEST_META["requests_used"] = resp.headers.get("x-requests-used")

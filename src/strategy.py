@@ -76,6 +76,25 @@ def _is_paper_wide_override(ticket: dict[str, Any]) -> bool:
     return "paper_wide_override" in blob
 
 
+def _kelly_ceiling_usd(ticket: dict[str, Any], *, live: bool) -> float | None:
+    """Dollar Kelly cap for one selection.
+
+    Paper with no stored ceiling keeps the strength curve. Live with a missing,
+    blank, unreadable, non-finite, negative, or zero ceiling is $0. The cap is
+    never taken from a previous suggested stake or from the other fighter.
+    """
+    if "kelly_stake_usd" not in ticket:
+        return 0.0 if live else None
+    raw_kelly = ticket.get("kelly_stake_usd")
+    blank = raw_kelly is None or (isinstance(raw_kelly, str) and not raw_kelly.strip())
+    if blank:
+        return 0.0 if live else None
+    kelly = _finite_float(raw_kelly)
+    if kelly is None or kelly <= 0:
+        return 0.0
+    return kelly
+
+
 def _cap_allocated_stake(
     ticket: dict[str, Any],
     dollars: float,
@@ -89,11 +108,9 @@ def _cap_allocated_stake(
     ``stake_pct`` stays a share of the card pool, not of bankroll.
     """
     caps: list[float] = []
-    raw_kelly = ticket.get("kelly_stake_usd")
-    if raw_kelly is not None and str(raw_kelly).strip() != "":
-        kelly = _finite_float(raw_kelly)
-        if kelly is not None:
-            caps.append(max(0.0, kelly))
+    ceiling = _kelly_ceiling_usd(ticket, live=live)
+    if ceiling is not None:
+        caps.append(ceiling)
     if _is_paper_wide_override(ticket):
         if live:
             caps.append(0.0)
@@ -1523,6 +1540,8 @@ def allocate_card_budget_pct(
     *,
     profile: str | None = None,
     inplace: bool = True,
+    as_of: Any = None,
+    bankroll: float | None = None,
 ) -> list[dict[str, Any]]:
     """
     Allocate card budget via confidence- and odds-aware strength scores.
@@ -1628,7 +1647,37 @@ def allocate_card_budget_pct(
             idx = max(range(len(target)), key=lambda j: float(target[j]["suggested_stake"]))
             target[idx]["suggested_stake"] = round(float(target[idx]["suggested_stake"]) + drift, 2)
 
+    _reapply_stake_ceilings(out, pool, live=live)
+    from src.quote_integrity import apply_live_quote_gate
+
+    apply_live_quote_gate(out, live=live, now=as_of)
+    from src.circuit_breaker import apply_live_safety_gate
+
+    apply_live_safety_gate(out, live=live, bankroll=bankroll)
     return out
+
+
+def _reapply_stake_ceilings(
+    tickets: list[dict[str, Any]],
+    pool: float,
+    *,
+    live: bool,
+) -> None:
+    """Parlay redistribution and penny drift must not punch through Kelly or Paper caps."""
+    for ticket in tickets:
+        try:
+            dollars = float(ticket.get("suggested_stake") or 0.0)
+        except (TypeError, ValueError):
+            dollars = 0.0
+        try:
+            pct = float(ticket.get("stake_pct") or 0.0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        capped, new_pct = _cap_allocated_stake(ticket, dollars, pct, pool, live=live)
+        ticket["suggested_stake"] = capped
+        ticket["stake_pct"] = new_pct
+        if "stake_usd" in ticket:
+            ticket["stake_usd"] = capped
 
 
 def allocate_alerts_card_budget_pct(
@@ -1637,6 +1686,7 @@ def allocate_alerts_card_budget_pct(
     *,
     profile: str | None = None,
     prop_singles: list[dict[str, Any]] | None = None,
+    bankroll: float | None = None,
 ) -> dict[str, Any]:
     """
     Rank and allocate % across singles + Over 1.5 props + 2-leg parlays in an alert payload.
@@ -1686,7 +1736,13 @@ def allocate_alerts_card_budget_pct(
         key=lambda t: ticket_allocation_weight(t, live=is_live),
         reverse=True,
     )
-    allocated = allocate_card_budget_pct(tickets_sorted, pool_usd, profile=profile, inplace=True)
+    allocated = allocate_card_budget_pct(
+        tickets_sorted,
+        pool_usd,
+        profile=profile,
+        inplace=True,
+        bankroll=bankroll,
+    )
     for i, t in enumerate(allocated, start=1):
         t["rank"] = i
 
@@ -1779,7 +1835,14 @@ def attach_prop_stakes(
         row["market_type"] = "prop"
         row["is_parlay"] = False
         tickets.append(row)
-    allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
+    roll = None
+    try:
+        roll = float((budget_state or {}).get("total_bankroll") or 0) or None
+    except (TypeError, ValueError):
+        roll = None
+    allocated = allocate_card_budget_pct(
+        tickets, pool, profile=profile, inplace=True, bankroll=roll
+    )
     return allocated
 
 
@@ -2016,6 +2079,43 @@ def bankroll_from_budget(budget_state: dict[str, Any] | None) -> float:
     return float(budget_state.get("total_bankroll") or _cfg.INITIAL_BANKROLL)
 
 
+_ALERT_STAKE_LISTS = ("singles", "parlays", "prop_singles", "model_parlays")
+
+
+def _clear_live_alert_stakes_if_blocked(
+    alerts: dict[str, Any],
+    *,
+    bankroll: float | None,
+) -> dict[str, Any] | None:
+    """Copy alert stake lists and zero them when daily loss or a bad safety file blocks.
+
+    Returns None when Live stakes may stand. An empty list still counts: the
+    safety file is read once, then every stake list is cleared.
+    """
+    from src.circuit_breaker import live_safety_block_reason
+    from src.quote_integrity import clear_actionable_stakes
+
+    reason = live_safety_block_reason(bankroll=bankroll)
+    if not reason:
+        return None
+    held = dict(alerts)
+    for key in _ALERT_STAKE_LISTS:
+        rows = held.get(key)
+        if not isinstance(rows, list):
+            continue
+        copied: list[Any] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                copied.append(row)
+                continue
+            item = dict(row)
+            clear_actionable_stakes(item, reason=reason)
+            item["safety_block_reason"] = reason
+            copied.append(item)
+        held[key] = copied
+    return held
+
+
 def scale_alerts_to_book_pool(
     alerts: dict[str, Any],
     budget_state: dict[str, Any] | None,
@@ -2024,6 +2124,23 @@ def scale_alerts_to_book_pool(
     profile: str | None = None,
 ) -> dict[str, Any]:
     """Allocate singles + Over 1.5 props + parlays as % of the book's card pool (sum 100%)."""
+    import config as _cfg
+
+    live = (
+        str(profile).strip().lower() == "live"
+        if profile is not None
+        else bool(_cfg.is_live_profile())
+    )
+    roll = None
+    if isinstance(budget_state, dict):
+        try:
+            roll = float(budget_state.get("total_bankroll") or 0) or None
+        except (TypeError, ValueError):
+            roll = None
+    if live and isinstance(alerts, dict):
+        blocked = _clear_live_alert_stakes_if_blocked(alerts, bankroll=roll)
+        if blocked is not None:
+            return blocked
     if not alerts or not budget_state:
         return alerts
 
@@ -2046,6 +2163,7 @@ def scale_alerts_to_book_pool(
         pool,
         profile=profile,
         prop_singles=props,
+        bankroll=roll,
     )
 
 
@@ -2056,9 +2174,11 @@ def budget_aware_alerts(
     *,
     profile: str | None = None,
 ) -> dict[str, Any]:
-    """Apply book enablement and card-budget % stake allocation to an alert payload."""
-    if not budget_state:
-        return alerts
+    """Apply book enablement and card-budget % stake allocation to an alert payload.
+
+    A missing budget still runs the Live safety gate. Cached stakes must not
+    survive a daily-loss block or an unreadable safety file.
+    """
     return scale_alerts_to_book_pool(alerts, budget_state, book, profile=profile)
 
 
@@ -2519,9 +2639,13 @@ def aggregate_overview_recommendations(
     if len(singles) < singles_cap:
         overview_singles = (books.get("Overview", {}).get("alerts") or {}).get("singles") or []
         seen = {s.get("fight_id") for s in singles}
+        live_profile = str(profile or "").strip().lower() == "live"
         for s in sorted(overview_singles, key=lambda x: float(x.get("edge") or 0), reverse=True):
             fid = str(s.get("fight_id") or s.get("fight") or "")
             if not fid or fid in seen:
+                continue
+            # Profile switch re-renders cached Paper slips. Do not revive a wide-CI override as Live.
+            if live_profile and _is_paper_wide_override(s):
                 continue
             edge = float(s.get("edge") or 0)
             prob = s.get("prob")
@@ -2545,6 +2669,31 @@ def aggregate_overview_recommendations(
                     "book": "Overview",
                     "book_key": "Overview",
                     "suggested_stake": float(s.get("suggested_stake") or 0),
+                    "kelly_stake_usd": s.get("kelly_stake_usd"),
+                    "uncertainty_action": s.get("uncertainty_action") or "",
+                    "uncertainty_reason": s.get("uncertainty_reason") or "",
+                    "decimal_odds": s.get("decimal_odds"),
+                    "bankroll": s.get("bankroll"),
+                    "fighter_1": s.get("fighter_1"),
+                    "fighter_2": s.get("fighter_2"),
+                    "bookmaker": s.get("bookmaker"),
+                    "bookmaker_count": s.get("bookmaker_count"),
+                    "price_kind": s.get("price_kind"),
+                    "quote_match": s.get("quote_match"),
+                    "quote_timestamp": s.get("quote_timestamp"),
+                    "commence_time": s.get("commence_time"),
+                    "quote_event_id": s.get("quote_event_id"),
+                    "card_event_id": s.get("card_event_id"),
+                    "card_event_date": s.get("card_event_date"),
+                    "quote_fighter_1": s.get("quote_fighter_1"),
+                    "quote_fighter_2": s.get("quote_fighter_2"),
+                    "quote_f1_odds": s.get("quote_f1_odds"),
+                    "quote_f2_odds": s.get("quote_f2_odds"),
+                    "quote_decimal_odds": s.get("quote_decimal_odds"),
+                    "quote_selection": s.get("quote_selection"),
+                    "quote_actionable": s.get("quote_actionable"),
+                    "quote_block_reason": s.get("quote_block_reason"),
+                    "event_id": s.get("event_id"),
                     "american_odds": "-",
                     "odds_display": "-",
                     "is_parlay": False,
@@ -2631,7 +2780,14 @@ def aggregate_overview_recommendations(
         key=lambda t: ticket_allocation_weight(t, live=is_live),
         reverse=True,
     )
-    allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
+    roll = None
+    try:
+        roll = float(resolved.get("total_bankroll") or 0) or None
+    except (TypeError, ValueError):
+        roll = None
+    allocated = allocate_card_budget_pct(
+        tickets, pool, profile=profile, inplace=True, bankroll=roll
+    )
     for i, t in enumerate(allocated, start=1):
         t["rank"] = i
 

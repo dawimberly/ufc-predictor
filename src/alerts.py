@@ -401,6 +401,26 @@ def generate_alerts(
                 "odds_source": str(row.get("odds_source") or row.get("odds_book") or ""),
                 "event_name": str(row.get("event_name") or row.get("event") or ev_name or ""),
                 "skip_reason": "",
+                "fighter_1": f1,
+                "fighter_2": f2,
+                "bookmaker": str(row.get("bookmaker") or row.get("odds_book") or ""),
+                "bookmaker_count": row.get("bookmaker_count"),
+                "price_kind": str(row.get("price_kind") or ""),
+                "quote_match": str(row.get("quote_match") or ""),
+                "quote_timestamp": row.get("quote_timestamp"),
+                "commence_time": row.get("commence_time"),
+                "quote_event_id": str(row.get("quote_event_id") or ""),
+                "card_event_id": str(row.get("card_event_id") or ""),
+                "card_event_date": row.get("card_event_date") or row.get("event_date"),
+                "quote_fighter_1": str(row.get("quote_fighter_1") or ""),
+                "quote_fighter_2": str(row.get("quote_fighter_2") or ""),
+                "quote_f1_odds": row.get("quote_f1_odds", row.get("f1_odds")),
+                "quote_f2_odds": row.get("quote_f2_odds", row.get("f2_odds")),
+                "quote_decimal_odds": row.get("quote_decimal_odds"),
+                "quote_selection": str(row.get("quote_selection") or ""),
+                "selection": str(row.get("selection") or row.get("quote_selection") or ""),
+                "quote_actionable": row.get("quote_actionable"),
+                "quote_block_reason": str(row.get("quote_block_reason") or ""),
             }
         )
 
@@ -701,6 +721,13 @@ def generate_alerts(
             payload = attach_narrative_tilts_to_alerts(payload, narrative_result)
         except Exception as exc:
             logger.debug("narrative tilt on alerts skipped: %s", exc)
+    if config.is_live_profile():
+        from src.circuit_breaker import apply_live_safety_gate
+
+        for key in ("singles", "parlays", "prop_singles", "model_parlays"):
+            rows = payload.get(key)
+            if isinstance(rows, list):
+                apply_live_safety_gate(rows, live=True, bankroll=float(bankroll or 0) or None)
     return payload
 
 

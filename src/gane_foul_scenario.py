@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 
 from src.predictor import _names_match
-from src.props import fetch_live_prop_odds, method_probs_from_row
+from src.props import fetch_live_prop_odds
 
 GANE_NAME = "Ciryl Gane"
 PEREIRA_NAME = "Alex Pereira"
@@ -28,7 +28,8 @@ ASPINALL_EXPLANATION = (
     "(sometimes including DQ) is the closest method market — verify your book's rules."
 )
 
-SPECULATIVE_STAKE_USD = 2.50
+# The panel explains a tail scenario. It is never a sized bet.
+ADVISORY_STAKE_USD = 0.0
 
 
 def _clip_prob(p: float, lo: float = 0.03, hi: float = 0.97) -> float:
@@ -217,6 +218,8 @@ def build_gane_foul_scenario(
                     "model_prob": model_p,
                     "edge": edge,
                     "score": (edge or -999) + 0.001 * dec,
+                    "price_kind": "book",
+                    "advisory": True,
                 }
             )
         if q.get("method_decimal"):
@@ -232,6 +235,8 @@ def build_gane_foul_scenario(
                     "model_prob": model_p,
                     "edge": edge,
                     "score": (edge or -999) + 0.002 * dec,
+                    "price_kind": "book",
+                    "advisory": True,
                 }
             )
 
@@ -242,7 +247,6 @@ def build_gane_foul_scenario(
         else:
             best = max(candidates, key=lambda c: c["decimal_odds"])
     else:
-        probs = method_probs_from_row(base_row)
         synth_ml = max(1.05, 1.0 / max(gane_ml_prob * 1.08, 0.05))
         best = {
             "book": "Model (synthetic)",
@@ -253,6 +257,8 @@ def build_gane_foul_scenario(
             "model_prob": gane_ml_prob,
             "edge": gane_ml_prob - (1.0 / synth_ml),
             "score": 0.0,
+            "price_kind": "synthetic",
+            "advisory": True,
         }
         for book in BOOKS:
             book_quotes.setdefault(book, {})
@@ -267,7 +273,13 @@ def build_gane_foul_scenario(
         "best_bet": best,
         "book_quotes": book_quotes,
         "explanation": ASPINALL_EXPLANATION,
-        "suggested_stake_usd": SPECULATIVE_STAKE_USD,
-        "stake_range": "$2–$3",
-        "risk_label": "HIGH RISK / SPECULATIVE",
+        "suggested_stake_usd": ADVISORY_STAKE_USD,
+        "stake_usd": ADVISORY_STAKE_USD,
+        "stake_pct": 0.0,
+        "kelly_stake_usd": ADVISORY_STAKE_USD,
+        "advisory": True,
+        "bet_action": "NO BET",
+        "price_kind": str(best.get("price_kind") or "advisory"),
+        "stake_range": "$0",
+        "risk_label": "ADVISORY ONLY",
     }

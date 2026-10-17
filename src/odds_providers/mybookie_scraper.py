@@ -452,7 +452,7 @@ def _fetch_odds_api_fallback() -> pd.DataFrame:
     """Fallback to The Odds API mybookieag bookmaker when scrape fails."""
     import json
 
-    from src.predictor import _names_match, _to_decimal_odds
+    from src.predictor import _to_decimal_odds
     from src.odds_providers.odds_api_client import (
         OddsApiFetchBlocked,
         ensure_live_odds_api_allowed,
@@ -479,7 +479,12 @@ def _fetch_odds_api_fallback() -> pd.DataFrame:
         response.raise_for_status()
         payload = response.json()
     except requests.RequestException as exc:
-        raise OddsAPIError(f"MyBookie Odds API fallback failed: {exc}") from exc
+        from src.safe_io import redact_secrets
+
+        cleaned = redact_secrets(str(exc))
+        if cleaned != str(exc):
+            exc.args = (cleaned,)
+        raise OddsAPIError(f"MyBookie Odds API fallback failed: {cleaned}") from exc
     except json.JSONDecodeError as exc:
         raise OddsAPIError("MyBookie Odds API fallback returned invalid JSON") from exc
 
@@ -506,8 +511,10 @@ def _fetch_odds_api_fallback() -> pd.DataFrame:
                     price = outcome.get("price")
                     if name and price is not None:
                         prices[name] = _to_decimal_odds(float(price), config.ODDS_API_ODDS_FORMAT)
-                f1_px = next((px for nm, px in prices.items() if _names_match(nm, home)), None)
-                f2_px = next((px for nm, px in prices.items() if _names_match(nm, away)), None)
+                from src.quote_integrity import price_for_selection
+
+                f1_px = price_for_selection(prices, home)
+                f2_px = price_for_selection(prices, away)
                 break
         if not f1_px or not f2_px or f1_px <= 1 or f2_px <= 1:
             continue

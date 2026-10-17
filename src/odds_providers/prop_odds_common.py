@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from src.predictor import _implied_probs, _names_match, _to_decimal_odds
+from src.predictor import _implied_probs, _to_decimal_odds
 
 PROP_ODDS_COLUMNS = [
     "fighter_1",
@@ -71,6 +71,11 @@ def prop_row(
     point: float | None = None,
     rotation: str = "",
     american_odds: float | None = None,
+    event_id: str = "",
+    commence_time: Any = None,
+    quote_timestamp: str = "",
+    price_kind: str = "",
+    bookmaker_count: int | None = None,
 ) -> dict[str, Any]:
     am = american_odds
     if am is None and decimal_odds > 1:
@@ -91,6 +96,11 @@ def prop_row(
         "rotation": rotation,
         "bookmaker": bookmaker,
         "odds_source": odds_source,
+        "event_id": event_id,
+        "commence_time": commence_time,
+        "quote_timestamp": quote_timestamp,
+        "price_kind": price_kind,
+        "bookmaker_count": bookmaker_count,
     }
 
 
@@ -112,24 +122,31 @@ def lookup_prop_odds_row(
     odds: pd.DataFrame,
     *,
     selection: str | None = None,
+    event_id: Any = None,
+    event_date: Any = None,
 ) -> pd.Series | None:
-    """Find a prop line for a fight, optionally matching selection (Over/Under/Yes)."""
+    """Find one prop line. Ambiguous or wrong-event rows are not returned."""
     if odds is None or odds.empty:
         return None
+    from src.quote_integrity import _event_compatible, pair_alignment
+
     keys = PROP_KEY_ALIASES.get(str(prop_key), (str(prop_key),))
+    hits: list[pd.Series] = []
     for _, row in odds.iterrows():
+        if not _event_compatible(event_id, event_date, row):
+            continue
         f1 = str(row.get("fighter_1", ""))
         f2 = str(row.get("fighter_2", ""))
-        aligned = _names_match(fighter_1, f1) and _names_match(fighter_2, f2)
-        swapped = _names_match(fighter_1, f2) and _names_match(fighter_2, f1)
-        if not aligned and not swapped:
+        if pair_alignment(fighter_1, fighter_2, f1, f2) is None:
             continue
         if str(row.get("prop_key", "")) not in keys:
             continue
         if selection is not None and str(row.get("selection", "")).lower() != selection.lower():
             continue
-        return row
-    return None
+        hits.append(row)
+    if len(hits) != 1:
+        return None
+    return hits[0]
 
 
 def attach_prop_odds_to_predictions(

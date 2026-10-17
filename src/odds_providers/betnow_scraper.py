@@ -21,7 +21,7 @@ from src.odds_providers.prop_odds_common import (
     parse_american_odds,
     prop_row,
 )
-from src.predictor import OddsAPIError, _implied_probs, _names_match
+from src.predictor import OddsAPIError, _implied_probs
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +100,7 @@ def _mask_cookie(cookie: str) -> str:
     c = str(cookie or "").strip()
     if not c:
         return "(empty / not set)"
-    # Show first name=value pair prefix only — enough to confirm the right jar.
-    first = c.split(";", 1)[0].strip()
-    if len(first) > 48:
-        first = first[:48] + "..."
-    return f"{first}... ({len(c)} chars, {c.count(';') + 1} parts)"
+    return f"(redacted cookie, {len(c)} chars, {c.count(';') + 1} parts)"
 
 
 def _append_session_query(url: str, token: str) -> str:
@@ -159,13 +155,17 @@ def _discover_session_token(headers: dict[str, str]) -> str:
             tok = _extract_session_token_from_response(resp)
             if tok:
                 logger.info(
-                    "BetNow session token extracted from %s: %s",
+                    "BetNow session token extracted from %s (set, len=%s)",
                     url,
-                    tok,
+                    len(tok),
                 )
                 return tok
         except requests.RequestException as exc:
-            logger.debug("BetNow session discovery failed for %s: %s", url, exc)
+            logger.debug(
+                "BetNow session discovery failed for %s: %s",
+                url,
+                redact_secrets(str(exc)),
+            )
     return ""
 
 
@@ -187,7 +187,11 @@ def resolve_betnow_session_token(*, force_discover: bool = False) -> str:
         source = "page"
     _ACTIVE_SESSION_TOKEN = token
     if token:
-        logger.info("BetNow session token in use (%s): %s", source, token)
+        logger.info(
+            "BetNow session token in use (source=%s, set, len=%s)",
+            source,
+            len(token),
+        )
     else:
         logger.info(
             "BetNow session token not set — will try public pages "
@@ -699,7 +703,7 @@ def _scrape_with_selenium() -> list[dict[str, Any]]:
                 rows.extend(parsed)
                 break
     except Exception as exc:
-        logger.warning("BetNow Selenium fallback failed: %s", exc)
+        logger.warning("BetNow Selenium fallback failed: %s", redact_secrets(str(exc)))
     finally:
         if driver is not None:
             driver.quit()
@@ -775,17 +779,26 @@ def fetch_betnow_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
 
 
 def match_betnow_row(fighter_1: str, fighter_2: str, odds: pd.DataFrame) -> pd.Series | None:
-    """Lookup helper for tests."""
+    """Exact or alias lookup. Surname-only rows are not a BetNow quote."""
+    from src.quote_integrity import pair_alignment
+
     for _, row in odds.iterrows():
-        if _names_match(fighter_1, row["fighter_1"]) and _names_match(fighter_2, row["fighter_2"]):
+        alignment = pair_alignment(
+            fighter_1,
+            fighter_2,
+            str(row.get("fighter_1") or ""),
+            str(row.get("fighter_2") or ""),
+        )
+        if alignment is None:
+            continue
+        if alignment == "aligned":
             return row
-        if _names_match(fighter_1, row["fighter_2"]) and _names_match(fighter_2, row["fighter_1"]):
-            swapped = row.copy()
-            swapped["fighter_1"], swapped["fighter_2"] = row["fighter_2"], row["fighter_1"]
-            swapped["f1_odds"], swapped["f2_odds"] = row["f2_odds"], row["f1_odds"]
-            swapped["implied_prob_f1"], swapped["implied_prob_f2"] = (
-                row["implied_prob_f2"],
-                row["implied_prob_f1"],
-            )
-            return swapped
+        swapped = row.copy()
+        swapped["fighter_1"], swapped["fighter_2"] = row["fighter_2"], row["fighter_1"]
+        swapped["f1_odds"], swapped["f2_odds"] = row["f2_odds"], row["f1_odds"]
+        swapped["implied_prob_f1"], swapped["implied_prob_f2"] = (
+            row["implied_prob_f2"],
+            row["implied_prob_f1"],
+        )
+        return swapped
     return None

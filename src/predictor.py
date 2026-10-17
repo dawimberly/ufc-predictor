@@ -859,7 +859,13 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         force_refresh = False
 
     if not force_refresh and _odds_cache_fresh():
-        cached = pd.read_csv(config.ODDS_CACHE_PATH, parse_dates=["commence_time"])
+        from src.quote_integrity import read_quote_cache
+
+        # Reuse the file as stored. Do not stamp quote_timestamp from load time.
+        cached = read_quote_cache(
+            config.ODDS_CACHE_PATH,
+            parse_dates=["commence_time"],
+        )
         if not cached.empty:
             logger.info(
                 "Using cached Odds API data (%s rows, once=%s ttl=%sm)",
@@ -935,12 +941,10 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                         prices[name] = _to_decimal_odds(
                             float(price), config.ODDS_API_ODDS_FORMAT
                         )
-                home_px = next(
-                    (px for nm, px in prices.items() if _names_match(nm, home)), None
-                )
-                away_px = next(
-                    (px for nm, px in prices.items() if _names_match(nm, away)), None
-                )
+                from src.quote_integrity import price_for_selection
+
+                home_px = price_for_selection(prices, home)
+                away_px = price_for_selection(prices, away)
                 if home_px and away_px and home_px > 1 and away_px > 1:
                     f1_prices.append(home_px)
                     f2_prices.append(away_px)
@@ -952,9 +956,17 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         if not f1_prices:
             continue
 
-        f1_odds = float(np.mean(f1_prices))
-        f2_odds = float(np.mean(f2_prices))
+        from datetime import datetime, timezone
+
+        from src.quote_integrity import classify_book_price
+
+        f1_odds = float(np.mean(f1_prices)) if len(f1_prices) > 1 else float(f1_prices[0])
+        f2_odds = float(np.mean(f2_prices)) if len(f2_prices) > 1 else float(f2_prices[0])
         imp1, imp2 = _implied_probs(f1_odds, f2_odds)
+        identity = classify_book_price(
+            bookmaker_count=len(f1_prices),
+            bookmaker=best_book,
+        )
         rows.append(
             {
                 "event_id": event.get("id", ""),
@@ -966,8 +978,10 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
                 "implied_prob_f1": imp1,
                 "implied_prob_f2": imp2,
                 "bookmaker_count": len(f1_prices),
-                "bookmaker": best_book or "Odds API",
-                "odds_source": "the_odds_api",
+                "bookmaker": identity["bookmaker"],
+                "odds_source": identity["odds_source"],
+                "price_kind": identity["price_kind"],
+                "quote_timestamp": datetime.now(timezone.utc).isoformat(),
             }
         )
 
@@ -993,24 +1007,23 @@ def _lookup_odds_row(
     fighter_1: str,
     fighter_2: str,
     odds: pd.DataFrame,
+    *,
+    event_id: Any = None,
+    event_date: Any = None,
 ) -> pd.Series | None:
-    for _, row in odds.iterrows():
-        aligned, matched = _match_fighters_to_event(
-            fighter_1,
-            fighter_2,
-            str(row["fighter_1"]),
-            str(row["fighter_2"]),
-        )
-        if matched:
-            out = row.copy()
-            if not aligned:
-                out["f1_odds"], out["f2_odds"] = row["f2_odds"], row["f1_odds"]
-                out["implied_prob_f1"], out["implied_prob_f2"] = (
-                    row["implied_prob_f2"],
-                    row["implied_prob_f1"],
-                )
-            return out
-    return None
+    from src.quote_integrity import select_moneyline_quote
+
+    selected = select_moneyline_quote(
+        fighter_1,
+        fighter_2,
+        odds,
+        event_id=event_id,
+        event_date=event_date,
+    )
+    row = selected.get("row")
+    if row is None:
+        return None
+    return row
 
 
 def merge_predictions_with_odds(
@@ -1118,7 +1131,13 @@ def merge_predictions_with_odds(
     for idx, row in out.iterrows():
         f1 = _fighter_name(row, 1)
         f2 = _fighter_name(row, 2)
-        match = _lookup_odds_row(f1, f2, market)
+        match = _lookup_odds_row(
+            f1,
+            f2,
+            market,
+            event_id=row.get("event_id") or row.get("card_event_id"),
+            event_date=row.get("event_date") or row.get("date") or row.get("card_event_date"),
+        )
         if match is None:
             unmatched.append((f1, f2))
             continue
@@ -1157,6 +1176,20 @@ def merge_predictions_with_odds(
         out.at[idx, "odds_matched"] = True
         out.at[idx, "odds_source"] = src
         out.at[idx, "odds_book"] = str(match.get("bookmaker") or src)
+        out.at[idx, "bookmaker"] = str(match.get("bookmaker") or "")
+        out.at[idx, "quote_event_id"] = str(match.get("event_id") or match.get("quote_event_id") or "")
+        out.at[idx, "card_event_id"] = str(row.get("card_event_id") or row.get("event_id") or "")
+        out.at[idx, "card_event_date"] = row.get("card_event_date") or row.get("event_date") or row.get("date")
+        out.at[idx, "quote_timestamp"] = match.get("quote_timestamp")
+        out.at[idx, "commence_time"] = match.get("commence_time")
+        out.at[idx, "price_kind"] = str(match.get("price_kind") or "")
+        out.at[idx, "quote_match"] = str(match.get("quote_match") or "")
+        out.at[idx, "quote_actionable"] = bool(match.get("quote_actionable"))
+        out.at[idx, "quote_block_reason"] = str(match.get("quote_block_reason") or "")
+        out.at[idx, "quote_fighter_1"] = str(match.get("fighter_1") or f1)
+        out.at[idx, "quote_fighter_2"] = str(match.get("fighter_2") or f2)
+        out.at[idx, "quote_f1_odds"] = f1_odds
+        out.at[idx, "quote_f2_odds"] = f2_odds
 
     matched_n = int(out["odds_matched"].fillna(False).astype(bool).sum())
     api_sample: list[tuple[str, str]] = []
