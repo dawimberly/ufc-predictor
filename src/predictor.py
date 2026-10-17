@@ -907,6 +907,13 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     if not isinstance(payload, list):
         raise OddsAPIError(f"Unexpected Odds API response: {type(payload)}")
 
+    try:
+        from src.odds_providers.draftkings import persist_draftkings_from_payload
+
+        persist_draftkings_from_payload(payload)
+    except Exception as exc:
+        logger.debug("DraftKings slice from Odds API payload skipped: %s", exc)
+
     rows: list[dict[str, Any]] = []
     for event in payload:
         home = str(event.get("home_team", "")).strip()

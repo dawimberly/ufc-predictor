@@ -516,9 +516,11 @@ ACTION_NETWORK_UFC_URL = os.getenv(
     "https://api.actionnetwork.com/web/v1/scoreboard/ufc",
 )
 
-# Optional book scrapers / DK API pass — OFF by default (free sources only)
+# Optional book scrapers. DraftKings moneylines are on by default and are
+# taken from the same Odds API download (no second credit) when that payload
+# includes the book.
 BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
-DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")
+DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "true")
 BETNOW_PROPS_URL = os.getenv(
     "BETNOW_PROPS_URL",
     "https://www.betnow.eu/sportsbook-info/fighting/ufc/",
@@ -784,7 +786,7 @@ def refresh_runtime_env() -> None:
         FEATURE_COLUMNS = list(FEATURE_COLUMNS) + list(MARKET_FEATURE_COLUMNS)
     MYBOOKIE_ENABLED = env_bool("MYBOOKIE_ENABLED", "false")
     BETNOW_ENABLED = env_bool("BETNOW_ENABLED", "false")
-    DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "false")
+    DRAFTKINGS_ENABLED = env_bool("DRAFTKINGS_ENABLED", "true")
     ACTION_NETWORK_ENABLED = env_bool("ACTION_NETWORK_ENABLED", "true")
     ACTION_NETWORK_UFC_URL = os.getenv(
         "ACTION_NETWORK_UFC_URL",

@@ -146,11 +146,13 @@ Selecting a fight can show weigh-in photos / missed-weight notes (`weigh_in`) an
 | `ODDS_FETCH_ONCE` | `true` | Reuse first download until cache deleted |
 | `ODDS_CACHE_TTL_MINUTES` | `20` | Only when fetch-once is off |
 | `MYBOOKIE_ENABLED` | `false` | Optional scraper |
-| `BETNOW_ENABLED` / `DRAFTKINGS_ENABLED` | `false` | Optional; keep DK off for quota |
+| `BETNOW_ENABLED` | `false` | Optional BetNow scraper |
+| `DRAFTKINGS_ENABLED` | `true` | DraftKings tab. Moneylines come from the main Odds API download |
 
 Delete only when you want a fresh live pull:
 
 - `data/cache/ufc_odds_api.csv`
+- `data/cache/draftkings_odds.csv`
 - `data/cache/the_odds_api_prop_odds.csv`
 - `data/cache/the_odds_api_prop_odds.once`
 
@@ -270,7 +272,7 @@ Copy `.env.example` → `.env`. Important keys:
 | `PAPER_WIDE_OVERRIDE_MAX_STAKE_FRAC` | 0.01 | Hard stake cap vs bankroll |
 | `PAPER_WIDE_OVERRIDE_MAX_PER_CARD` | 2 | Max override singles per card |
 | `MYBOOKIE_ENABLED` | false | MyBookie + Props - MyBookie tabs |
-| `DRAFTKINGS_ENABLED` | false | Keep false to protect API quota |
+| `DRAFTKINGS_ENABLED` | true | DraftKings moneyline tab. Does not add a second Odds API credit when the main download already includes DraftKings |
 | `OLLAMA_ENABLED` | true | Local Ollama Analysis tab |
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |
