@@ -83,6 +83,23 @@ def _totals_to_prop_rows(
     return rows
 
 
+def _draftkings_props_from_shared_cache() -> pd.DataFrame:
+    """DraftKings rows already stored by the main Odds API prop download."""
+    from src.odds_providers.the_odds_api import PROP_CACHE_PATH
+
+    if not PROP_CACHE_PATH.is_file():
+        return empty_prop_odds_df()
+    try:
+        shared = pd.read_csv(PROP_CACHE_PATH)
+    except Exception as exc:
+        logger.debug("Shared prop cache unreadable: %s", exc)
+        return empty_prop_odds_df()
+    if shared.empty or "bookmaker" not in shared.columns:
+        return empty_prop_odds_df()
+    mask = shared["bookmaker"].astype(str).str.lower().str.contains("draftkings", na=False)
+    return shared.loc[mask].copy()
+
+
 def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     """
     Fetch DraftKings UFC prop markets from The Odds API.
@@ -105,6 +122,12 @@ def fetch_draftkings_prop_odds(*, force_refresh: bool = False) -> pd.DataFrame:
         if not cached.empty:
             logger.info("Using cached DraftKings prop odds (%s rows)", len(cached))
             return cached
+
+    shared = _draftkings_props_from_shared_cache()
+    if shared is not None and not shared.empty:
+        shared.to_csv(DK_PROP_CACHE_PATH, index=False)
+        logger.info("Using %s DraftKings prop rows from the Odds API prop cache", len(shared))
+        return shared
 
     # Hard block: DK props hit The Odds API per-event (huge credit burn).
     try:
