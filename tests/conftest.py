@@ -20,15 +20,32 @@ TEST_LIVE_BANKROLL = 1000.0
 
 @pytest.fixture(autouse=True)
 def _isolated_safety_state(tmp_path, monkeypatch):
-    """Every test gets its own daily-loss file. The real cache file is never read or written."""
+    """Every test gets its own daily-loss file. The real cache file is never read or written.
+
+    Dashboard bootstrap calls ``project_paths.patch_config``, which would otherwise
+    reset ``CIRCUIT_BREAKER_STATE_PATH`` to the real cache. Keep the temp path.
+    Production ``patch_config`` is unchanged; only the test monkeypatch wraps it.
+    """
     import config
     from src import circuit_breaker
+    from src import project_paths
 
     path = tmp_path / "circuit_breaker_state.json"
     monkeypatch.setattr(config, "CIRCUIT_BREAKER_STATE_PATH", path)
+
+    original_patch = project_paths.patch_config
+
+    def _patch_config_keep_test_safety(root):
+        original_patch(root)
+        config.CIRCUIT_BREAKER_STATE_PATH = path
+
+    monkeypatch.setattr(project_paths, "patch_config", _patch_config_keep_test_safety)
     circuit_breaker.set_entry_block(None)
     yield path
     circuit_breaker.set_entry_block(None)
+    # If dashboard was imported and bootstrap already ran under a prior patch,
+    # force the temp path back for any teardown that still reads config.
+    config.CIRCUIT_BREAKER_STATE_PATH = path
 
 
 @pytest.fixture

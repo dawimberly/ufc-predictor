@@ -6,7 +6,8 @@ Live keeps three operations apart:
   ``start-live-session`` command calls it, and it never overwrites a session.
 * ``record_bankroll_observation`` stores the operator's current bankroll with
   its source and UTC observation time (``record-bankroll`` command). It never
-  touches the opening bankroll or a trip.
+  clears a trip or changes the opening bankroll; it latches a trip when the
+  new or previously stored observation breaches the Live daily-loss limit.
 * ``evaluate_live_daily_loss`` / ``live_safety_block_reason`` authorize Live
   stakes. They only read the file. Missing, stale, or unusable state blocks,
   and so does a disabled breaker.
@@ -392,22 +393,69 @@ def record_bankroll_observation(
 ) -> BankrollObservation:
     """Store the operator's current bankroll on today's session. Explicit use only.
 
-    The opening bankroll and any trip are left exactly as they are.
+    Writes the observation in one atomic update. Latches ``circuit_tripped`` when
+    the new bankroll meets or exceeds the Live daily-loss limit against
+    ``bankroll_open``, or when the previous stored observation already breached
+    that limit (so a recovery record cannot erase an unflagged breach). A later
+    higher bankroll never clears an existing trip. The opening bankroll and any
+    existing trip details are left alone.
     """
     value = _finite_positive(bankroll)
     if value is None:
         raise ValueError("current bankroll must be a finite amount greater than 0")
+    # Validate everything before mutating so a bad session never gets a partial write.
     state = load_safety_state()
     day = _session_day(today)
     key = live_session_key(today)
     session = state.get(key)
     if not isinstance(session, dict) or str(session.get("session_date") or "") != day:
         raise NoLiveSession(f"no Live session for {day} - start one: {START_LIVE_SESSION_HINT}")
+    anchor = _finite_positive(session.get("bankroll_open"))
+    if anchor is None:
+        raise ValueError("live session anchor missing or invalid")
+    if _parse_utc(session.get("initialized_at")) is None:
+        raise ValueError("live session start time missing or invalid")
+    limit = _live_loss_limit()
+    if limit is None:
+        raise ValueError("live daily loss limit unreadable")
+
     observed = (now or _now()).astimezone(timezone.utc)
-    session["current_bankroll"] = round(value, 4)
-    session["current_bankroll_source"] = SOURCE_RECORD_BANKROLL
-    session["current_bankroll_observed_at"] = observed.isoformat()
-    state[key] = session
+    updated = dict(session)
+
+    # Inspect the prior observation before replacing it so a recovery write
+    # still latches an unflagged breach from the previous recorded bankroll.
+    if not _is_tripped(updated):
+        prior = _finite_positive(session.get("current_bankroll"))
+        if prior is not None:
+            prior_loss = (anchor - prior) / anchor
+            if prior_loss >= limit - 1e-9:
+                prior_at = _parse_utc(session.get("current_bankroll_observed_at"))
+                updated["circuit_tripped"] = True
+                updated["circuit_tripped_at"] = (prior_at or observed).isoformat()
+                updated["loss_pct"] = round(prior_loss, 6)
+                logger.warning(
+                    "daily loss circuit breaker latched from prior observation "
+                    "(%s >= %s limit, profile=live)",
+                    f"{prior_loss:.2%}",
+                    f"{limit:.2%}",
+                )
+
+    updated["current_bankroll"] = round(value, 4)
+    updated["current_bankroll_source"] = SOURCE_RECORD_BANKROLL
+    updated["current_bankroll_observed_at"] = observed.isoformat()
+
+    loss_pct = (anchor - value) / anchor
+    if loss_pct >= limit - 1e-9 and not _is_tripped(updated):
+        updated["circuit_tripped"] = True
+        updated["circuit_tripped_at"] = observed.isoformat()
+        updated["loss_pct"] = round(loss_pct, 6)
+        logger.warning(
+            "daily loss circuit breaker latched on record (%s >= %s limit, profile=live)",
+            f"{loss_pct:.2%}",
+            f"{limit:.2%}",
+        )
+
+    state[key] = updated
     if not write_json_atomic(_state_path(), state):
         raise OSError(f"could not write {Path(_state_path()).name}")
     logger.info("Live bankroll recorded for %s: %.2f", day, value)

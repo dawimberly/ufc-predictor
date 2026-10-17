@@ -34,7 +34,7 @@ from src.strategy import (
     budget_aware_alerts,
     collect_dashboard_risk_warnings,
 )
-from tests.test_audit_fail_closed import _fresh_quote, _strong_ticket
+from tests.test_audit_fail_closed import _fresh_quote, _overview_app, _strong_ticket
 
 DAY = date(2026, 6, 1)
 NOW = datetime(2026, 6, 1, 18, 0, tzinfo=timezone.utc)
@@ -151,38 +151,160 @@ def test_caller_or_config_bankroll_cannot_authorize_or_hide_loss(state_path, mon
     record_bankroll_observation(980.0, now=NOW)
     monkeypatch.setattr(config, "INITIAL_BANKROLL", 1000.0)
     before = _snapshot(state_path)
-    # A "healthy" caller bankroll must not override the recorded 980 loss.
+    # Recording already latched the trip; a "healthy" caller bankroll must not clear it.
     decision = evaluate_live_daily_loss(now=NOW)
     assert not decision.allowed
-    assert decision.computed_trip
+    assert "stored trip" in decision.reason
     _assert_zero(_allocate([_ticket(bankroll=1000.0)])[0])
     _assert_zero(
         apply_grok_kelly_adjustments([_ticket(bankroll=1000.0)], TILT_UP, now=NOW)[0]
     )
-    # Read-only paths leave the file alone; the alert gate may then persist the trip.
+    # Read-only authorization leaves the latched trip untouched.
     assert _snapshot(state_path) == before
     assert not check_alerts_allowed(1000.0)[0]
+    assert _snapshot(state_path) == before
     stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
     assert stored["circuit_tripped"] is True
     assert stored["bankroll_open"] == 1000.0
     assert stored["current_bankroll"] == 980.0
 
 
-def test_computed_loss_over_limit_blocks_before_any_trip_flag(state_path):
+def test_record_latches_breach_recovery_stays_blocked_without_alert_gate(state_path):
+    """Breach must persist on record; a later higher bankroll never clears it."""
     initialize_live_session(1000.0, now=NOW)
-    record_bankroll_observation(985.0, now=NOW)
-    before = _snapshot(state_path)
+    record_bankroll_observation(980.0, now=NOW)
+    stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    assert stored["circuit_tripped"] is True
+    assert stored["bankroll_open"] == 1000.0
+    assert stored["current_bankroll"] == 980.0
+    assert stored["loss_pct"] == pytest.approx(0.02)
+    trip_at = stored["circuit_tripped_at"]
+
+    # Recovery observation must not run the alert gate and must not clear the trip.
+    record_bankroll_observation(995.0, now=NOW)
+    stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    assert stored["circuit_tripped"] is True
+    assert stored["circuit_tripped_at"] == trip_at
+    assert stored["loss_pct"] == pytest.approx(0.02)
+    assert stored["bankroll_open"] == 1000.0
+    assert stored["current_bankroll"] == 995.0
+    assert stored["current_bankroll_source"] == "record-bankroll"
+
+    before_auth = _snapshot(state_path)
     decision = evaluate_live_daily_loss(now=NOW)
     assert not decision.allowed
-    assert decision.computed_trip
-    assert "daily loss circuit breaker" in decision.reason
-    out = _allocate([_ticket()])
-    _assert_zero(out[0])
-    assert "daily loss" in out[0]["safety_block_reason"]
+    assert "stored trip" in decision.reason
+    assert _snapshot(state_path) == before_auth
+
+    _assert_zero(_allocate([_ticket()])[0])
+    for narrative in NARRATIVES:
+        _assert_zero(apply_grok_kelly_adjustments([_ticket()], narrative, now=NOW)[0])
+    cached = budget_aware_alerts({"singles": [_ticket()], "bankroll": 995.0}, None, "DraftKings")
+    _assert_zero(cached["singles"][0])
+    overview = _overview_app([_ticket()], profile="Live")
+    assert overview
+    for ticket in overview:
+        assert float(ticket.get("suggested_stake") or 0.0) == 0.0
+        assert float(ticket.get("stake_usd") or 0.0) == 0.0
+    assert _snapshot(state_path) == before_auth
+
+
+def test_below_limit_observation_does_not_trip(state_path):
+    initialize_live_session(1000.0, now=NOW)
+    # 0.5% drawdown is below the Live 1.2% limit.
+    record_bankroll_observation(995.0, now=NOW)
     stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
     assert "circuit_tripped" not in stored
-    assert stored["current_bankroll"] == 985.0
-    assert _snapshot(state_path) == before
+    assert stored["bankroll_open"] == 1000.0
+    assert stored["current_bankroll"] == 995.0
+    assert evaluate_live_daily_loss(now=NOW).allowed
+    assert _funded(_allocate([_ticket()])[0])
+
+
+def test_existing_trip_survives_subsequent_recordings(state_path):
+    initialize_live_session(1000.0, now=NOW)
+    record_bankroll_observation(980.0, now=NOW)
+    first = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    assert first["circuit_tripped"] is True
+    trip_at = first["circuit_tripped_at"]
+    loss_pct = first["loss_pct"]
+
+    record_bankroll_observation(990.0, now=NOW + timedelta(minutes=5))
+    record_bankroll_observation(999.0, now=NOW + timedelta(minutes=10))
+    stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    assert stored["circuit_tripped"] is True
+    assert stored["circuit_tripped_at"] == trip_at
+    assert stored["loss_pct"] == loss_pct
+    assert stored["bankroll_open"] == 1000.0
+    assert stored["current_bankroll"] == 999.0
+    _assert_zero(_allocate([_ticket()])[0])
+
+
+def test_record_recovery_latches_prior_unflagged_breach(state_path):
+    """Legacy session: breaching current bankroll, no circuit_tripped yet.
+
+    Recording a recovery without the alert gate must still latch the prior
+    breach and keep Live blocked.
+    """
+    prior_at = (NOW - timedelta(minutes=15)).isoformat()
+    _write_state(
+        state_path,
+        {
+            KEY: _session(
+                current_bankroll=980.0,
+                current_bankroll_source="record-bankroll",
+                current_bankroll_observed_at=prior_at,
+            )
+        },
+    )
+    row = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    row.pop("circuit_tripped", None)
+    row.pop("circuit_tripped_at", None)
+    row.pop("loss_pct", None)
+    _write_state(state_path, {KEY: row})
+    assert "circuit_tripped" not in json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+
+    # Recovery write only — no alert gate.
+    record_bankroll_observation(995.0, now=NOW)
+    stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    assert stored["circuit_tripped"] is True
+    assert stored["circuit_tripped_at"] == prior_at
+    assert stored["loss_pct"] == pytest.approx(0.02)
+    assert stored["bankroll_open"] == 1000.0
+    assert stored["current_bankroll"] == 995.0
+    assert stored["current_bankroll_source"] == "record-bankroll"
+
+    before_auth = _snapshot(state_path)
+    decision = evaluate_live_daily_loss(now=NOW)
+    assert not decision.allowed
+    assert "stored trip" in decision.reason
+    _assert_zero(_allocate([_ticket()])[0])
+    assert _snapshot(state_path) == before_auth
+
+
+def test_record_rejects_unusable_session_or_invalid_limit_without_partial_write(
+    state_path, monkeypatch
+):
+    before_missing = _snapshot(state_path)
+    with pytest.raises(NoLiveSession):
+        record_bankroll_observation(980.0, now=NOW)
+    assert _snapshot(state_path) == before_missing
+
+    initialize_live_session(1000.0, now=NOW)
+    row = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    row["bankroll_open"] = "bad"
+    _write_state(state_path, {KEY: row})
+    before_bad_anchor = _snapshot(state_path)
+    with pytest.raises(ValueError, match="anchor"):
+        record_bankroll_observation(980.0, now=NOW)
+    assert _snapshot(state_path) == before_bad_anchor
+
+    _write_state(state_path, {KEY: _session()})
+    before_limit = _snapshot(state_path)
+    monkeypatch.setattr(cb, "_live_loss_limit", lambda: None)
+    with pytest.raises(ValueError, match="loss limit"):
+        record_bankroll_observation(980.0, now=NOW)
+    assert _snapshot(state_path) == before_limit
 
 
 def test_missing_file_blocks_everywhere_and_is_never_recreated(state_path):
@@ -394,8 +516,25 @@ def test_record_bankroll_cli_updates_observation_not_anchor(state_path, capsys):
 
 
 def test_alert_gate_records_computed_trip_only_on_existing_session(state_path):
-    initialize_live_session(1000.0, now=NOW)
-    record_bankroll_observation(980.0, now=NOW)
+    # Pre-seed a breaching observation without a latch so the alert gate path
+    # is what persists the trip (record_bankroll_observation latches on its own).
+    _write_state(
+        state_path,
+        {
+            KEY: _session(
+                current_bankroll=980.0,
+                current_bankroll_source="record-bankroll",
+            )
+        },
+    )
+    # Strip any accidental trip flag from the helper defaults.
+    row = json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+    row.pop("circuit_tripped", None)
+    row.pop("circuit_tripped_at", None)
+    row.pop("loss_pct", None)
+    _write_state(state_path, {KEY: row})
+    assert "circuit_tripped" not in json.loads(state_path.read_text(encoding="utf-8"))[KEY]
+
     allowed, reason = check_alerts_allowed(None)
     assert not allowed and "daily loss" in reason
     stored = json.loads(state_path.read_text(encoding="utf-8"))[KEY]

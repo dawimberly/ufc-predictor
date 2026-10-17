@@ -657,8 +657,13 @@ def test_draftkings_prop_skip_log_omits_key(caplog, monkeypatch):
 
 
 def _overview_app(singles: list[dict], *, profile: str = "Live"):
+    import config
+
+    # Dashboard import may run bootstrap; keep the test safety file (never the real cache).
+    safety_path = config.CIRCUIT_BREAKER_STATE_PATH
     import src.ufc_dashboard as dash
 
+    config.CIRCUIT_BREAKER_STATE_PATH = safety_path
     dash.pd = pd
 
     class _Var:
