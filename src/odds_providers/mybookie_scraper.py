@@ -155,6 +155,7 @@ def _parse_moneyline_rows(soup) -> list[dict[str, Any]]:
                 "implied_prob_f2": imp2,
                 "bookmaker": "MyBookie",
                 "bookmaker_count": 1,
+                "price_kind": "book",
                 "source_url": MYBOOKIE_UFC_URL,
                 "game_id": game_id,
             }
@@ -529,6 +530,7 @@ def _fetch_odds_api_fallback() -> pd.DataFrame:
                 "implied_prob_f2": imp2,
                 "bookmaker": "MyBookie",
                 "bookmaker_count": 1,
+                "price_kind": "book",
                 "source_url": "The Odds API (MyBookie)",
             }
         )

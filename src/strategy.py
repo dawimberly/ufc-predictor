@@ -1541,7 +1541,6 @@ def allocate_card_budget_pct(
     profile: str | None = None,
     inplace: bool = True,
     as_of: Any = None,
-    bankroll: float | None = None,
 ) -> list[dict[str, Any]]:
     """
     Allocate card budget via confidence- and odds-aware strength scores.
@@ -1653,7 +1652,7 @@ def allocate_card_budget_pct(
     apply_live_quote_gate(out, live=live, now=as_of)
     from src.circuit_breaker import apply_live_safety_gate
 
-    apply_live_safety_gate(out, live=live, bankroll=bankroll)
+    apply_live_safety_gate(out, live=live)
     return out
 
 
@@ -1686,7 +1685,6 @@ def allocate_alerts_card_budget_pct(
     *,
     profile: str | None = None,
     prop_singles: list[dict[str, Any]] | None = None,
-    bankroll: float | None = None,
 ) -> dict[str, Any]:
     """
     Rank and allocate % across singles + Over 1.5 props + 2-leg parlays in an alert payload.
@@ -1741,7 +1739,6 @@ def allocate_alerts_card_budget_pct(
         pool_usd,
         profile=profile,
         inplace=True,
-        bankroll=bankroll,
     )
     for i, t in enumerate(allocated, start=1):
         t["rank"] = i
@@ -1835,15 +1832,7 @@ def attach_prop_stakes(
         row["market_type"] = "prop"
         row["is_parlay"] = False
         tickets.append(row)
-    roll = None
-    try:
-        roll = float((budget_state or {}).get("total_bankroll") or 0) or None
-    except (TypeError, ValueError):
-        roll = None
-    allocated = allocate_card_budget_pct(
-        tickets, pool, profile=profile, inplace=True, bankroll=roll
-    )
-    return allocated
+    return allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
 
 
 def budget_summary_text(budget_state: dict[str, Any]) -> str:
@@ -2082,11 +2071,80 @@ def bankroll_from_budget(budget_state: dict[str, Any] | None) -> float:
 _ALERT_STAKE_LISTS = ("singles", "parlays", "prop_singles", "model_parlays")
 
 
-def _clear_live_alert_stakes_if_blocked(
+def _enforce_live_kelly_ceiling(ticket: dict[str, Any]) -> None:
+    """Live stake fields stay inside the stored Kelly ceiling; no valid ceiling is $0."""
+    from src.quote_integrity import clear_actionable_stakes
+
+    if _is_paper_wide_override(ticket):
+        clear_actionable_stakes(ticket, reason="paper_wide_override")
+        return
+    ceiling = _kelly_ceiling_usd(ticket, live=True)
+    if ceiling is None or ceiling <= 0:
+        clear_actionable_stakes(
+            ticket,
+            reason=str(ticket.get("quote_block_reason") or "invalid_kelly_ceiling"),
+        )
+        return
+    cap = round(ceiling, 2)
+    for field in ("suggested_stake", "stake_usd", "raw_stake", "max_safe_bet_usd"):
+        if field not in ticket or ticket.get(field) is None:
+            continue
+        value = _finite_float(ticket.get(field))
+        if value is None or value < 0:
+            ticket[field] = 0.0
+        elif value > cap:
+            ticket[field] = cap
+    pool = _finite_float(ticket.get("card_pool_usd"))
+    stake = _finite_float(ticket.get("suggested_stake"))
+    if pool is not None and pool > 0 and stake is not None:
+        ticket["stake_pct"] = round(100.0 * stake / pool, 1)
+
+
+def revalidate_live_tickets(
+    tickets: list[dict[str, Any]],
+    *,
+    now: Any = None,
+) -> list[dict[str, Any]]:
+    """Final Live check for tickets returned after allocation (narrative, cache).
+
+    Same rules as allocation: Kelly ceiling, quote identity / price / freshness /
+    event start, then the daily-loss gate. Edits the tickets in place.
+    """
+    from src.circuit_breaker import apply_live_safety_gate
+    from src.quote_integrity import apply_live_quote_gate
+
+    rows = [ticket for ticket in tickets if isinstance(ticket, dict)]
+    if not rows:
+        return tickets
+    for ticket in rows:
+        _enforce_live_kelly_ceiling(ticket)
+    apply_live_quote_gate(rows, live=True, now=now)
+    apply_live_safety_gate(rows, live=True)
+    return tickets
+
+
+def revalidate_live_alert_lists(
     alerts: dict[str, Any],
     *,
-    bankroll: float | None,
-) -> dict[str, Any] | None:
+    now: Any = None,
+) -> dict[str, Any]:
+    """Copy every alert stake list and run ``revalidate_live_tickets`` on it."""
+    held = dict(alerts)
+    for key in _ALERT_STAKE_LISTS:
+        rows = held.get(key)
+        if not isinstance(rows, list):
+            continue
+        copied = [dict(row) if isinstance(row, dict) else row for row in rows]
+        revalidate_live_tickets(copied, now=now)
+        held[key] = copied
+    if isinstance(held.get("items"), list):
+        copied_items = [dict(row) if isinstance(row, dict) else row for row in held["items"]]
+        revalidate_live_tickets(copied_items, now=now)
+        held["items"] = copied_items
+    return held
+
+
+def _clear_live_alert_stakes_if_blocked(alerts: dict[str, Any]) -> dict[str, Any] | None:
     """Copy alert stake lists and zero them when daily loss or a bad safety file blocks.
 
     Returns None when Live stakes may stand. An empty list still counts: the
@@ -2095,7 +2153,7 @@ def _clear_live_alert_stakes_if_blocked(
     from src.circuit_breaker import live_safety_block_reason
     from src.quote_integrity import clear_actionable_stakes
 
-    reason = live_safety_block_reason(bankroll=bankroll)
+    reason = live_safety_block_reason()
     if not reason:
         return None
     held = dict(alerts)
@@ -2131,17 +2189,13 @@ def scale_alerts_to_book_pool(
         if profile is not None
         else bool(_cfg.is_live_profile())
     )
-    roll = None
-    if isinstance(budget_state, dict):
-        try:
-            roll = float(budget_state.get("total_bankroll") or 0) or None
-        except (TypeError, ValueError):
-            roll = None
     if live and isinstance(alerts, dict):
-        blocked = _clear_live_alert_stakes_if_blocked(alerts, bankroll=roll)
+        blocked = _clear_live_alert_stakes_if_blocked(alerts)
         if blocked is not None:
             return blocked
     if not alerts or not budget_state:
+        if live and isinstance(alerts, dict):
+            return revalidate_live_alert_lists(alerts)
         return alerts
 
     resolved = resolve_budget_for_calculations(budget_state, profile=profile)
@@ -2154,17 +2208,24 @@ def scale_alerts_to_book_pool(
         plan = allocate_card_budget_per_book(resolved, profile=profile)
         info = plan.get(book, {})
         if not info.get("enabled"):
-            return {**alerts, "singles": [], "parlays": [], "book_disabled": True}
+            disabled = {**alerts, "singles": [], "parlays": [], "book_disabled": True}
+            if live:
+                return revalidate_live_alert_lists(disabled)
+            return disabled
         pool = float(info.get("allocation") or 0)
 
     props = list(alerts.get("prop_singles") or [])
-    return allocate_alerts_card_budget_pct(
+    out = allocate_alerts_card_budget_pct(
         alerts,
         pool,
         profile=profile,
         prop_singles=props,
-        bankroll=roll,
     )
+    if live and isinstance(out.get("model_parlays"), list):
+        model_parlays = [dict(row) if isinstance(row, dict) else row for row in out["model_parlays"]]
+        revalidate_live_tickets(model_parlays)
+        out["model_parlays"] = model_parlays
+    return out
 
 
 def budget_aware_alerts(
@@ -2229,6 +2290,13 @@ def collect_dashboard_risk_warnings(
                 )
         elif card_eff < raw_card:
             _add("warn", f"Card budget trimmed to safe cap ${card_eff:,.2f} for current profile.")
+
+    if _cfg.is_live_profile():
+        from src.circuit_breaker import live_safety_block_reason
+
+        safety_reason = live_safety_block_reason()
+        if safety_reason:
+            _add("critical", f"Live stakes are $0: {safety_reason}")
 
     for w in _cfg.live_small_bankroll_warnings(br):
         _add("critical", w)
@@ -2780,14 +2848,7 @@ def aggregate_overview_recommendations(
         key=lambda t: ticket_allocation_weight(t, live=is_live),
         reverse=True,
     )
-    roll = None
-    try:
-        roll = float(resolved.get("total_bankroll") or 0) or None
-    except (TypeError, ValueError):
-        roll = None
-    allocated = allocate_card_budget_pct(
-        tickets, pool, profile=profile, inplace=True, bankroll=roll
-    )
+    allocated = allocate_card_budget_pct(tickets, pool, profile=profile, inplace=True)
     for i, t in enumerate(allocated, start=1):
         t["rank"] = i
 
@@ -2913,13 +2974,17 @@ def aggregate_best_parlay(
 def apply_narrative_tilt_after_model_sizing(
     bets: list[dict[str, Any]] | dict[str, Any],
     narrative_result: dict[str, Any] | None,
+    *,
+    profile: str | None = None,
+    now: Any = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Final sizing step: narrative Kelly tilt after uncertainty gates + strategy rating.
 
     Model pick/edge stay locked; only stake fields may move within profile ±bounds.
+    Live tickets are revalidated on return, including when there is no narrative.
     """
     from src.grok_analysis import apply_grok_kelly_adjustments
 
-    return apply_grok_kelly_adjustments(bets, narrative_result)
+    return apply_grok_kelly_adjustments(bets, narrative_result, profile=profile, now=now)
 

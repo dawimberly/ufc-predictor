@@ -1745,29 +1745,59 @@ def _lookup_pick(grok_picks: list[dict[str, Any]], bet: dict[str, Any]) -> dict[
     return None
 
 
+_NARRATIVE_TICKET_LISTS = ("singles", "parlays", "prop_singles", "model_parlays")
+# Ceiling-like fields: narrative may lower them, never raise them.
+_NARRATIVE_NO_RAISE_FIELDS = ("kelly_pct", "max_safe_bet_usd")
+
+
+def _narrative_is_live(profile: str | None) -> bool:
+    if profile is not None:
+        return str(profile).strip().lower() == "live"
+    return bool(config.is_live_profile())
+
+
 def apply_grok_kelly_adjustments(
     bets: list[dict[str, Any]] | dict[str, Any],
     grok_result: dict[str, Any] | None,
+    *,
+    profile: str | None = None,
+    now: Any = None,
 ) -> list[dict[str, Any]] | dict[str, Any]:
     """
     Apply narrative Kelly tilt to stake fields only (model-first).
 
     Must run AFTER uncertainty gates + strategy rating have set model stakes.
     Never flips pick, never changes edge/prob. Fail-closed → factor 1.0.
+
+    Every Live ticket that leaves this function is revalidated with the same
+    Kelly, quote, and daily-loss gates as allocation, whatever the narrative
+    result (None, failed, no-op, or applied).
     """
-    if isinstance(bets, dict) and ("singles" in bets or "parlays" in bets):
-        singles = apply_grok_kelly_adjustments(list(bets.get("singles") or []), grok_result)
-        parlays = apply_grok_kelly_adjustments(list(bets.get("parlays") or []), grok_result)
-        assert isinstance(singles, list) and isinstance(parlays, list)
+    live = _narrative_is_live(profile)
+    if isinstance(bets, dict) and any(key in bets for key in _NARRATIVE_TICKET_LISTS):
         out = dict(bets)
-        out["singles"] = singles
-        out["parlays"] = parlays
-        out["items"] = [*singles, *parlays]
+        for key in _NARRATIVE_TICKET_LISTS:
+            if key not in bets and key not in ("singles", "parlays"):
+                continue
+            adjusted_list = apply_grok_kelly_adjustments(
+                list(bets.get(key) or []),
+                grok_result,
+                profile=profile,
+                now=now,
+            )
+            assert isinstance(adjusted_list, list)
+            out[key] = adjusted_list
+        out["items"] = [*out["singles"], *out["parlays"]]
         return out
 
-    # No analysis run yet — leave model stakes untouched (no log spam).
     if grok_result is None:
-        return bets
+        # No analysis run yet — Paper stakes are untouched (no log spam).
+        if not live:
+            return bets
+        copied = [dict(bet) if isinstance(bet, dict) else bet for bet in bets]  # type: ignore[union-attr]
+        from src.strategy import revalidate_live_tickets
+
+        return revalidate_live_tickets(copied, now=now)
 
     grok_ok = bool(grok_result.get("ok"))
     grok_picks = list(grok_result.get("picks") or []) if grok_ok else []
@@ -1808,9 +1838,12 @@ def apply_grok_kelly_adjustments(
                 if field == "kelly_stake_usd" or row.get(field) is None:
                     continue
                 try:
-                    row[field] = round(float(row[field]) * factor, 2)
+                    scaled = round(float(row[field]) * factor, 2)
                 except (TypeError, ValueError):
-                    pass
+                    continue
+                if field in _NARRATIVE_NO_RAISE_FIELDS:
+                    scaled = min(scaled, float(row[field]))
+                row[field] = scaled
         if ceiling is not None:
             cap = round(max(0.0, ceiling), 2)
             for field in ("suggested_stake", "stake_usd", "raw_stake"):
@@ -1840,39 +1873,37 @@ def apply_grok_kelly_adjustments(
         for k, v in locked.items():
             row[k] = v
         adjusted.append(row)
-    import config as _cfg
-
-    live = bool(_cfg.is_live_profile())
     if live and adjusted:
-        from src.circuit_breaker import apply_live_safety_gate
+        from src.strategy import revalidate_live_tickets
 
-        bankroll = None
-        for row in adjusted:
-            try:
-                candidate = float(row.get("bankroll") or 0)
-            except (TypeError, ValueError):
-                candidate = 0.0
-            if candidate > 0:
-                bankroll = candidate
-                break
-        apply_live_safety_gate(adjusted, live=True, bankroll=bankroll)
+        revalidate_live_tickets(adjusted, now=now)
     return adjusted
 
 
 def attach_narrative_tilts_to_alerts(
     alerts: dict[str, Any] | None,
     grok_result: dict[str, Any] | None,
+    *,
+    profile: str | None = None,
+    now: Any = None,
 ) -> dict[str, Any]:
     """Apply narrative Kelly tilts to alert singles/parlays after model sizing."""
     if not alerts:
         return alerts or {}
     out = dict(alerts)
+    lists = {
+        key: list(out.get(key) or [])
+        for key in _NARRATIVE_TICKET_LISTS
+        if key in out or key in ("singles", "parlays")
+    }
     applied = apply_grok_kelly_adjustments(
-        {"singles": list(out.get("singles") or []), "parlays": list(out.get("parlays") or [])},
+        lists,
         grok_result,
+        profile=profile,
+        now=now,
     )
     assert isinstance(applied, dict)
-    out["singles"] = applied.get("singles") or []
-    out["parlays"] = applied.get("parlays") or []
+    for key in lists:
+        out[key] = applied.get(key) or []
     out["narrative_tilt_applied"] = bool(grok_result and grok_result.get("ok"))
     return out

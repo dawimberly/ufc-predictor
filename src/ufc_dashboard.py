@@ -5327,7 +5327,9 @@ class UFCDashboardApp(_CTK_BASE):
                 profile=profile,
                 allowed_fights=self._allowed_fight_keys(self._payload.combined),
             )
-            tilted = apply_narrative_tilt_after_model_sizing(recs, self._grok_result)
+            tilted = apply_narrative_tilt_after_model_sizing(
+                recs, self._grok_result, profile=profile
+            )
             if isinstance(tilted, dict):
                 items = list(tilted.get("items") or [])
                 if not items:
@@ -5361,12 +5363,7 @@ class UFCDashboardApp(_CTK_BASE):
                     apply_live_quote_gate(items, live=live_profile)
                     from src.circuit_breaker import apply_live_safety_gate
 
-                    roll = None
-                    try:
-                        roll = float(self._current_budget_state().get("total_bankroll") or 0) or None
-                    except (TypeError, ValueError):
-                        roll = None
-                    apply_live_safety_gate(items, live=live_profile, bankroll=roll)
+                    apply_live_safety_gate(items, live=live_profile)
         except Exception as exc:
             _debug_log(f"Overview recommendations failed closed: {exc}")
             aggregation_failed = True

@@ -1003,6 +1003,18 @@ def fetch_ufc_odds(*, force_refresh: bool = False) -> pd.DataFrame:
     return odds_df
 
 
+def _quote_side_name(match: pd.Series | dict[str, Any], side: int) -> str:
+    """The quote's own fighter name. Blank when the quote has none; card names are not used."""
+    for key in (f"fighter_{side}", f"fighter{side}"):
+        value = match.get(key)
+        if value is None or (not isinstance(value, str) and pd.isna(value)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
 def _lookup_odds_row(
     fighter_1: str,
     fighter_2: str,
@@ -1186,8 +1198,8 @@ def merge_predictions_with_odds(
         out.at[idx, "quote_match"] = str(match.get("quote_match") or "")
         out.at[idx, "quote_actionable"] = bool(match.get("quote_actionable"))
         out.at[idx, "quote_block_reason"] = str(match.get("quote_block_reason") or "")
-        out.at[idx, "quote_fighter_1"] = str(match.get("fighter_1") or f1)
-        out.at[idx, "quote_fighter_2"] = str(match.get("fighter_2") or f2)
+        out.at[idx, "quote_fighter_1"] = _quote_side_name(match, 1)
+        out.at[idx, "quote_fighter_2"] = _quote_side_name(match, 2)
         out.at[idx, "quote_f1_odds"] = f1_odds
         out.at[idx, "quote_f2_odds"] = f2_odds
 

@@ -149,6 +149,26 @@ def _suggest_stake(
     return stake, float(rating_mult), gate_dict
 
 
+def _alert_bankroll(
+    bankroll: float | None,
+) -> tuple[float, float | None, str, str | None]:
+    """(sizing bankroll, payload bankroll, source, observed_at).
+
+    Live sizes from today's recorded bankroll and ignores caller or configured
+    numbers. With nothing recorded the payload bankroll stays empty and every
+    Live stake is cleared at the end of ``generate_alerts``.
+    """
+    if not config.is_live_profile():
+        value = float(bankroll or config.INITIAL_BANKROLL)
+        return value, value, "caller" if bankroll else "config_default", None
+    from src.circuit_breaker import live_observed_bankroll
+
+    observed = live_observed_bankroll()
+    if observed is None:
+        return float(bankroll or config.INITIAL_BANKROLL), None, "missing", None
+    return observed.value, observed.value, observed.source, observed.observed_at.isoformat()
+
+
 def generate_alerts(
     predictions_df: pd.DataFrame,
     risk_metrics: dict[str, Any] | None = None,
@@ -168,7 +188,7 @@ def generate_alerts(
     ``narrative_result`` (Ollama/Grok) is applied last — after uncertainty gates and
     strategy-rating sizing — and may only tilt Kelly stake, never pick/edge.
     """
-    bankroll = bankroll or config.INITIAL_BANKROLL
+    bankroll, payload_bankroll, bankroll_source, bankroll_observed_at = _alert_bankroll(bankroll)
     ctx = threshold_context_for_alerts(
         predictions_df,
         bankroll=bankroll,
@@ -389,7 +409,7 @@ def generate_alerts(
                 "brief": build_fight_brief(row, risk_metrics=risk_metrics, edge_pct=edge_pct),
                 "suggested_stake": stake,
                 "kelly_stake_usd": round(float(stake), 2),
-                "bankroll": float(bankroll),
+                "bankroll": payload_bankroll,
                 "confidence": str(row.get("confidence_label", "")),
                 "strategy_rating_mult": rating_mult,
                 "weight_class": str(row.get("weight_class") or ""),
@@ -694,7 +714,9 @@ def generate_alerts(
         "min_confidence": str(getattr(strategy, "min_confidence", "") or ""),
         "max_bets_per_card": max_bets,
         "max_tickets_per_card": max_bets,
-        "bankroll": bankroll,
+        "bankroll": payload_bankroll,
+        "bankroll_source": bankroll_source,
+        "bankroll_observed_at": bankroll_observed_at,
         "dynamic_thresholds": ctx.get("use_dynamic", False),
         "threshold_detail": ctx.get("thresholds"),
         "decision_layer": decision,
@@ -722,12 +744,9 @@ def generate_alerts(
         except Exception as exc:
             logger.debug("narrative tilt on alerts skipped: %s", exc)
     if config.is_live_profile():
-        from src.circuit_breaker import apply_live_safety_gate
+        from src.strategy import revalidate_live_alert_lists
 
-        for key in ("singles", "parlays", "prop_singles", "model_parlays"):
-            rows = payload.get(key)
-            if isinstance(rows, list):
-                apply_live_safety_gate(rows, live=True, bankroll=float(bankroll or 0) or None)
+        payload = revalidate_live_alert_lists(payload)
     return payload
 
 
@@ -832,15 +851,20 @@ def should_send_alert(
     if not alert_data.get("available"):
         return False, "no actionable bets"
 
+    live = config.is_live_profile()
     bankroll = alert_data.get("bankroll")
-    if bankroll is not None:
+    if live or bankroll is not None:
         try:
             from src.risk_manager import check_bankroll_safety
 
-            allowed, block_reason = check_bankroll_safety(float(bankroll))
+            allowed, block_reason = check_bankroll_safety(
+                float(bankroll) if bankroll is not None else None
+            )
             if not allowed:
                 return False, block_reason
         except Exception as exc:
+            if live:
+                return False, f"live safety check failed: {exc}"
             logger.debug("Safety check skipped: %s", exc)
 
     cooldown = cooldown_minutes or config.ALERT_COOLDOWN_MINUTES
@@ -912,7 +936,11 @@ def send_discord_alert(
                 },
                 {
                     "name": "Bankroll",
-                    "value": f"${alert_data.get('bankroll', 0):,.0f}",
+                    "value": (
+                        f"${float(alert_data['bankroll']):,.0f}"
+                        if alert_data.get("bankroll") is not None
+                        else "not recorded"
+                    ),
                     "inline": True,
                 },
             ],

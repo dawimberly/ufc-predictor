@@ -475,6 +475,7 @@ def _parse_moneyline_rows(fights: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "implied_prob_f2": imp2,
                 "bookmaker": "BetNow.eu",
                 "bookmaker_count": 1,
+                "price_kind": "book",
                 "source_url": BETNOW_UFC_URL,
             }
         )

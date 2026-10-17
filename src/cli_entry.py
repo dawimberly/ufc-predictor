@@ -585,6 +585,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     install_safe_stdout()
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if raw and raw[0] == "start-live-session":
+        from src.circuit_breaker import start_live_session_cli
+
+        return start_live_session_cli(raw[1:])
+    if raw and raw[0] == "record-bankroll":
+        from src.circuit_breaker import record_bankroll_cli
+
+        return record_bankroll_cli(raw[1:])
     parser = build_parser()
     args = parser.parse_args(argv)
 

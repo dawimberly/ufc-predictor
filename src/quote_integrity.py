@@ -291,8 +291,13 @@ def _fighters_from_ticket(ticket: dict[str, Any]) -> tuple[str, str]:
     return first, second
 
 
+def normalized_price_kind(ticket: dict[str, Any]) -> str:
+    """Live sizes only an explicit ``book`` price; blank or unknown kinds do not qualify."""
+    return str(ticket.get("price_kind") or "").strip().lower()
+
+
 def _is_consensus(ticket: dict[str, Any]) -> bool:
-    kind = str(ticket.get("price_kind") or "").strip().lower()
+    kind = normalized_price_kind(ticket)
     if kind in _PRICE_CONSENSUS:
         return True
     try:
@@ -319,6 +324,8 @@ def live_quote_block_reason(
         return match
     if _is_consensus(ticket):
         return "consensus_not_executable"
+    if normalized_price_kind(ticket) != "book":
+        return "price_kind_not_book"
     book = str(ticket.get("bookmaker") or "").strip()
     if not book:
         return "missing_bookmaker"
