@@ -56,7 +56,9 @@ Bets are skipped when odds are missing, edge is below threshold, or the daily lo
 
 Strict as-of pricing requires an **opening** quote with a timestamp ≤ the event cutoff. Closing-only, unlabeled, and label-only (no timestamp) prices are excluded from selection, sizing, and settlement. Reports show eligible vs excluded counts; zero eligible fights do not claim ROI.
 
-Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical lines, joined on event + date + fighter names.
+**Feature chronology:** walk-forward scores a precomputed feature matrix; `FEATURE_COLUMNS` values are proven past-only via truncated-rebuild equality tests (not rebuild-per-fold). Historical profitability remains unverified until opening-line coverage exists.
+
+Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical lines + optional jerzyszocik daily snapshots, joined on event + date + fighter names. Merge persists opening/closing columns only when genuine pre-fight observation timestamps exist; unlabeled lines become closing (or stay unlabeled), never invented openings.
 
 ## CLI
 

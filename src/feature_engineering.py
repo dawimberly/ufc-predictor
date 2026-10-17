@@ -1463,10 +1463,12 @@ def _rolling_stats(history: pd.DataFrame) -> pd.DataFrame:
 
     history["control_time_per_min"] = np.nan  # not in base dataset
 
-    # Physical attributes at fight time are known pre-bout (DOB / profile); do not shift.
+    # Physical attributes are known pre-bout when present on the row. Forward-fill
+    # carries a previously observed profile value into later missing rows, but never
+    # back-fill from a future fight (that would leak later measurements).
     for col in ("reach_in", "height_in", "age"):
         if col in history.columns:
-            history[col] = g[col].apply(lambda s: s.ffill().bfill())
+            history[col] = g[col].apply(lambda s: s.ffill())
 
     if "stance" in history.columns:
         enc = history["stance"].map(_stance_encoding).apply(pd.Series)
