@@ -98,6 +98,11 @@ FIGHTS_COLUMNS = [
     "finish",
     "f1_odds",
     "f2_odds",
+    "f1_opening_odds",
+    "f2_opening_odds",
+    "f1_closing_odds",
+    "f2_closing_odds",
+    "opening_odds_observed_at",
     "source",
 ]
 

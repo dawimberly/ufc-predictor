@@ -73,7 +73,7 @@ python main.py live                    # Dry-run signals for next card
 ## Next milestones
 
 1. **Calibration** — keep WF isotonic / conformal on past-only holdouts; tighten live edge calc
-2. **Opening-line coverage** — persist opening vs closing columns in the odds merge (strict as-of already refuses unlabeled)
+2. **Opening-line coverage** — merge now persists opening/closing + observation stamps when daily snapshots (or explicit opening fields) provide pre-fight provenance; most public single-shot sources still yield closing-only / `unproven` until richer feeds are wired
 3. **Live execution** — DraftKings / Odds API polling + bet slip export (no auto-bet yet)
 4. **Per-bookmaker line shop** — best available price instead of averaged odds
 5. **Alerting** — Telegram/discord when edge > threshold on upcoming main events
