@@ -651,15 +651,17 @@ examples:
         action="store_true",
         help=(
             "Run year-scoped event backtest. Default evaluation_mode=frozen_model "
-            "(production weights). Pass --walk-forward to refit on earlier fights only."
+            "(production weights). Pass --walk-forward for walk_forward_simplified "
+            "(small past-only LightGBM — not the production ensemble)."
         ),
     )
     parser.add_argument(
         "--walk-forward",
         action="store_true",
         help=(
-            "With --backtest-2025: true walk-forward (preprocess / fit / calibrate on "
-            "fights strictly before each event). Without this flag the run is frozen_model."
+            "With --backtest-2025: walk_forward_simplified — imputer + small LightGBM "
+            "+ optional isotonic on fights strictly before each event. Not production "
+            "ensemble training. Default without this flag is frozen_model."
         ),
     )
     parser.add_argument(
@@ -870,12 +872,14 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if args.walk_forward:
                 logger.info(
-                    "evaluation_mode=walk_forward — refitting on earlier fights only"
+                    "evaluation_mode=walk_forward_simplified — "
+                    "simplified_lgbm_isotonic on earlier fights "
+                    "(not production ensemble / discovery)"
                 )
             else:
                 logger.info(
                     "evaluation_mode=frozen_model — production weights "
-                    "(not a true walk-forward; pass --walk-forward to refit)"
+                    "(pass --walk-forward for walk_forward_simplified)"
                 )
             result = backtest_2025(
                 features,

@@ -194,10 +194,10 @@ python -m src.cli_entry --next-two --odds
 python main.py --preflight
 python main.py --watch --auto-odds --dry-run
 python main.py --backtest-2025                 # frozen_model (default)
-python main.py --backtest-2025 --walk-forward  # true walk-forward
+python main.py --backtest-2025 --walk-forward  # walk_forward_simplified
 ```
 
-`--backtest-2025` defaults to **frozen_model** (production weights; may have seen scored fights). Pass `--walk-forward` to refit preprocessing / model / calibration on earlier fights only. Strict as-of betting uses **opening** prices only.
+`--backtest-2025` defaults to **frozen_model** (production weights; may have seen scored fights). Pass `--walk-forward` for **walk_forward_simplified** (small past-only LightGBM — not the production ensemble). Strict as-of betting requires opening quotes with timestamps ≤ the event cutoff.
 
 `launch_predict.bat` wraps the CLI (`--next-two --odds`).
 

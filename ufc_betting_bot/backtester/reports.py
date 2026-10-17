@@ -11,27 +11,76 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def _mode_label(mode: str, trainer_identity: str = "") -> str:
+    mode = str(mode or "frozen_model")
+    if mode == "walk_forward_simplified":
+        identity = trainer_identity or "simplified_lgbm_isotonic"
+        return (
+            f"walk_forward_simplified ({identity}; "
+            "not production ensemble / discovery)"
+        )
+    if mode == "walk_forward":
+        return "walk_forward (production-equivalent refit on earlier fights)"
+    return "frozen_model (production weights; may have seen scored fights)"
+
+
+def _fmt_pct_or_na(value) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "N/A"
+        return f"{float(value):.1%}" if abs(float(value)) <= 1.5 else f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _fmt_roi_or_na(value) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "N/A"
+        return f"{float(value):>7.1f}%"
+    except (TypeError, ValueError):
+        return "    N/A"
+
+
 def print_backtest_summary(result) -> None:
     m = result.overall_metrics
     mode = str(getattr(result, "evaluation_mode", "") or "frozen_model")
-    if mode == "walk_forward":
-        mode_label = "walk_forward (refit on earlier fights only)"
-    else:
-        mode_label = "frozen_model (production weights; may have seen scored fights)"
+    trainer = str(getattr(result, "trainer_identity", "") or "")
+    eligibility = getattr(result, "as_of_eligibility", None) or {}
+    n_total = int(eligibility.get("n_total", m.get("n_fights", 0) or 0))
+    n_eligible = int(eligibility.get("n_as_of_eligible", getattr(result, "fights_with_odds", 0) or 0))
+
     print(f"\n  UFC BETTING BOT — BACKTEST {result.target_year}")
     print("  " + "=" * 72)
-    print(f"  Evaluation mode  {mode_label}")
-    print(f"  Fights scored     {int(m.get('n_fights', 0))}")
+    print(f"  Evaluation mode  {_mode_label(mode, trainer)}")
+    if trainer:
+        print(f"  Trainer          {trainer}")
+    print(f"  Fights scored     {n_total}")
     print(f"  Events            {len(result.per_event)}")
     print(f"  Accuracy          {m.get('accuracy', 0):.1%}")
     print(f"  Log loss          {m.get('log_loss', 0):.3f}")
     print(f"  Brier score       {m.get('brier_score', 0):.3f}")
     print(f"  ROC AUC           {m.get('roc_auc', float('nan')):.3f}")
-    print(f"  Fights w/ odds    {result.fights_with_odds}")
+    print(f"  As-of eligible    {n_eligible} / {n_total}")
     print(
-        "  As-of prices      opening only "
-        "(closing-only / unproven quotes excluded from sizing)"
+        "  Exclusions        "
+        f"closing_not_as_of={int(eligibility.get('n_closing_not_as_of', 0))}  "
+        f"unproven={int(eligibility.get('n_unproven', 0))}  "
+        f"missing={int(eligibility.get('n_missing', 0))}  "
+        f"other={int(eligibility.get('n_other', 0))}"
     )
+    print(
+        "  As-of rule        opening quote timestamp ≤ event cutoff "
+        "(labels alone are unproven)"
+    )
+
+    if n_eligible == 0:
+        print("\n  STAKING / ROI")
+        print("  " + "-" * 72)
+        print("  N/A — zero as-of-eligible fights; no pricing performance claimed.")
+        print(f"\n  Reports -> {result.report_dir}")
+        print()
+        return
 
     print("\n  SEGMENT ACCURACY")
     print("  " + "-" * 40)
@@ -46,6 +95,14 @@ def print_backtest_summary(result) -> None:
         print("\n  STAKING MODES (min edge from settings)")
         print("  " + "-" * 72)
         for _, row in staking.iterrows():
+            if row.get("performance_available") is False or int(row.get("trades", 0) or 0) == 0:
+                print(
+                    f"  {str(row.get('staking', '')):<14} "
+                    f"trades {int(row.get('trades', 0) or 0):>4}  "
+                    f"hit N/A  ROI N/A  "
+                    f"(as-of eligible present; no bets cleared edge/stakes)"
+                )
+                continue
             warn = ""
             if row.get("roi_warning"):
                 warn = "  <<< check"
@@ -63,8 +120,8 @@ def print_backtest_summary(result) -> None:
             print(
                 f"  {str(row.get('staking', '')):<14} "
                 f"trades {int(row.get('trades', 0)):>4}  "
-                f"hit {row.get('hit_rate', 0):.1%}  "
-                f"ROI {row.get('roi_pct', 0):>7.1f}%  "
+                f"hit {_fmt_pct_or_na(row.get('hit_rate', 0))}  "
+                f"ROI {_fmt_roi_or_na(row.get('roi_pct', 0))}  "
                 f"maxDD {row.get('max_drawdown_pct', 0):.1f}%  "
                 f"winStk {int(row.get('max_win_streak', 0))}{warn}{mc_extra}"
             )
@@ -75,9 +132,9 @@ def print_backtest_summary(result) -> None:
             mc.n_simulations, mc.outcome_mode
         ))
         print("  " + "-" * 72)
-        for mode, stats in mc.staking_summaries.items():
+        for mode_name, stats in mc.staking_summaries.items():
             print(
-                f"  {mode:<14} "
+                f"  {mode_name:<14} "
                 f"expDD {stats.get('expected_max_drawdown_pct', 0):.1f}%  "
                 f"VaR DD {stats.get('var_max_drawdown_pct', 0):.1f}%  "
                 f"CVaR DD {stats.get('cvar_max_drawdown_pct', 0):.1f}%  "
@@ -92,9 +149,16 @@ def print_backtest_summary(result) -> None:
         print("\n  FRACTIONAL KELLY SWEEP")
         print("  " + "-" * 56)
         for _, row in result.bankroll_sweep.iterrows():
+            if row.get("performance_available") is False or int(row.get("trades", 0) or 0) == 0:
+                print(
+                    f"  edge >= {row['min_edge']:.0%}  "
+                    f"trades {int(row.get('trades', 0) or 0):>4}  "
+                    f"hit N/A  ROI N/A"
+                )
+                continue
             roi = row.get("roi_pct", 0)
             flag = ""
-            if roi > 500:
+            if pd.notna(roi) and roi > 500:
                 flag = "  <<< unrealistic?"
                 logger.warning(
                     "Kelly sweep edge>=%s%% ROI %.1f%% looks unrealistically high",
@@ -104,8 +168,8 @@ def print_backtest_summary(result) -> None:
             print(
                 f"  edge >= {row['min_edge']:.0%}  "
                 f"trades {int(row.get('trades', 0)):>4}  "
-                f"hit {row.get('hit_rate', 0):.1%}  "
-                f"ROI {roi:>7.1f}%  "
+                f"hit {_fmt_pct_or_na(row.get('hit_rate', 0))}  "
+                f"ROI {_fmt_roi_or_na(roi)}  "
                 f"maxDD {row.get('max_drawdown_pct', 0):.1f}%{flag}"
             )
 
@@ -114,12 +178,12 @@ def print_backtest_summary(result) -> None:
         print("  " + "-" * 72)
         top = result.per_event.sort_values("fights", ascending=False).head(10)
         for _, row in top.iterrows():
-            odds_n = int(row.get("fights_with_odds", 0))
+            odds_n = int(row.get("fights_as_of_eligible", row.get("fights_with_odds", 0)))
             print(
                 f"  {str(row['event'])[:38]:<38} "
                 f"{int(row['fights']):>3} fights  "
                 f"acc {row['accuracy']:.1%}  "
-                f"odds {odds_n}"
+                f"as-of {odds_n}"
             )
 
     print(f"\n  Reports -> {result.report_dir}")
@@ -145,8 +209,13 @@ def save_calibration_plot(bins: pd.DataFrame, path: Path) -> None:
 def save_roi_plot(sweep: pd.DataFrame, path: Path) -> None:
     if sweep.empty:
         return
+    work = sweep.copy()
+    if "roi_pct" in work.columns:
+        work = work[work["roi_pct"].notna()]
+    if work.empty:
+        return
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.bar(sweep["min_edge"] * 100, sweep["roi_pct"], width=1.5)
+    ax.bar(work["min_edge"] * 100, work["roi_pct"], width=1.5)
     ax.axhline(0, color="k", lw=0.8)
     ax.set_xlabel("Min edge (%)")
     ax.set_ylabel("ROI (%)")

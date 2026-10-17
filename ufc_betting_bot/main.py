@@ -54,11 +54,14 @@ def cmd_backtest_2025(args: argparse.Namespace) -> int:
 
     walk_forward = bool(getattr(args, "walk_forward", False))
     if walk_forward:
-        print("evaluation_mode=walk_forward (refit on earlier fights only)")
+        print(
+            "evaluation_mode=walk_forward_simplified "
+            "(simplified_lgbm_isotonic; not production ensemble)"
+        )
     else:
         print(
             "evaluation_mode=frozen_model (production weights; "
-            "pass --walk-forward for true walk-forward)"
+            "pass --walk-forward for walk_forward_simplified)"
         )
     result = backtest_2025(target_year=args.year, walk_forward=walk_forward)
     print_backtest_summary(result)
@@ -90,7 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
     bt.add_argument(
         "--walk-forward",
         action="store_true",
-        help="Refit preprocess/model/calibration on earlier fights only (true walk-forward)",
+        help=(
+            "walk_forward_simplified: past-only imputer + small LightGBM "
+            "(not production ensemble)"
+        ),
     )
     bt.set_defaults(func=cmd_backtest_2025)
 
@@ -104,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--walk-forward",
         action="store_true",
-        help="With --backtest-2025: true walk-forward (default is frozen_model)",
+        help="With --backtest-2025: walk_forward_simplified (default is frozen_model)",
     )
     p.add_argument("--refresh-odds", action="store_true")
     p.add_argument("--year", type=int, default=get_settings().backtest_year)

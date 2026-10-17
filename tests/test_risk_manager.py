@@ -23,16 +23,18 @@ def _synthetic_predictions(n: int = 40) -> pd.DataFrame:
         m2 = 1.0 - m1
         f1_odds = round(1.0 / m1, 2)
         f2_odds = round(1.0 / m2, 2)
+        event_date = pd.Timestamp("2025-01-01", tz="UTC") + pd.Timedelta(days=(i // 5) * 14)
         rows.append(
             {
                 "fight_id": f"f{i}",
                 "event_name": f"UFC Event {i // 5}",
-                "event_date": pd.Timestamp("2025-01-01") + pd.Timedelta(days=(i // 5) * 14),
+                "event_date": event_date,
                 "prob_f1_win": p1,
                 "prob_f2_win": 1.0 - p1,
-                # Strict as-of requires labeled opening prices.
+                # Strict as-of requires labeled opening prices + pre-cutoff timestamp.
                 "f1_opening_odds": f1_odds,
                 "f2_opening_odds": f2_odds,
+                "opening_odds_observed_at": event_date - pd.Timedelta(days=7),
                 "f1_odds": f1_odds,
                 "f2_odds": f2_odds,
                 "f1_win": int(rng.random() < p1),

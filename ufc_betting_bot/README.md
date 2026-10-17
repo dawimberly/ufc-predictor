@@ -52,11 +52,9 @@ Bets are skipped when odds are missing, edge is below threshold, or the daily lo
 | Mode | Flag | Meaning |
 |------|------|---------|
 | **frozen_model** | default `--backtest-2025` | Scores the production artifact. Weights may have seen the fights being scored. |
-| **walk_forward** | `--backtest-2025 --walk-forward` | Refits preprocessing, model, and calibration on fights **strictly before** each event. |
+| **walk_forward_simplified** | `--backtest-2025 --walk-forward` | Past-only imputer + small LightGBM + optional isotonic. **Not** the production ensemble / interaction-discovery pipeline. |
 
-Strict as-of pricing uses **opening** quotes only. Closing-only and unlabeled (`f1_odds` without an opening/closing label) prices are excluded from selection, sizing, and settlement.
-
-Profitability / ROI figures from older runs that mixed closing or unlabeled odds are **paused** until re-run under these rules.
+Strict as-of pricing requires an **opening** quote with a timestamp ≤ the event cutoff. Closing-only, unlabeled, and label-only (no timestamp) prices are excluded from selection, sizing, and settlement. Reports show eligible vs excluded counts; zero eligible fights do not claim ROI.
 
 Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical lines, joined on event + date + fighter names.
 
@@ -65,7 +63,7 @@ Odds coverage: **Ultimate UFC dataset** (Kaggle mirror) + jansen88 historical li
 ```bash
 python main.py merge-odds              # Merge odds into ufc-predictor/data/raw/fights.csv
 python main.py backtest-2025           # frozen_model (default)
-python main.py backtest-2025 --walk-forward   # true walk-forward
+python main.py backtest-2025 --walk-forward   # walk_forward_simplified
 python main.py backtest-2025 --year 2024
 python main.py live                    # Dry-run signals for next card
 ```

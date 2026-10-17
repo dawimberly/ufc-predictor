@@ -198,16 +198,27 @@ def simulate_value_bets(
     initial_bankroll: float,
     flat_stake: float,
 ) -> tuple[pd.DataFrame, dict[str, float]]:
-    """Flat-stake value betting when model prob beats implied odds."""
+    """Flat-stake value betting on a validated as-of (opening) price only."""
+    try:
+        from ufc_betting_bot.modules.edge import as_of_price_from_row
+    except ImportError:
+        as_of_price_from_row = None  # type: ignore[assignment]
+
     bankroll = initial_bankroll
     rows: list[dict] = []
 
     for _, row in predictions.iterrows():
-        market = _market_probs(row)
-        if market is None:
+        if as_of_price_from_row is not None:
+            price = as_of_price_from_row(row)
+            if price is None:
+                continue
+            market_p1, market_p2 = price.market_p1, price.market_p2
+            dec_f1, dec_f2 = price.decimal_f1, price.decimal_f2
+            odds_timing = price.timing
+        else:
+            # Fail closed: without the as-of helper, do not size on raw f1_odds.
             continue
 
-        market_p1, market_p2 = market
         model_p1 = float(row["prob_f1_win"])
         model_p2 = float(row["prob_f2_win"])
         actual_f1_win = row.get(config.TARGET_COLUMN, np.nan)
@@ -217,10 +228,6 @@ def simulate_value_bets(
         bet_side = None
         edge = 0.0
         odds = np.nan
-        decimal_odds = _fight_decimal_odds(row)
-        if decimal_odds is None:
-            continue
-        dec_f1, dec_f2 = decimal_odds
 
         if model_p1 - market_p1 >= min_edge:
             bet_side = "f1"
@@ -253,6 +260,7 @@ def simulate_value_bets(
                 "edge_pct": edge * 100.0,
                 "stake": flat_stake,
                 "odds": odds,
+                "odds_timing": odds_timing,
                 "won": int(won),
                 "pnl": pnl,
                 "yield_pct": yield_pct,
@@ -265,11 +273,12 @@ def simulate_value_bets(
         summary = {
             "min_edge": min_edge,
             "trades": 0.0,
-            "hit_rate": 0.0,
+            "hit_rate": float("nan"),
             "total_pnl": 0.0,
             "final_equity": initial_bankroll,
-            "roi_pct": 0.0,
-            "avg_yield_pct": 0.0,
+            "roi_pct": float("nan"),
+            "avg_yield_pct": float("nan"),
+            "performance_available": False,
         }
         return trades, summary
 
@@ -281,6 +290,7 @@ def simulate_value_bets(
         "final_equity": float(trades["equity"].iloc[-1]),
         "roi_pct": float((trades["equity"].iloc[-1] - initial_bankroll) / initial_bankroll * 100),
         "avg_yield_pct": float(trades["yield_pct"].mean()),
+        "performance_available": True,
     }
     return trades, summary
 

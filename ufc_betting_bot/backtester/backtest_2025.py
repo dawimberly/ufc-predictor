@@ -1,9 +1,10 @@
 """Year-scoped event backtest with strict as-of prices and bankroll rules.
 
 Default ``walk_forward=False`` scores a frozen production model
-(``evaluation_mode=frozen_model``). Pass ``walk_forward=True`` to refit
-preprocessing, the classifier, and calibration on fights strictly before each
-event (``evaluation_mode=walk_forward``).
+(``evaluation_mode=frozen_model``). Pass ``walk_forward=True`` to run the
+simplified past-only trainer (``evaluation_mode=walk_forward_simplified``):
+a small LightGBM + optional isotonic calibration — not the production
+ensemble / discovery pipeline.
 """
 
 from __future__ import annotations
@@ -52,6 +53,30 @@ from ufc_betting_bot.modules.model_bridge import get_predictor, load_features, l
 logger = logging.getLogger(__name__)
 
 
+def _json_safe(value: Any) -> Any:
+    """Replace undefined floats with ``\"N/A\"`` for valid JSON output."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            return "N/A"
+        return float(value)
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return "N/A"
+    except (TypeError, ValueError):
+        pass
+    if isinstance(value, (str, int, bool)):
+        return value
+    return str(value)
+
+
 @dataclass
 class Backtest2025Result:
     predictions: pd.DataFrame
@@ -69,6 +94,8 @@ class Backtest2025Result:
     monte_carlo: Any = None
     threshold_comparison: dict[str, Any] | None = None
     evaluation_mode: str = "frozen_model"
+    as_of_eligibility: dict[str, int] | None = None
+    trainer_identity: str = "production_artifact"
 
 
 def _attach_event_names(features: pd.DataFrame) -> pd.DataFrame:
@@ -87,6 +114,51 @@ def _attach_event_names(features: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _interaction_names(predictor) -> set[str]:
+    names: set[str] = set()
+    for spec in getattr(predictor, "interaction_specs", None) or []:
+        name = spec.get("name") if isinstance(spec, dict) else getattr(spec, "name", None)
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _walk_forward_feature_columns(
+    df: pd.DataFrame,
+    predictor,
+    *,
+    refit_model: bool,
+) -> list[str]:
+    """Columns used for scoring.
+
+    Walk-forward uses the fixed leakage-safe ``config.FEATURE_COLUMNS`` base
+    list (never production-selected interaction columns). Frozen scoring may
+    still use the artifact feature list after applying its interaction specs.
+    """
+    import config
+
+    interactions = _interaction_names(predictor)
+    if refit_model:
+        base = [
+            c
+            for c in config.FEATURE_COLUMNS
+            if c in df.columns and c not in interactions
+        ]
+        if base:
+            return base
+        # Synthetic fixtures often use a tiny non-production column set.
+        return [
+            c
+            for c in (getattr(predictor, "feature_columns", None) or [])
+            if c in df.columns and c not in interactions
+        ]
+    return [
+        c
+        for c in (getattr(predictor, "feature_columns", None) or [])
+        if c in df.columns
+    ]
+
+
 def walk_forward_events(
     features: pd.DataFrame,
     predictor,
@@ -98,15 +170,14 @@ def walk_forward_events(
 ) -> pd.DataFrame:
     """Predict each event from information available before that event.
 
-    ``refit_model=False`` scores a frozen artifact. That is not walk-forward:
-    the weights may have seen the fights being scored. ``refit_model=True``
-    fits a new model on rows dated strictly before the event.
+    ``refit_model=False`` scores a frozen artifact (``frozen_model``).
+    ``refit_model=True`` with the default trainer uses the simplified
+    past-only LightGBM path (``walk_forward_simplified``), not production
+    ensemble training.
     """
     from src.feature_engineering import apply_imputer, apply_interaction_specs, fit_imputer
     from ufc_betting_bot.modules.edge import validated_as_of_price
 
-    # Frozen-model scoring may reuse production interaction specs. True walk-forward
-    # must not: those specs may have been selected with knowledge of later fights.
     frozen_interaction_specs = getattr(predictor, "interaction_specs", None) or []
 
     df = _attach_event_names(features)
@@ -126,9 +197,17 @@ def walk_forward_events(
         .sort_values(DATE_COLUMN)
     )
 
-    feature_cols = list(getattr(predictor, "feature_columns", []) or [])
+    feature_cols = _walk_forward_feature_columns(df, predictor, refit_model=refit_model)
     rows: list[dict] = []
-    mode = "walk_forward" if refit_model else "frozen_model"
+    if not refit_model:
+        mode = "frozen_model"
+        trainer_identity = "production_artifact"
+    elif trainer is None:
+        mode = "walk_forward_simplified"
+        trainer_identity = "simplified_lgbm_isotonic"
+    else:
+        mode = "walk_forward_simplified"
+        trainer_identity = getattr(trainer, "__name__", type(trainer).__name__)
 
     for _, ev in events.iterrows():
         ev_date = ev[DATE_COLUMN]
@@ -153,8 +232,6 @@ def walk_forward_events(
             model = fit_model(train, fold_cols)
             prepared = test
             if trainer is None:
-                # Imputer + model already fitted inside _fit_past_only_model on
-                # past rows only; re-fit imputer here for the score-time transform.
                 imputer = fit_imputer(train)
                 prepared = apply_imputer(test, imputer).dropna(subset=fold_cols)
             if prepared.empty:
@@ -170,7 +247,7 @@ def walk_forward_events(
         for i, (_, row) in enumerate(prepared.iterrows()):
             actual = int(row[TARGET_COLUMN])
             p1 = float(proba[i])
-            price, odds_timing = validated_as_of_price(row)
+            price, odds_timing = validated_as_of_price(row, as_of=ev_date)
             record = row.to_dict()
             record["prob_f1_win"] = p1
             record["prob_f2_win"] = 1.0 - p1
@@ -179,6 +256,7 @@ def walk_forward_events(
             record["wf_train_rows"] = len(train)
             record["event_name"] = ev["event"]
             record["evaluation_mode"] = mode
+            record["trainer_identity"] = trainer_identity
             record["odds_timing"] = odds_timing
 
             if price is not None:
@@ -204,10 +282,11 @@ def walk_forward_events(
 
 
 def _fit_past_only_model(train: pd.DataFrame, feature_cols: list[str]):
-    """Fit imputer, optional calibration, and classifier on past-only rows.
+    """Simplified past-only trainer (not the production ensemble pipeline).
 
-    Feature selection is limited to columns present on the past slice. No
-    frozen production interaction specs are applied here.
+    Fits imputer + small LightGBM + optional isotonic calibration on the
+    caller-provided past slice only. Does not rediscover interactions or
+    run production Optuna / dual-model training.
     """
     from lightgbm import LGBMClassifier
 
@@ -270,13 +349,17 @@ def _per_event_breakdown(predictions: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict] = []
     for event, grp in predictions.groupby("event_name"):
         m = evaluate_classification(grp[TARGET_COLUMN], grp["prob_f1_win"])
-        odds_n = int(grp["f1_odds"].notna().sum()) if "f1_odds" in grp.columns else 0
+        if "odds_timing" in grp.columns:
+            eligible = int((grp["odds_timing"].astype(str) == "opening").sum())
+        else:
+            eligible = 0
         rows.append(
             {
                 "event": event,
                 "event_date": grp[DATE_COLUMN].iloc[0],
                 "fights": len(grp),
-                "fights_with_odds": odds_n,
+                "fights_as_of_eligible": eligible,
+                "fights_with_odds": eligible,
                 "accuracy": m["accuracy"],
                 "log_loss": m["log_loss"],
                 "brier_score": m["brier_score"],
@@ -320,11 +403,18 @@ def backtest_2025(
         target_year=year,
         refit_model=walk_forward,
     )
-    evaluation_mode = (
-        str(predictions["evaluation_mode"].iloc[0])
-        if "evaluation_mode" in predictions.columns and not predictions.empty
-        else ("walk_forward" if walk_forward else "frozen_model")
-    )
+    from ufc_betting_bot.modules.edge import as_of_eligibility_counts
+
+    if walk_forward:
+        evaluation_mode = "walk_forward_simplified"
+        trainer_identity = "simplified_lgbm_isotonic"
+    else:
+        evaluation_mode = "frozen_model"
+        trainer_identity = "production_artifact"
+    if "evaluation_mode" in predictions.columns and not predictions.empty:
+        evaluation_mode = str(predictions["evaluation_mode"].iloc[0])
+    if "trainer_identity" in predictions.columns and not predictions.empty:
+        trainer_identity = str(predictions["trainer_identity"].iloc[0])
 
     if predictions.empty:
         raise ValueError(
@@ -345,7 +435,8 @@ def backtest_2025(
         "undercard": segment_metrics(predictions, undercard_mask, TARGET_COLUMN, "prob_f1_win"),
     }
 
-    fights_with_odds = int(predictions["f1_odds"].notna().sum()) if "f1_odds" in predictions else 0
+    as_of_eligibility = as_of_eligibility_counts(predictions)
+    fights_with_odds = int(as_of_eligibility.get("n_as_of_eligible", 0))
 
     active_profile = profile
     if active_profile is None:
@@ -422,6 +513,23 @@ def backtest_2025(
     )
     per_event = _per_event_breakdown(predictions)
 
+    if as_of_eligibility.get("n_as_of_eligible", 0) == 0:
+        # Do not present empty staking as break-even performance.
+        for summary in (bankroll_summary,):
+            summary["performance_available"] = False
+            summary["roi_pct"] = float("nan")
+            summary["hit_rate"] = float("nan")
+        if isinstance(staking_modes, pd.DataFrame) and not staking_modes.empty:
+            staking_modes = staking_modes.copy()
+            staking_modes["performance_available"] = False
+            staking_modes["roi_pct"] = np.nan
+            staking_modes["hit_rate"] = np.nan
+        if isinstance(bankroll_sweep, pd.DataFrame) and not bankroll_sweep.empty:
+            bankroll_sweep = bankroll_sweep.copy()
+            bankroll_sweep["performance_available"] = False
+            bankroll_sweep["roi_pct"] = np.nan
+            bankroll_sweep["hit_rate"] = np.nan
+
     result = Backtest2025Result(
         predictions=predictions,
         overall_metrics=overall,
@@ -438,6 +546,8 @@ def backtest_2025(
         monte_carlo=monte_carlo,
         threshold_comparison=threshold_comparison,
         evaluation_mode=evaluation_mode,
+        as_of_eligibility=as_of_eligibility,
+        trainer_identity=trainer_identity,
     )
 
     if save_outputs:
@@ -445,26 +555,35 @@ def backtest_2025(
         PLOTS_DIR.mkdir(parents=True, exist_ok=True)
         predictions.to_csv(BACKTEST_2025_CSV, index=False)
         per_event.to_csv(REPORTS_DIR / f"backtest_{year}_per_event.csv", index=False)
-        bankroll_sweep.to_csv(REPORTS_DIR / f"backtest_{year}_bankroll_sweep.csv", index=False)
+        # Undefined staking metrics must serialize as N/A, not blank/NaN.
+        sweep_out = bankroll_sweep.copy()
+        modes_out = staking_modes.copy()
+        for frame in (sweep_out, modes_out):
+            for col in ("roi_pct", "hit_rate", "avg_yield_pct"):
+                if col in frame.columns:
+                    frame[col] = frame[col].where(frame[col].notna(), other="N/A")
+        sweep_out.to_csv(REPORTS_DIR / f"backtest_{year}_bankroll_sweep.csv", index=False)
         bankroll_trades.to_csv(REPORTS_DIR / f"backtest_{year}_bankroll_trades.csv", index=False)
-        staking_modes.to_csv(REPORTS_DIR / f"backtest_{year}_staking_modes.csv", index=False)
+        modes_out.to_csv(REPORTS_DIR / f"backtest_{year}_staking_modes.csv", index=False)
         calibration_bins.to_csv(REPORTS_DIR / f"backtest_{year}_calibration.csv", index=False)
 
         summary = {
             "target_year": year,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "fights_with_odds": fights_with_odds,
+            "as_of_eligibility": as_of_eligibility,
             "bankroll_rules": bankroll.__dict__,
             **{f"overall_{k}": v for k, v in overall.items()},
             **{f"bankroll_{k}": v for k, v in bankroll_summary.items()},
             "dynamic_thresholds": dynamic_enabled,
             "threshold_comparison": threshold_comparison,
             "evaluation_mode": evaluation_mode,
-            "walk_forward": evaluation_mode == "walk_forward",
+            "trainer_identity": trainer_identity,
+            "walk_forward": evaluation_mode.startswith("walk_forward"),
             "staking_modes": staking_modes.to_dict(orient="records"),
         }
         (REPORTS_DIR / f"backtest_{year}_summary.json").write_text(
-            json.dumps(summary, indent=2, default=str),
+            json.dumps(_json_safe(summary), indent=2),
             encoding="utf-8",
         )
         save_calibration_plot(calibration_bins, PLOTS_DIR / f"calibration_{year}.png")

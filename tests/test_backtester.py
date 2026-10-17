@@ -79,6 +79,13 @@ def test_simulate_value_bets_with_odds():
             config.TARGET_COLUMN: [1, 0],
             "prob_f1_win": [0.65, 0.35],
             "prob_f2_win": [0.35, 0.65],
+            "event_date": ["2025-03-01", "2025-03-08"],
+            "f1_opening_odds": [1.8, 2.0],
+            "f2_opening_odds": [2.1, 1.7],
+            "opening_odds_observed_at": [
+                "2025-02-15T00:00:00+00:00",
+                "2025-02-20T00:00:00+00:00",
+            ],
             "f1_odds": [1.8, 2.0],
             "f2_odds": [2.1, 1.7],
             "implied_prob_f1": [0.5, 0.45],
@@ -90,6 +97,28 @@ def test_simulate_value_bets_with_odds():
     )
     assert "roi_pct" in summary
     assert summary["min_edge"] == pytest.approx(0.08)
+    assert summary.get("performance_available") is True
+    assert not trades.empty
+    assert (trades["odds_timing"] == "opening").all()
+
+
+def test_simulate_value_bets_skips_unlabeled_f1_odds():
+    preds = pd.DataFrame(
+        {
+            config.TARGET_COLUMN: [1],
+            "prob_f1_win": [0.80],
+            "prob_f2_win": [0.20],
+            "event_date": ["2025-03-01"],
+            "f1_odds": [1.8],
+            "f2_odds": [2.1],
+        }
+    )
+    trades, summary = simulate_value_bets(
+        preds, min_edge=0.05, initial_bankroll=1000, flat_stake=10
+    )
+    assert trades.empty
+    assert summary.get("performance_available") is False
+    assert summary["trades"] == 0.0
 
 
 def test_style_matchup_bonus_sign():
