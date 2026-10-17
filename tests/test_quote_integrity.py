@@ -6,6 +6,7 @@ import json
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+import pytest
 
 import config
 from src.odds_providers.odds_fallback import _normalize_odds_frame
@@ -25,6 +26,8 @@ from tests.test_audit_fail_closed import _fresh_quote, _strong_ticket
 
 
 NOW = datetime(2026, 6, 1, 18, 0, tzinfo=timezone.utc)
+
+pytestmark = pytest.mark.usefixtures("live_session")
 
 
 def _quote_frame(**extra) -> dict:
@@ -598,7 +601,7 @@ def test_daily_loss_and_unreadable_state_clear_live_stakes(tmp_path, monkeypatch
     )
     ticket = _strong_ticket(**_quote_frame(), kelly_stake_usd=8.0, suggested_stake=8.0, bankroll=1000)
     out = allocate_card_budget_pct(
-        [ticket], 100.0, profile="live", inplace=False, as_of=NOW, bankroll=1000
+        [ticket], 100.0, profile="live", inplace=False, as_of=NOW
     )
     assert float(out[0]["suggested_stake"]) == 0.0
     assert float(out[0]["kelly_stake_usd"]) == 0.0
@@ -609,7 +612,7 @@ def test_daily_loss_and_unreadable_state_clear_live_stakes(tmp_path, monkeypatch
     )
     assert float(tilted[0]["suggested_stake"]) == 0.0
     second = allocate_card_budget_pct(
-        tilted, 100.0, profile="live", inplace=False, as_of=NOW, bankroll=1000
+        tilted, 100.0, profile="live", inplace=False, as_of=NOW
     )
     assert float(second[0]["suggested_stake"]) == 0.0
     assert float(second[0]["kelly_stake_usd"]) == 0.0
@@ -617,7 +620,7 @@ def test_daily_loss_and_unreadable_state_clear_live_stakes(tmp_path, monkeypatch
     (tmp_path / "cb.json").write_text("{not-json", encoding="utf-8")
     fresh = _strong_ticket(**_quote_frame(), kelly_stake_usd=8.0, suggested_stake=8.0)
     blocked = allocate_card_budget_pct(
-        [fresh], 100.0, profile="live", inplace=False, as_of=NOW, bankroll=1000
+        [fresh], 100.0, profile="live", inplace=False, as_of=NOW
     )
     assert float(blocked[0]["suggested_stake"]) == 0.0
     assert "unreadable" in str(blocked[0].get("safety_block_reason") or "")

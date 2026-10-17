@@ -79,7 +79,7 @@ def _fresh_live_fields(
     }
 
 
-def test_live_allocation_less_aggressive_than_paper():
+def test_live_allocation_less_aggressive_than_paper(live_session):
     tickets = [
         {"edge": 0.12, "prob": 0.75, "confidence": "high", "decimal_odds": 1.55, "uncertainty_action": "allow", "kelly_stake_usd": 100.0, **_fresh_live_fields("Alpha One", "Beta One", "evt-1", decimal_odds=1.55)},
         {"edge": 0.06, "prob": 0.70, "confidence": "medium", "decimal_odds": 1.80, "uncertainty_action": "allow", "kelly_stake_usd": 100.0, **_fresh_live_fields("Alpha Two", "Beta Two", "evt-1", decimal_odds=1.80)},
@@ -93,6 +93,7 @@ def test_live_allocation_less_aggressive_than_paper():
     live_sum = sum(t["stake_pct"] for t in live)
     assert paper_top >= live_top - 0.5
     assert paper_sum + 1e-6 >= live_sum
+    assert live_sum > 0.0
 
 
 def test_alerts_allocator_splits_singles_parlays_props():

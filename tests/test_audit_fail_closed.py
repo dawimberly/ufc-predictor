@@ -25,6 +25,8 @@ from src.strategy import (
 )
 from ufc_betting_bot.modules.dynamic_thresholds import ThresholdResult
 
+pytestmark = pytest.mark.usefixtures("live_session")
+
 
 def test_edge_for_predicted_pick_ignores_opponent_best_edge():
     row = pd.Series(

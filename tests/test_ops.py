@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from src.circuit_breaker import check_alerts_allowed, daily_loss_circuit_tripped
 from src.fight_brief import build_fight_brief
@@ -34,7 +35,11 @@ def test_safe_io_atomic(tmp_path, monkeypatch):
 
 def test_circuit_breaker_trips(tmp_path, monkeypatch):
     import config
-    from src.circuit_breaker import update_session_bankroll_anchor
+    from src.circuit_breaker import (
+        initialize_live_session,
+        record_bankroll_observation,
+        update_session_bankroll_anchor,
+    )
 
     monkeypatch.setattr(config, "CIRCUIT_BREAKER_STATE_PATH", tmp_path / "cb.json")
     monkeypatch.setattr(config, "CIRCUIT_BREAKER_ENABLED", True)
@@ -45,7 +50,15 @@ def test_circuit_breaker_trips(tmp_path, monkeypatch):
         lambda k: 0.02 if k == "daily_loss_limit_fraction" else 0.1,
     )
     update_session_bankroll_anchor(1000.0)
-    tripped, reason, _ = daily_loss_circuit_tripped(950.0)
+    # Live trips against the recorded current bankroll, not a caller argument.
+    record_bankroll_observation(950.0)
+    tripped, reason, _ = daily_loss_circuit_tripped(None)
     assert tripped
-    allowed, _ = check_alerts_allowed(950.0)
+    assert "daily loss" in reason
+    allowed, _ = check_alerts_allowed(None)
     assert not allowed
+
+    from src.circuit_breaker import LiveSessionExists
+
+    with pytest.raises(LiveSessionExists):
+        initialize_live_session(500.0)
