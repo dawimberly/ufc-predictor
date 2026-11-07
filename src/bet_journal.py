@@ -17,6 +17,7 @@ JOURNAL_FIELDS = [
     "pick",
     "edge_pct",
     "model_prob",
+    "signal_odds",
     "stake",
     "bankroll",
     "profile",
@@ -68,6 +69,7 @@ def log_journal_row(
     pick: str = "",
     edge_pct: float | str = "",
     model_prob: float | str = "",
+    signal_odds: float | str = "",
     stake: float | str = "",
     bankroll: float | str = "",
     profile: str = "",
@@ -104,6 +106,7 @@ def log_journal_row(
         "pick": pick,
         "edge_pct": edge_pct,
         "model_prob": model_prob,
+        "signal_odds": signal_odds,
         "stake": stake,
         "bankroll": bankroll,
         "profile": profile or config.UFC_PROFILE,
@@ -134,6 +137,7 @@ def log_signal(
     model_prob: float | None = None,
     stake: float = 0.0,
     bankroll: float | None = None,
+    signal_odds: float | None = None,
     notes: str = "",
 ) -> None:
     log_journal_row(
@@ -145,6 +149,7 @@ def log_signal(
         model_prob=f"{model_prob:.1%}" if model_prob is not None else "",
         stake=f"{stake:.2f}" if stake else "",
         bankroll=f"{bankroll:.2f}" if bankroll is not None else "",
+        signal_odds=f"{signal_odds:.6f}" if signal_odds is not None else "",
         notes=notes,
     )
 
@@ -197,6 +202,28 @@ def log_settlement(
     )
 
 
+
+def _signal_decimal_odds(signal: dict[str, Any]) -> float | None:
+    """Return the signal's captured price as decimal odds for the journal."""
+    for key in ("decimal_odds", "opening_odds"):
+        try:
+            value = float(signal.get(key))
+        except (TypeError, ValueError):
+            continue
+        if value > 1.0:
+            return value
+    raw = signal.get("american_odds")
+    try:
+        price = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if price >= 100:
+        return 1.0 + price / 100.0
+    if price <= -100:
+        return 1.0 + 100.0 / abs(price)
+    return None
+
+
 def log_alert_dispatch(
     alert_data: dict[str, Any],
     *,
@@ -224,6 +251,7 @@ def log_alert_dispatch(
             model_prob=s.get("prob"),
             stake=float(s.get("suggested_stake", 0)),
             bankroll=alert_data.get("bankroll"),
+            signal_odds=_signal_decimal_odds(s),
             notes=s.get("brief") or s.get("reasoning", "")[:200],
         )
 

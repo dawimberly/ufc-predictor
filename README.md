@@ -275,6 +275,10 @@ Copy `.env.example` → `.env`. Important keys:
 | `OLLAMA_MODEL` | `qwen2.5-coder:7b` | Prefer 7b; 14b often times out |
 | `GROK_ENABLED` | false | Optional cloud narrative (not required) |
 
+## Bet signal price tracking
+
+When a single-bet alert is dispatched, the bet journal records the UTC signal time and the quoted price in decimal odds in `signal_odds`. Decimal prices are kept as-is; American prices are converted before they are stored. This is the price shown with the recommendation, not a confirmed bet fill. The signal log does not yet link automatically to settlement records, so it does not by itself produce CLV. Older journal entries are not backfilled.
+
 ## Ops artifacts
 
 | File | Purpose |
