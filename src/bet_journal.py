@@ -17,6 +17,7 @@ JOURNAL_FIELDS = [
     "pick",
     "edge_pct",
     "model_prob",
+    "signal_odds",
     "stake",
     "bankroll",
     "profile",
@@ -134,7 +135,7 @@ def log_signal(
     model_prob: float | None = None,
     stake: float = 0.0,
     bankroll: float | None = None,
-    opening_odds: float | None = None,
+    signal_odds: float | None = None,
     notes: str = "",
 ) -> None:
     log_journal_row(
@@ -146,7 +147,7 @@ def log_signal(
         model_prob=f"{model_prob:.1%}" if model_prob is not None else "",
         stake=f"{stake:.2f}" if stake else "",
         bankroll=f"{bankroll:.2f}" if bankroll is not None else "",
-        opening_odds=f"{opening_odds:.6f}" if opening_odds is not None else "",
+        signal_odds=f"{signal_odds:.6f}" if signal_odds is not None else "",
         notes=notes,
     )
 
@@ -248,7 +249,7 @@ def log_alert_dispatch(
             model_prob=s.get("prob"),
             stake=float(s.get("suggested_stake", 0)),
             bankroll=alert_data.get("bankroll"),
-            opening_odds=_signal_decimal_odds(s),
+            signal_odds=_signal_decimal_odds(s),
             notes=s.get("brief") or s.get("reasoning", "")[:200],
         )
 
